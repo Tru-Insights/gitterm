@@ -1,9 +1,10 @@
 use crate::{
     data::{SessionKind, ShellData, WorkspaceId},
+    terminal_setup::{self, Placement},
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
-use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
+use gitterm_terminal::{TerminalLaunch, TerminalView};
 use gpui::*;
 use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
@@ -177,7 +178,7 @@ impl Pane {
                     let exit_target = session.clone();
                     let cwd_target = session.clone();
                     PaneContent::Terminal(cx.new(|cx| {
-                        TerminalView::launch(launch, TerminalConfig::default(), cx)
+                        terminal_setup::launch(launch, Placement::Main, cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
                                     if pane.session != title_target {

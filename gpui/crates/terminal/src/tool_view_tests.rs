@@ -56,34 +56,40 @@ fn real_tools_osc8_label_reaches_link_callback(cx: &mut TestAppContext) {
         };
     });
     crate::test_support::wait(|| {
-        entity.update(cx, |view, _| {
+        entity.update(cx, |view, cx| {
             if view.backend.sync() && opened.borrow().is_empty() {
-                view.mouse_down(&MouseDownEvent {
-                    position: point(px(35.), px(10.)),
-                    modifiers: Modifiers {
-                        platform: true,
+                view.mouse_down(
+                    &MouseDownEvent {
+                        position: point(px(35.), px(10.)),
+                        modifiers: Modifiers {
+                            platform: true,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
-                });
+                    cx,
+                );
             }
             opened.borrow().len() == 1
         })
     });
-    entity.update(cx, |view, _| {
+    entity.update(cx, |view, cx| {
         assert_eq!(&*opened.borrow(), &["https://example.invalid/target"]);
         assert_eq!(
             view.backend.renderable_content().hovered_hyperlink,
             Some(Point::new(Line(0), Column(0))..=Point::new(Line(0), Column(9)))
         );
-        view.mouse_down(&MouseDownEvent {
-            position: point(px(125.), px(10.)),
-            modifiers: Modifiers {
-                platform: true,
+        view.mouse_down(
+            &MouseDownEvent {
+                position: point(px(125.), px(10.)),
+                modifiers: Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        });
+            cx,
+        );
         assert_eq!(
             opened.borrow().len(),
             1,

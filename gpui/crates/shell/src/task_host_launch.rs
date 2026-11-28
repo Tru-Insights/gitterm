@@ -2282,7 +2282,7 @@ fn spawn_terminal_launch(
     let title_owner = owner.clone();
     let title_session = session_id.clone();
     let view = cx.new(|cx| {
-        TerminalView::launch(launch, Default::default(), cx)
+        crate::terminal_setup::launch(launch, crate::terminal_setup::Placement::Main, cx)
             .with_exit_callback(move |_, cx| {
                 let owner = owner.clone();
                 let session_id = session_id.clone();
