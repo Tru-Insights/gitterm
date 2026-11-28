@@ -299,6 +299,105 @@ impl<C> WorkspaceConfig<C> {
     }
 }
 
+/// The terminal branch of Iced's workspace_config projection. Both frontends
+/// supply runtime identity, never a GPUI layout id, to the shared inventory.
+impl WorkspaceTabConfig {
+    pub fn from_terminal(
+        dir: &Path,
+        repo_dir: &Path,
+        startup_command: Option<&str>,
+        target: &crate::session::Target,
+        chat_session_id: Option<String>,
+        worker_shutdown_refused: bool,
+    ) -> Self {
+        Self {
+            extra: Default::default(),
+            dir: dir.to_string_lossy().to_string(),
+            repo_dir: Some(repo_dir.to_string_lossy().to_string()),
+            startup_command: startup_command.map(String::from),
+            tab_kind: None,
+            agent_config: None,
+            chat_session_id,
+            task_id: target.task_id.clone(),
+            task_session_id: target.task_session_id.clone(),
+            worker_shutdown_refused,
+            session_uid: Some(target.session_uid.clone()),
+        }
+    }
+}
+
+/// Narrow desktop mutations: unmounted sessions and unrelated fields stay owned
+/// by the document. Bottom shells have no persisted identity or main selection.
+#[derive(Clone)]
+pub enum DesktopSessionEdit {
+    OpenTabs(Vec<WorkspaceTabConfig>),
+    OpenBottom {
+        terminal: BottomTerminalConfig,
+        initial_tabs: Vec<WorkspaceTabConfig>,
+    },
+    Select(Option<usize>),
+}
+impl WorkspacesFile {
+    pub fn edit_desktop_sessions(
+        &mut self,
+        target: &WorkspaceTarget,
+        edit: DesktopSessionEdit,
+    ) -> Result<(), String> {
+        let index = target.index(self)?;
+        let workspace = &mut self.workspaces[index];
+        match edit {
+            DesktopSessionEdit::OpenTabs(tabs) => {
+                if workspace.location.is_some() || workspace.is_legacy_remote() {
+                    return Err("Local terminal workspace changed location".into());
+                }
+                for tab in tabs {
+                    let uid = tab
+                        .session_uid
+                        .as_deref()
+                        .ok_or("New terminal has no session identity")?;
+                    let at = workspace
+                        .tabs
+                        .iter()
+                        .position(|saved| saved.session_uid.as_deref() == Some(uid));
+                    // An adopted worker may already be in the inventory. Do not
+                    // discard its saved metadata or append it a second time.
+                    let at = at.unwrap_or_else(|| {
+                        workspace.tabs.push(tab);
+                        workspace.tabs.len() - 1
+                    });
+                    workspace.active_tab = Some(at);
+                }
+            }
+            DesktopSessionEdit::OpenBottom {
+                terminal,
+                initial_tabs,
+            } => {
+                if workspace.location.is_some() || workspace.is_legacy_remote() {
+                    return Err("Local terminal workspace changed location".into());
+                }
+                if workspace.tabs.is_empty() && !initial_tabs.is_empty() {
+                    workspace.tabs = initial_tabs;
+                    workspace.active_tab = Some(0);
+                }
+                workspace.bottom_terminals.push(terminal);
+            }
+            DesktopSessionEdit::Select(tab) => {
+                if let Some(tab) = tab {
+                    if tab >= workspace.tabs.len() {
+                        return Err("Selected main tab is no longer open".into());
+                    }
+                    workspace.active_tab = Some(tab);
+                }
+                // V6 stores an ordinal among open workspaces, not the file
+                // index (closed workspaces can be interleaved in older files).
+                self.active_workspace =
+                    self.workspaces[..index].iter().filter(|w| w.active).count();
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1266,3 +1365,7 @@ pub fn active_tab_after_removal(active: usize, removed: usize, remaining: usize)
 }
 
 mod workspace_bar;
+
+#[cfg(all(test, feature = "runtime"))]
+#[path = "workspace_config/desktop_session_tests.rs"]
+mod desktop_session_tests;

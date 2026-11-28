@@ -3688,6 +3688,7 @@ mod live_writes {
     include!("sidebar_resume_tests.rs");
     include!("task_panel_live_tests.rs");
     include!("remote_terminal_tests.rs");
+    include!("local_session_persistence_tests.rs");
 }
 
 #[gpui::test]
