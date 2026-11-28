@@ -189,6 +189,13 @@ impl Shell {
                 cx.notify();
             });
         }
+        let chat = pane.and_then(|pane| match &pane.read(cx).content {
+            pane::PaneContent::PreviewChat(chat) => Some(chat.clone()),
+            _ => None,
+        });
+        if let Some(chat) = chat {
+            chat.update(cx, |chat, cx| chat.bind_tab_context(workspace, id, cx));
+        }
         self.selected_files.remove(&workspace);
         self.content.update(cx, |content, cx| {
             content.visits.activate(workspace, Some(id));

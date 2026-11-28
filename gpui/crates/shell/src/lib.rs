@@ -1135,8 +1135,9 @@ impl Shell {
         // Iced flushes a chat's held results when its turn ends.
         self._subscriptions
             .push(task_host::forward_turn_ends(&view, cx));
-        self.owner.update(cx, |owner, _| {
+        self.owner.update(cx, |owner, cx| {
             owner.chats.insert(target.session_uid.clone(), view.clone());
+            cx.notify();
         });
         let mut id = layout::stable_path_hash(Path::new(&target.session_uid));
         while self
@@ -1174,7 +1175,8 @@ impl Shell {
             title: "Claude preview".into(),
             kind: data::SessionKind::Chat,
         });
-        state.active_session = Some(SessionId(id));
+        self.activate_session_context(workspace, SessionId(id), cx);
+        self.workspace_mut_for_context(workspace).active_session = Some(SessionId(id));
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {

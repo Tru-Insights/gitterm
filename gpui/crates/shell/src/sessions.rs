@@ -1186,6 +1186,7 @@ impl crate::Shell {
                         use gpui::AppContext as _;
                         let view = cx
                             .new(|cx| crate::chat::ChatPane::history(shutdown, saved, window, cx));
+                        view.update(cx, |view, cx| view.bind_tab_context(workspace, id, cx));
                         // Imported history has no live target and is never registered
                         // as a preview-owned runtime or persisted as a preview chat.
                         pane.update(cx, |p, cx| {
@@ -1540,9 +1541,6 @@ impl crate::Shell {
         let target = view.read(cx).target();
         self._subscriptions
             .push(crate::task_host::forward_turn_ends(&view, cx));
-        self.owner.update(cx, |owner, _| {
-            owner.chats.insert(target.session_uid.clone(), view.clone());
-        });
         let id = existing.unwrap_or_else(|| {
             let mut id = crate::layout::stable_path_hash(std::path::Path::new(&target.session_uid));
             while self
@@ -1553,6 +1551,11 @@ impl crate::Shell {
                 id = id.wrapping_add(1);
             }
             crate::data::SessionId(id)
+        });
+        view.update(cx, |view, cx| view.bind_tab_context(workspace, id, cx));
+        self.owner.update(cx, |owner, cx| {
+            owner.chats.insert(target.session_uid.clone(), view.clone());
+            cx.notify();
         });
         let pane_id = crate::session_pane_id(id);
         if let Some(pane) = self.workspace(workspace).panes.get(&pane_id) {

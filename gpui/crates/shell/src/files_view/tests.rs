@@ -716,7 +716,7 @@ fn tab_context_gap3_directory_uses_v6_dir_in_live_and_never_writes_source_in_pre
 
 #[gpui::test]
 fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut TestAppContext) {
-    use crate::{chat::ChatPane, data::ShellData};
+    use crate::data::ShellData;
     use gitterm_core::chat::{runtime::RuntimeEvent, types::HarnessEvent};
 
     let _app = crate::test_app::Cleanup::new(cx);
@@ -760,33 +760,20 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
     let config = temp.path().join("preview");
+    let services = gitterm_core::preview::service::ServiceContext::production(
+        &temp.path().join("live"),
+        "worktree-follow-test",
+    )
+    .unwrap();
+    cx.update(|cx| crate::chat::policy::install_live(services, cx).unwrap());
     let (shell, cx) = cx.add_window_view(|window, cx| {
-        let shutdown = crate::chat::RuntimeShutdown::new();
-        let chats = ["first", "second"].map(|uid| {
-            cx.new(|cx| {
-                ChatPane::history(
-                    shutdown.clone(),
-                    crate::chat::SavedChat {
-                        uid: uid.into(),
-                        cwd: repo.clone(),
-                        provider: repo.join("fixture-provider"),
-                        session_id: None,
-                        records: vec![],
-                    },
-                    window,
-                    cx,
-                )
+        let tabs = ["first", "second"].map(|uid| {
+            serde_json::json!({
+                "dir": repo, "repo_dir": repo, "tab_kind": "agent",
+                "session_uid": uid,
+                "agent_config": {"backend": "claude", "model": "default"},
             })
         });
-        let tabs: Vec<_> = chats
-            .iter()
-            .map(|chat| {
-                serde_json::json!({
-                    "dir": repo, "repo_dir": repo, "tab_kind": "agent",
-                    "session_uid": chat.read(cx).target().session_uid,
-                })
-            })
-            .collect();
         fs::write(
             source.join("workspaces.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -798,7 +785,7 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
         .unwrap();
         let catalog = crate::workspace_config::IcedCatalog::read(&source).unwrap();
         let model = WorkspaceStatus::from_iced(&catalog);
-        let mut store = WorkspaceStore::new(&config);
+        let mut store = crate::preview::tests::guarded_store(&config);
         store.iced = Some(catalog);
         let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
         let mut shell = crate::Shell::with_owner(
@@ -811,18 +798,7 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
         )
         .unwrap();
         let sessions = shell.workspaces[0].sessions.clone();
-        for (session, chat) in sessions.iter().zip(chats) {
-            shell.workspaces[0].panes[&crate::session_pane_id(session.id)].update(
-                cx,
-                |pane, cx| {
-                    pane.session = Some(chat.read(cx).target());
-                    pane.content = crate::pane::PaneContent::PreviewChat(chat.clone());
-                },
-            );
-            owner.update(cx, |owner, cx| {
-                owner.chats.insert(chat.read(cx).target().session_uid, chat);
-            });
-        }
+        shell.restore_live_workspace_sessions(crate::WorkspaceId(1), window, cx);
         shell.select_session_id(sessions[0].id, window, cx);
         shell
     });
@@ -840,6 +816,12 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
                 chat.clone()
             })
             .collect();
+        for (session, chat) in sessions.iter().zip(&chats) {
+            assert_eq!(
+                chat.read(cx).tab_context(),
+                Some((crate::WorkspaceId(1), session.id)),
+            );
+        }
         (shell.owner.clone(), sessions, chats)
     });
     let workspace = crate::data::WorkspaceId(1);
@@ -926,6 +908,48 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
         for session in &sessions {
             assert_eq!(owner.model.session_contexts[&session.id].cwd, repo);
         }
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
+    });
+    let (new_session, new_chat) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let id = shell.active(cx).active_session.unwrap();
+        let pane = shell.active(cx).panes[&crate::session_pane_id(id)].read(cx);
+        let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+            panic!("new chat must be installed");
+        };
+        assert_eq!(chat.read(cx).tab_context(), Some((workspace, id)));
+        assert!(!sessions.iter().any(|session| session.id == id));
+        assert!(
+            !shell
+                .owner
+                .read(cx)
+                .iced_workspace(workspace)
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.session_uid.as_deref() == Some(&chat.read(cx).target().session_uid))
+        );
+        (id, chat.clone())
+    });
+    new_chat.update(cx, |chat, cx| {
+        chat.receive_runtime_event(
+            &chat.runtime_source(),
+            RuntimeEvent::Harness(HarnessEvent::ItemStarted {
+                id: "unsaved-read".into(),
+                kind: gitterm_core::chat::types::ItemKind::ToolCall {
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": linked[0].join("new.txt")}),
+                },
+            }),
+            cx,
+        );
+    });
+    wait_context(&linked[0], "one", cx);
+    owner.read_with(cx, |owner, _| {
+        assert_eq!(owner.model.active_sessions[&workspace], new_session);
+        assert_eq!(owner.model.session_contexts[&new_session].cwd, repo);
     });
     assert_eq!(fs::read(source.join("workspaces.json")).unwrap(), before);
 }

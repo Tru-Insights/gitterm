@@ -505,6 +505,14 @@ impl ChatPane {
             owner.update(cx, |owner, _| {
                 owner.chats.remove(&old_target.session_uid);
                 owner.chats.insert(self.saved.uid.clone(), entity);
+                if let Some((_, session)) = self.tab_context
+                    && let Some(tab) = owner.model.session_contexts.get_mut(&session)
+                {
+                    // The UI tab and follow choice survive; this conversation
+                    // starts a new event stream, even if its length is unchanged.
+                    tab.observed_events = 0;
+                    tab.follow.tracker = Default::default();
+                }
             });
         }
         self.controller.source = self
@@ -785,6 +793,143 @@ mod tests {
         });
         cx.run_until_parked();
     }
+    #[gpui::test]
+    fn tab_context_chat_identity_reset_keeps_tab_and_restarts_follow_events(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gitterm_core::chat::types::{HarnessEvent, ItemKind};
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let linked = temp.path().join("linked");
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture",
+                "--allow-empty",
+            ],
+            vec![
+                "worktree",
+                "add",
+                "-qb",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        ] {
+            let output = gitterm_core::git_status::git_command()
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let linked = linked.canonicalize().unwrap();
+        let services =
+            ServiceContext::production(&temp.path().join("live"), "reset-follow-test").unwrap();
+        cx.update(|cx| policy::install_live(services, cx).unwrap());
+        let (_root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+            file["active_workspace"] = serde_json::json!(0);
+            file["workspaces"].as_array_mut().unwrap().truncate(1);
+            file["workspaces"][0]["dir"] = serde_json::json!(repo);
+            file["workspaces"][0]["tabs"] = serde_json::json!([]);
+        });
+        shell.update_in(cx, |shell, window, cx| {
+            shell.new_claude_chat(None, window, cx)
+        });
+        let (owner, binding, chat) = shell.read_with(cx, |shell, cx| {
+            let state = shell.active(cx);
+            let session = state.active_session.unwrap();
+            let pane = state.panes[&crate::session_pane_id(session)].read(cx);
+            let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+                panic!("chat");
+            };
+            (
+                shell.owner.clone(),
+                (state.workspace.id, session),
+                chat.clone(),
+            )
+        });
+        let event = |path: &Path| {
+            RuntimeEvent::Harness(HarnessEvent::ItemStarted {
+                id: "same-tool-id".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": path.join("fixture.txt")}),
+                },
+            })
+        };
+        let wait_root = |path: &Path, cx: &mut gpui::VisualTestContext| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                cx.run_until_parked();
+                if owner.read_with(cx, |owner, _| owner.model.workspaces[0].root == path) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "reset chat did not follow {}",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        chat.update(cx, |chat, cx| {
+            chat.receive_runtime_event(&chat.runtime_source(), event(&linked), cx);
+            // An established conversation is longer than the reset's settings.
+            for index in 0..8 {
+                chat.receive_runtime_event(
+                    &chat.runtime_source(),
+                    RuntimeEvent::Harness(HarnessEvent::ItemCompleted {
+                        id: format!("old-tool-{index}"),
+                        output: String::new(),
+                        is_error: false,
+                    }),
+                    cx,
+                );
+            }
+        });
+        wait_root(&linked, cx);
+        let (old_uid, count) = chat.read_with(cx, |chat, _| {
+            (chat.target().session_uid, chat.conversation_events().len())
+        });
+        let new_count = chat.update(cx, |chat, cx| {
+            chat.fresh_chat(cx);
+            assert_eq!(chat.tab_context(), Some(binding));
+            assert_ne!(chat.target().session_uid, old_uid);
+            assert!(chat.controller.runtime.is_none());
+            // Reuse the tool id before observers see the shorter new stream.
+            chat.receive_runtime_event(&chat.runtime_source(), event(&repo), cx);
+            chat.conversation_events().len()
+        });
+        assert!(new_count < count);
+        owner.read_with(cx, |owner, _| {
+            assert!(!owner.chats.contains_key(&old_uid));
+        });
+        wait_root(&repo, cx);
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.active(cx).active_session, Some(binding.1));
+            assert_eq!(
+                owner.read(cx).model.session_contexts[&binding.1].observed_events,
+                new_count
+            );
+        });
+    }
+
     #[gpui::test]
     fn missing_saved_cwd_offers_fresh_in_the_workspace_without_launching(
         cx: &mut gpui::TestAppContext,

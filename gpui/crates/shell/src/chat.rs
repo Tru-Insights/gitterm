@@ -368,6 +368,8 @@ struct DeferredLive {
 
 pub(crate) struct ChatPane {
     controller: Controller,
+    /// Runtime UI tab ownership survives provider/chat identity resets.
+    tab_context: Option<(crate::WorkspaceId, crate::data::SessionId)>,
     pub(crate) notification_attention: crate::notifications::ChatAttention,
     deferred_live: Option<DeferredLive>,
     remote: Option<remote::Binding>,
@@ -404,6 +406,22 @@ impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    pub(crate) fn tab_context(&self) -> Option<(crate::WorkspaceId, crate::data::SessionId)> {
+        self.tab_context
+    }
+
+    pub(crate) fn bind_tab_context(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        session: crate::data::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_context != Some((workspace, session)) {
+            self.tab_context = Some((workspace, session));
+            cx.notify();
+        }
+    }
+
     pub(crate) fn conversation_events(&self) -> &[AgentEvent] {
         &self.controller.adapter.state().conversation
     }
@@ -501,6 +519,7 @@ impl ChatPane {
         };
         let mut pane = Self {
             controller,
+            tab_context: None,
             deferred_live,
             remote: None,
             notification_attention: Default::default(),
@@ -813,6 +832,7 @@ impl ChatPane {
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         Self {
             controller,
+            tab_context: None,
             deferred_live: None,
             remote: None,
             notification_attention: Default::default(),

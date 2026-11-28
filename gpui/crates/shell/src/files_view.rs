@@ -436,32 +436,12 @@ impl FilesView {
         let Some(owner) = self.owner.clone() else {
             return;
         };
-        let session = {
-            let owner = owner.read(cx);
-            let Some(saved) = owner.iced_workspace(self.workspace) else {
-                return;
-            };
-            let chat = chat.read(cx);
-            let uid = chat.target().session_uid;
-            let Some(index) = saved.tabs.iter().position(|tab| {
-                tab.session_uid.as_ref() == Some(&uid)
-                    || (tab.session_uid.is_none()
-                        && tab
-                            .chat_session_id
-                            .as_deref()
-                            .is_some_and(|id| chat.matches_chat(id)))
-            }) else {
-                return;
-            };
-            // Newly mounted chats use their uid; restored tabs use the catalog's
-            // workspace-scoped id (install_live_pane's existing-session path).
-            let mounted = SessionId(crate::layout::stable_path_hash(std::path::Path::new(&uid)));
-            if owner.model.session_contexts.contains_key(&mounted) {
-                mounted
-            } else {
-                owner.iced_sessions(saved)[index].id
-            }
+        let Some((workspace, session)) = chat.read(cx).tab_context() else {
+            return;
         };
+        if workspace != self.workspace {
+            return;
+        }
         chat.update(cx, |chat, cx| {
             owner.update(cx, |owner, cx| {
                 owner.observe_session_worktree_events(
