@@ -2152,17 +2152,18 @@ mod live_tests {
                     )
                     .is_ok()
             );
-            for effect in [gitterm_core::preview::service::RunnerEffect::RestoreSession] {
-                assert!(
-                    owner
-                        .host
-                        .services()
-                        .runner(effect, None)
-                        .unwrap_err()
-                        .notice()
-                        .ends_with("not available in preview")
-                );
-            }
+            assert!(
+                owner
+                    .host
+                    .services()
+                    .runner(
+                        gitterm_core::preview::service::RunnerEffect::RestoreSession,
+                        None
+                    )
+                    .unwrap_err()
+                    .notice()
+                    .ends_with("not available in preview")
+            );
         });
         owner.update(cx, |owner, _| owner.shutdown());
         assert_eq!(std::fs::read(&source).unwrap(), bytes);
