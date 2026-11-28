@@ -370,18 +370,26 @@ mod interaction_tests {
         click(cx, "pstrip-more-item-1");
         notice(&shell, "Open browser", cx);
         let dark = cx.read(|cx| gpui_component::Theme::global(cx).mode.is_dark());
-        for (key, label) in [
-            ("cmd-shift-t", "Toggle Light/Dark Theme"),
-            ("cmd-shift-l", "Toggle Terminal Log Mirroring"),
-        ] {
-            cx.simulate_keystrokes(key);
-            draw(cx);
-            notice(&shell, label, cx);
-        }
+        cx.simulate_keystrokes("cmd-shift-t");
+        draw(cx);
+        assert_eq!(
+            cx.read(|cx| gpui_component::Theme::global(cx).mode.is_dark()),
+            !dark
+        );
+        cx.simulate_keystrokes("cmd-shift-t");
+        draw(cx);
         assert_eq!(
             cx.read(|cx| gpui_component::Theme::global(cx).mode.is_dark()),
             dark
         );
+        cx.simulate_keystrokes("cmd-shift-l");
+        draw(cx);
+        cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).owner.read(cx).error.as_deref(),
+                Some("Terminal log mirroring is not available in preview")
+            )
+        });
         cx.read(|cx| {
             let shell = shell.read(cx);
             assert!(shell.owner.read(cx).chats.is_empty());

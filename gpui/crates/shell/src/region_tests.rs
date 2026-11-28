@@ -303,9 +303,20 @@ fn sidebar_shell<'a>(
         let mut store = LayoutStore::new(layout::workspace_layout_path(config.path(), key));
         store.regions.sidebar_width = width;
         store
-            .save(&gpui_component::dock::DockAreaState::default())
+            .save(&gpui_component::dock::DockAreaState {
+                version: Some(1),
+                center: gpui_component::dock::PanelState {
+                    panel_name: "StackPanel".into(),
+                    children: vec![],
+                    info: gpui_component::dock::PanelInfo::stack(vec![], gpui::Axis::Horizontal),
+                },
+                ..Default::default()
+            })
             .unwrap();
     }
+    // Live uses Iced's global width even when old GPUI layouts contain dividers.
+    let desktop = gitterm_core::desktop_store::DesktopStore::open(iced).unwrap();
+    cx.update(|cx| cx.set_global(workspace_config::LiveWorkspaces(desktop)));
     let settings = workspace_config::load_iced_settings_from(iced);
     let dir = config.path().to_path_buf();
     let (shell, cx) = cx.add_window_view(|window, cx| {
@@ -353,17 +364,31 @@ fn sidebar_width_comes_from_iced_settings_for_every_workspace(cx: &mut TestAppCo
     draw(cx);
     assert_eq!(cx.debug_bounds("sidebar").unwrap().size.width, px(310.));
 
-    // A drag resizes every workspace and never touches Iced's file.
-    let before = std::fs::read(iced.path().join("settings.json")).unwrap();
+    // A Live drag resizes every workspace and persists Iced's shared preference.
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(iced.path().join("settings.json")).unwrap()).unwrap();
     let divider = cx.debug_bounds("sidebar-divider").unwrap().center();
     cx.simulate_mouse_down(divider, gpui::MouseButton::Left, gpui::Modifiers::none());
     let target = divider + gpui::point(px(40.), px(0.));
     cx.simulate_mouse_move(target, gpui::MouseButton::Left, gpui::Modifiers::none());
     cx.simulate_mouse_up(target, gpui::MouseButton::Left, gpui::Modifiers::none());
     assert_eq!(sidebar_widths(&shell, cx)[..2], [350., 350.]);
+    cx.read(|cx| {
+        cx.global::<workspace_config::LiveWorkspaces>()
+            .0
+            .drain()
+            .wait()
+            .unwrap()
+    });
+    expected["sidebar_width"] = serde_json::json!(350.);
+    expected["terminal_font_size"] = serde_json::json!(13.);
+    expected["ui_font_size"] = serde_json::json!(16.);
     assert_eq!(
-        std::fs::read(iced.path().join("settings.json")).unwrap(),
-        before
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(iced.path().join("settings.json")).unwrap()
+        )
+        .unwrap(),
+        expected
     );
 }
 
@@ -378,6 +403,7 @@ fn sidebar_width_clamps_like_iced_and_defaults_when_settings_missing(cx: &mut Te
     .unwrap();
     let (shell, cx, _config) = sidebar_shell(iced.path(), cx);
     assert_eq!(sidebar_widths(&shell, cx)[..2], [600., 600.]);
+    let iced = tempfile::tempdir().unwrap();
     std::fs::write(
         iced.path().join("settings.json"),
         br#"{"sidebar_width": 20}"#,

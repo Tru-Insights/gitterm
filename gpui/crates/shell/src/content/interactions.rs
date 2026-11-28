@@ -281,6 +281,7 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
     click(cx, "close-file-viewer");
     cx.read(|cx| assert!(shell.read(cx).content.read(cx).visits.is_empty()));
     // Reopen and exercise the keyboard route independently from the back click.
+    let retained_review = review.entity_id();
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
             shell.open_file_viewer(
@@ -297,6 +298,8 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
+            let review = shell.owner.read(cx).reviews[&WorkspaceId(1)].clone();
+            assert_ne!(review.entity_id(), retained_review);
             review.focus_handle(cx).focus(window, cx);
         })
     });

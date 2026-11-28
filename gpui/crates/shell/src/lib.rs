@@ -3978,8 +3978,8 @@ impl Shell {
             .on_mouse_up_out(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    // The existing finish handler may already have cleared resize.
-                    this.save_global_geometry(cx);
+                    // Capture saves an active drag before the finish handler clears it.
+                    this.finish_preference_resize(cx);
                 }),
             )
             .track_focus(&self.focus)
@@ -6700,6 +6700,26 @@ mod tests {
                 );
             }
         });
+        // A new terminal gets its own status context and initial poll. Let that
+        // finish before testing a subsequent maintenance request (as Iced's
+        // per-tab status state rejects another request while one is in flight).
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                let workspace = &owner.read(cx).model.workspaces[0];
+                workspace.checked
+                    && !workspace.status.git_status_loading
+                    && workspace.status.branch_name == "live-fixture"
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new terminal status did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // A real subsequent maintenance request sees a filesystem change.
         std::fs::write(repo.path().join("later.txt"), "later").unwrap();
         cx.update(|_, cx| {
@@ -6711,6 +6731,7 @@ mod tests {
                 );
             })
         });
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
         loop {
             cx.run_until_parked();
             if cx.read(|cx| {

@@ -190,6 +190,7 @@ fn work_outcomes_select_existing_chat_and_other_controls_do_not_mutate(cx: &mut 
             let chat = shell.owner.read(cx).chats.keys().next().unwrap().clone();
             let session = shell.active(cx).active_session;
             shell.select_workspace(1, window, cx);
+            let preview_workspace = shell.active_workspace(cx);
             shell.work_outcome(
                 &work_sidebar::WorkSidebarOutcome::OpenChat {
                     workspace,
@@ -198,8 +199,15 @@ fn work_outcomes_select_existing_chat_and_other_controls_do_not_mutate(cx: &mut 
                 window,
                 cx,
             );
-            assert_eq!(shell.active(cx).active_session, session);
-            assert_eq!(shell.active_workspace(cx).unwrap().0, workspace);
+            // Work now uses Live's resume path, which Preview must refuse even
+            // for an existing chat; the destination and its session stay intact.
+            assert_eq!(shell.active_workspace(cx), preview_workspace);
+            assert!(shell.active(cx).active_session.is_none());
+            assert_eq!(shell.workspaces[0].active_session, session);
+            assert_eq!(
+                shell.owner.read(cx).error.as_deref(),
+                Some("Open chat: Conversation resume not available in preview")
+            );
             shell.select_workspace(1, window, cx);
             shell.work_outcome(
                 &work_sidebar::WorkSidebarOutcome::Focus {

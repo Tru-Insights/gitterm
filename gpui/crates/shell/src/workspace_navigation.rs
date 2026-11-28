@@ -697,6 +697,27 @@ struct DebugPiFixture {
 #[cfg(test)]
 impl gpui::Global for DebugPiFixture {}
 
+/// Finish the real slide state before headless interaction tests target controls.
+#[cfg(test)]
+pub(super) fn settle_slide(cx: &mut gpui::VisualTestContext, position: usize) {
+    cx.update(|_, cx| {
+        let viewport = cx.global::<SlideProbe>().0.upgrade().unwrap();
+        viewport.update(cx, |state, cx| {
+            let now = Instant::now();
+            state
+                .slide
+                .tick(position, now + std::time::Duration::from_secs(1));
+            state
+                .slide
+                .tick(position, now + std::time::Duration::from_secs(2));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+}
+
 #[cfg(test)]
 struct SlideProbe(WeakEntity<SlideViewport>);
 #[cfg(test)]
@@ -786,19 +807,6 @@ mod tests {
         draw(cx);
     }
 
-    fn settle(cx: &mut VisualTestContext, position: usize) {
-        cx.update(|_, cx| {
-            let viewport = cx.global::<SlideProbe>().0.upgrade().unwrap();
-            viewport.update(cx, |state, cx| {
-                let now = Instant::now();
-                state.slide.tick(position, now + Duration::from_secs(1));
-                state.slide.tick(position, now + Duration::from_secs(2));
-                cx.notify();
-            });
-        });
-        draw(cx);
-    }
-
     fn assert_x(cx: &mut VisualTestContext, selector: &'static str, expected: gpui::Pixels) {
         let bounds = cx
             .debug_bounds(selector)
@@ -870,7 +878,7 @@ mod tests {
                 "{selector} stays outside the strip"
             );
         }
-        settle(cx, 0);
+        settle_slide(cx, 0);
         assert_x(cx, "sidebar", sidebar.origin.x);
         assert_x(cx, "sidebar-divider", divider.origin.x);
         assert_x(cx, "workspace-main-1", main.origin.x);
@@ -933,7 +941,7 @@ mod tests {
             })
         });
         draw(cx);
-        settle(cx, 0);
+        settle_slide(cx, 0);
         let host = cx.debug_bounds("workspace-slide-host").unwrap();
         let close = cx.debug_bounds("close-file-viewer").unwrap();
         let main = cx.debug_bounds("workspace-main-1").unwrap();
@@ -953,7 +961,7 @@ mod tests {
             "workspace-sidebar-2",
             host.origin.x + host.size.width * 0.75,
         );
-        settle(cx, 0);
+        settle_slide(cx, 0);
         assert_x(cx, "close-file-viewer", close.origin.x);
         assert_x(cx, "workspace-main-1", main.origin.x);
         assert!(cx.debug_bounds("workspace-sidebar-2").is_none());
@@ -966,7 +974,7 @@ mod tests {
             "close-file-viewer",
             close.origin.x - host.size.width * 0.75,
         );
-        settle(cx, 1);
+        settle_slide(cx, 1);
         assert!(cx.debug_bounds("close-file-viewer").is_none());
         assert_x(cx, "sidebar", host.origin.x);
     }
