@@ -515,7 +515,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
-            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
+            _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
@@ -826,7 +826,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
-            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
+            _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
@@ -933,8 +933,14 @@ impl ChatPane {
         self.controller.target.task_session_id = Some(task_session_id.into());
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.stop_restoring_remote() {
+            eprintln!("Stop restoring remote chat: {error:#}");
+            self.show_notice(format!("Stop restoring remote chat: {error:#}"), cx);
+            return;
+        }
         self.deferred_live = None;
         self._history_load = None;
+        self.history_loading = false;
         self.live_claim = None;
         self.controller.ready = false;
         self.shutdown_runtime(cx);
@@ -945,13 +951,17 @@ impl ChatPane {
     }
     pub(crate) fn quit_runtime(&mut self, cx: &gpui::App) {
         self._history_load = None;
+        self.history_loading = false;
         self.deferred_live = None;
-        if self.remote.is_some()
+        self.detach_remote_runtime();
+        self.shutdown_runtime(cx);
+    }
+    fn detach_remote_runtime(&mut self) {
+        if self.controller.remote
             && let Some(runtime) = self.controller.runtime.as_mut()
         {
             runtime.request_shutdown(); // Closing this port makes the queued Shutdown a no-op.
         }
-        self.shutdown_runtime(cx);
     }
     pub(crate) fn shutdown_runtime(&mut self, cx: &gpui::App) {
         crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
@@ -1276,6 +1286,9 @@ mod history_projection_tests {
 }
 impl Drop for ChatPane {
     fn drop(&mut self) {
+        // GPUI releases the last window's panes before its deferred quit callback.
+        // Only explicit close/Stop/Done sends a remote Shutdown.
+        self.detach_remote_runtime();
         self.enqueue_shutdown();
     }
 }
@@ -1322,6 +1335,7 @@ pub(crate) struct RuntimeShutdown {
 }
 enum ShutdownCommand {
     Session(OwnedRuntime),
+    StopRemote(Box<remote::PendingStop>),
     Persist(
         Box<resume::LiveTab>,
         gitterm_core::desktop_store::DesktopStore,
@@ -1341,6 +1355,13 @@ impl RuntimeShutdown {
                 let mut errors = Vec::new();
                 while let Ok(command) = receiver.recv() {
                     match command {
+                        ShutdownCommand::StopRemote(stop) => {
+                            if let Err(error) = stop.run(&executor) {
+                                let error = format!("Stop restoring remote chat: {error:#}");
+                                eprintln!("{error}");
+                                errors.push(error);
+                            }
+                        }
                         ShutdownCommand::Session(mut session) => {
                             if let Err(error) = executor.block_on(session.completed()) {
                                 eprintln!("Reap preview Claude: {error}");
@@ -1379,7 +1400,9 @@ impl RuntimeShutdown {
             .send(ShutdownCommand::Session(session))
             .map_err(|error| match error.0 {
                 ShutdownCommand::Session(session) => session,
-                ShutdownCommand::Drain(_) | ShutdownCommand::Persist(..) => unreachable!(),
+                ShutdownCommand::Drain(_)
+                | ShutdownCommand::Persist(..)
+                | ShutdownCommand::StopRemote(_) => unreachable!(),
             })
     }
     pub(crate) fn drain(&self) -> Result<()> {

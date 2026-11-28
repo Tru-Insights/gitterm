@@ -2205,7 +2205,17 @@ impl crate::Shell {
         let Some(state) = self.workspaces.iter().find(|w| w.runtime_uid == uid) else {
             return vec![];
         };
-        crate::bottom_pane_ids(state, cx)
+        let bottom = crate::bottom_pane_ids(state, cx);
+        if bottom.is_empty()
+            && let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id)
+            && (saved.is_legacy_remote()
+                || crate::workspace_config::workspace_remote_id(saved).is_some())
+        {
+            // Remote bottom descriptors have not been mounted without a GPUI
+            // layout. Parking must retain the inventory we did not load.
+            return saved.bottom_terminals.clone();
+        }
+        bottom
             .into_iter()
             .filter(|id| !self.run_tabs.contains_key(id))
             .filter_map(|id| state.panes.get(&id)?.read(cx).task_folder(cx))

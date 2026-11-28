@@ -660,3 +660,124 @@ fn golive20b_shell_new_remote_chat_uses_remote_cwd_and_close_stops(cx: &mut gpui
         shell.owner.read(cx).chat_shutdown.drain().unwrap()
     });
 }
+
+#[gpui::test]
+fn golive20b_review_f1_last_window_close_detaches(cx: &mut gpui::TestAppContext) {
+    let f = Fixture::new(cx, true);
+    let (pane, cx) = cx.add_window_view(|window, cx| f.pane(None, window, cx));
+    send(&pane, cx);
+    let mut stream = call(&f, cx);
+    opened(&stream, 0, false);
+    receive_command(&mut stream, cx);
+    cx.update(|_, cx| {
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                crate::lifetime::quit(cx);
+            }
+        })
+        .detach();
+    });
+    let weak = pane.downgrade();
+    drop(pane);
+    cx.update(|window, _| window.remove_window());
+    wait(cx, |_| match stream.commands.try_recv() {
+        Err(channel::error::TryRecvError::Disconnected) => true,
+        Err(_) => false,
+        Ok(command) => panic!("last-window close sent {command}"),
+    });
+    assert!(weak.upgrade().is_none());
+    drop(stream);
+    f.shutdown.drain().unwrap();
+}
+
+#[gpui::test]
+fn golive20b_review_f2_close_during_history_load_stops(cx: &mut gpui::TestAppContext) {
+    let f = Fixture::new(cx, true);
+    *f.fake.running.lock().unwrap() = Some("placeholder-chat".into());
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        let mut pane = f.pane(Some("placeholder-session"), window, cx);
+        // Hold the UI history task pending while the saved running chat closes.
+        pane._history_load = Some(cx.spawn(async |_, _| std::future::pending::<()>().await));
+        pane
+    });
+    pane.update(cx, |pane, cx| {
+        assert!(pane.history_loading);
+        assert!(pane.controller.runtime.is_none());
+        pane.close(cx);
+    });
+    drop(pane);
+    cx.update(|window, _| window.remove_window());
+    let mut stream = call(&f, cx);
+    assert!(matches!(stream.open, ClaudeChatOpen::Chat { .. }));
+    opened(&stream, 0, false);
+    assert_eq!(
+        receive_command(&mut stream, cx),
+        serde_json::to_value(HarnessCommand::Shutdown).unwrap()
+    );
+    drop(stream);
+    f.shutdown.drain().unwrap();
+}
+
+#[gpui::test]
+fn golive20b_review_f3_park_preserves_unloaded_remote_bottom_terminals(
+    cx: &mut gpui::TestAppContext,
+) {
+    let f = Fixture::new(cx, true);
+    let expected = vec![gitterm_core::workspace_config::BottomTerminalConfig {
+        dir: "/remote/project/subdir".into(),
+    }];
+    let bottom = expected.clone();
+    f.store
+        .try_edit_workspaces(move |file| {
+            file.workspaces[0].bottom_terminals = bottom;
+            Ok(())
+        })
+        .wait()
+        .unwrap();
+    let mut store = crate::preview::tests::guarded_store(f.preview.root());
+    let model = crate::workspace_config::load_iced_workspaces_from(&mut store, f.store.root());
+    let layout = store.guard.as_ref().unwrap().preview().layout();
+    let settings = crate::workspace_config::load_iced_settings_from(f.store.root());
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+        let mut shell = crate::Shell::with_owner_settings(
+            Rc::new(crate::data::LocalData(owner.clone())),
+            owner,
+            &layout,
+            true,
+            &settings,
+            window,
+            cx,
+        )
+        .unwrap();
+        shell.set_remote_client(Arc::new(Client(f.fake.clone())));
+        shell
+    });
+    let bottom_terminals = shell.read_with(cx, |shell, cx| {
+        let state = &shell.workspaces[0];
+        assert!(crate::bottom_pane_ids(state, cx).is_empty());
+        shell.live_workspace_bottom_terminals(state.runtime_uid, cx)
+    });
+    // Exercise Park's durable write with the actual Shell inventory capture.
+    crate::workspace_config::save_live_workspace(
+        &f.store,
+        crate::workspace_config::LiveWorkspaceAction::Park {
+            key: gitterm_core::park::Key {
+                name: f.workspace.name.clone(),
+                dir: f.workspace.dir.clone(),
+            },
+            info: gitterm_core::park::Info::new("", "2026-11-27T00:00:00Z".into()),
+            done: false,
+            active_tab: None,
+            tabs: vec![],
+            bottom_terminals,
+        },
+        None,
+    )
+    .unwrap();
+    let saved: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(f.store.root().join("workspaces.json")).unwrap())
+            .unwrap();
+    assert!(saved.workspaces[0].is_parked());
+    assert_eq!(saved.workspaces[0].bottom_terminals, expected);
+}

@@ -7,7 +7,74 @@ pub(crate) struct Binding {
     pub agent: RemoteAgentConfig,
     pub client: Arc<dyn crate::remote_client::RemoteClient>,
 }
+/// A close must outlive a canceled history load and even the pane itself.
+/// The application's shutdown queue owns this lookup, stop, and completion.
+pub(super) struct PendingStop {
+    remote: Binding,
+    config: gitterm_core::harness::claude::ClaudeSessionConfig,
+    _claim: Option<Arc<provider::ConversationClaim>>,
+}
+impl PendingStop {
+    pub(super) fn run(self, executor: &tokio::runtime::Runtime) -> Result<()> {
+        let id = self
+            .config
+            .resume
+            .as_deref()
+            .context("Missing saved remote chat id")?;
+        let Some(id) = self
+            .remote
+            .client
+            .running_chat(&self.remote.agent, id)
+            .map_err(anyhow::Error::msg)
+            .context("List running remote chat for close")?
+        else {
+            return Ok(());
+        };
+        let (mut session, events) = self
+            .remote
+            .client
+            .chat_runtime(&self.remote.agent, self.config, Some(id))
+            .map_err(anyhow::Error::msg)
+            .context("Attach remote chat for close")?;
+        let sent = session.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
+        session.request_shutdown();
+        let completed = executor.block_on(session.completed());
+        drop(events);
+        sent.map_err(anyhow::Error::msg)
+            .context("Send remote chat Shutdown")?;
+        completed
+            .map_err(anyhow::Error::msg)
+            .context("Reap stopped remote chat")
+    }
+}
 impl ChatPane {
+    pub(super) fn stop_restoring_remote(&self) -> Result<()> {
+        if !self.history_loading || self.controller.runtime.is_some() {
+            return Ok(());
+        }
+        let Some(remote) = self.remote.clone() else {
+            return Ok(());
+        };
+        let launch = self
+            .deferred_live
+            .as_ref()
+            .context("Missing remote restore launch")?;
+        let mut config = live_config(
+            self.saved.cwd.clone(),
+            &launch.settings.borrow(),
+            vec![],
+            false,
+        );
+        config.resume = self.saved.session_id.clone();
+        self.shutdown
+            .sender
+            .send(ShutdownCommand::StopRemote(Box::new(PendingStop {
+                remote,
+                config,
+                _claim: self.live_claim.clone(),
+            })))
+            .map_err(|_| anyhow::anyhow!("Remote chat shutdown queue stopped"))
+    }
     pub(crate) fn bind_remote(&mut self, binding: Option<Binding>, cx: &mut Context<Self>) {
         self.controller.remote = binding.is_some();
         self.remote = binding;
