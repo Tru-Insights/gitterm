@@ -783,6 +783,9 @@ impl TaskHostOwner {
     pub(crate) fn host_mut(&mut self) -> &mut TaskHost {
         &mut self.host
     }
+    pub(crate) fn log_state(&self) -> Option<&gitterm_core::log_server::ServerState> {
+        self.servers.as_ref().map(|servers| &servers.log)
+    }
     #[cfg(test)]
     pub(crate) fn task_endpoint(&self) -> Option<String> {
         self.servers

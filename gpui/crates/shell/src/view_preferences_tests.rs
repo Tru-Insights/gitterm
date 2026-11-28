@@ -1,6 +1,7 @@
 use super::*;
 use gitterm_core::{desktop_store::DesktopStore, settings::DesktopSettings};
 use gpui::{TestAppContext, VisualTestContext};
+use std::sync::Arc;
 
 const UNKNOWN: &str = "\"future\" : { \"keep\" : [3, 2, 1] }";
 
@@ -259,6 +260,200 @@ fn gap5_mirroring_menu_and_bottom_use_the_same_iced_setting(cx: &mut TestAppCont
     expected.terminal_log_mirroring_enabled = false;
     saved(root.path(), store.as_ref().unwrap(), &expected);
     cx.read(|cx| assert!(!shell.read(cx).bottom.read(cx).input.mirroring));
+}
+
+fn log_host(root: &Path, cx: &mut VisualTestContext) -> gitterm_core::log_server::ServerState {
+    use crate::task_host::{GpuiTaskHost, HostConfig, Ingress, TaskHostOwner};
+    use gitterm_core::preview::{Preview, ProtectedRoots};
+    let root = root.canonicalize().unwrap();
+    let iced_config = root.join("v6");
+    let roots = Arc::new(
+        Preview::validate(
+            &root.join("preview"),
+            ProtectedRoots::new(&root.join("fixture-home"), [iced_config.clone()]).unwrap(),
+        )
+        .unwrap(),
+    );
+    let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
+    cx.update(|_, cx| {
+        let host = TaskHostOwner::start(
+            HostConfig {
+                roots,
+                iced_config,
+                ingress: Ingress::Channel(sender, receiver),
+            },
+            cx,
+        )
+        .unwrap();
+        let log = host.read(cx).log_state().unwrap().clone();
+        cx.set_global(GpuiTaskHost(host));
+        log
+    })
+}
+
+fn wait_for_logs(cx: &mut VisualTestContext, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "terminal mirror did not settle");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(25));
+        h2_tests::draw(cx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[gpui::test]
+fn terminal_log_mirroring_opt_in_publishes_opt_out_clears(cx: &mut TestAppContext) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    let (root, store, shell, cx) = fixture(cx, true, &Default::default());
+    let log = log_host(root.path(), cx);
+    let main = shell.update_in(cx, |shell, window, cx| {
+        shell.select_session(1, window, cx);
+        let main = shell.active_main_terminal(cx).unwrap();
+        shell.local = true;
+        let active = shell.active_workspace(cx);
+        shell
+            .workspaces
+            .iter_mut()
+            .find(|state| Some(state.workspace.id) == active)
+            .unwrap()
+            .store
+            .terminals = Some(Vec::new());
+        shell.new_terminal_at(DockPlacement::Bottom, None, window, cx);
+        main
+    });
+    let expected_ids: HashSet<_> = cx.read(|cx| {
+        shell
+            .read(cx)
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                let bottom = bottom_pane_ids(workspace, cx);
+                workspace.sessions.iter().filter_map(move |session| {
+                    let id = session_pane_id(session.id);
+                    let pane = workspace.panes.get(&id)?.read(cx);
+                    (matches!(pane.content, pane::PaneContent::Terminal(_))
+                        && !bottom.contains(&id))
+                    .then(|| pane.session.as_ref().unwrap().tab_id)
+                })
+            })
+            .collect()
+    });
+    assert!(expected_ids.len() > 1, "include hidden workspace terminals");
+    main.update(cx, |view, _| {
+        view.backend_mut().handle(gitterm_terminal::Command::Write(
+            b"printf 'mirror-fixture-first\\n'\n".to_vec(),
+        ));
+    });
+    assert!(log.terminals.try_read().unwrap().is_empty());
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(app_menus::ToggleTerminalLogMirroring), cx)
+    });
+    wait_for_logs(cx, || {
+        log.terminals.try_read().is_ok_and(|logs| {
+            logs.values()
+                .any(|s| s.content.contains("mirror-fixture-first"))
+        })
+    });
+    let tab_id = *log.terminals.try_read().unwrap().keys().next().unwrap();
+    {
+        let logs = log.terminals.try_read().unwrap();
+        assert_eq!(logs.keys().copied().collect::<HashSet<_>>(), expected_ids);
+        for (id, snapshot) in logs.iter() {
+            assert_eq!(*id, snapshot.tab_id);
+            assert!(!snapshot.tab_name.is_empty());
+        }
+    }
+    main.update(cx, |view, _| {
+        view.backend_mut().handle(gitterm_terminal::Command::Write(
+            b"printf 'mirror-fixture-updated\\n'\n".to_vec(),
+        ));
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(15));
+    wait_for_logs(cx, || {
+        log.terminals.try_read().is_ok_and(|logs| {
+            logs.values()
+                .any(|s| s.content.contains("mirror-fixture-updated"))
+        })
+    });
+    log.files.try_write().unwrap().insert(
+        tab_id,
+        gitterm_core::log_server::FileSnapshot {
+            file_path: "fixture.md".into(),
+            content: "fixture document".into(),
+        },
+    );
+    // Force a publication to wait on the server lock, then opt out.
+    let held = log.terminals.try_read().unwrap();
+    shell.update(cx, |shell, cx| shell.sync_log_mirroring(cx));
+    wait_for_logs(cx, || log.terminals.try_read().is_err());
+    shell.update_in(cx, |shell, window, cx| {
+        shell.bottom_outcome(bottom_panel::Outcome::ToggleMirroring, window, cx)
+    });
+    drop(held);
+    wait_for_logs(cx, || {
+        log.terminals.try_read().is_ok_and(|logs| logs.is_empty())
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(30));
+    h2_tests::draw(cx);
+    assert!(log.terminals.try_read().unwrap().is_empty());
+    assert_eq!(
+        log.files.try_read().unwrap()[&tab_id].content,
+        "fixture document"
+    );
+    saved(root.path(), store.as_ref().unwrap(), &Default::default());
+    // A saved opt-in restarts publication without another toggle.
+    store
+        .as_ref()
+        .unwrap()
+        .edit_settings(|settings| {
+            settings.terminal_log_mirroring_enabled = true;
+        })
+        .wait()
+        .unwrap();
+    let settings = workspace_config::load_iced_settings_from(&root.path().join("v6"));
+    let _restored = cx.update(|window, cx| cx.new(|cx| build(root.path(), &settings, window, cx)));
+    wait_for_logs(cx, || {
+        log.terminals.try_read().is_ok_and(|logs| !logs.is_empty())
+    });
+}
+
+#[gpui::test]
+fn terminal_log_mirroring_preview_publishes_nothing_to_iced(cx: &mut TestAppContext) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    let settings = DesktopSettings {
+        terminal_log_mirroring_enabled: true,
+        ..Default::default()
+    };
+    let (root, _, shell, cx) = fixture(cx, false, &settings);
+    let path = root.path().join("v6/settings.json");
+    let before = std::fs::read(&path).unwrap();
+    let log = log_host(root.path(), cx);
+    log.terminals.try_write().unwrap().insert(
+        usize::MAX,
+        gitterm_core::log_server::TerminalSnapshot {
+            tab_id: usize::MAX,
+            tab_name: "Iced fixture".into(),
+            content: "existing fixture snapshot".into(),
+        },
+    );
+    shell.update_in(cx, |shell, window, cx| {
+        shell.select_session(1, window, cx);
+        assert!(shell.active_main_terminal(cx).is_some());
+        shell.sync_log_mirroring(cx);
+        shell.toggle_log_mirroring(cx);
+        shell.bottom_outcome(bottom_panel::Outcome::ToggleMirroring, window, cx);
+        assert!(shell.terminal_mirror.is_none());
+    });
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(30));
+    h2_tests::draw(cx);
+    let logs = log.terminals.try_read().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[&usize::MAX].content, "existing fixture snapshot");
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }
 
 #[gpui::test]

@@ -143,7 +143,120 @@ impl Shell {
             },
             cx,
         );
+        self.sync_log_mirroring(cx);
         cx.notify();
+    }
+
+    pub(super) fn sync_log_mirroring(&mut self, cx: &mut Context<Self>) {
+        // Cancel publication before clearing, including a pending server lock.
+        self.terminal_mirror = None;
+        if !Self::live_preferences(cx) {
+            return;
+        }
+        let Some(state) = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .and_then(|host| host.0.read(cx).log_state())
+            .cloned()
+        else {
+            return;
+        };
+        let enabled = self.bottom.read(cx).input.mirroring;
+        self.terminal_mirror = Some(cx.spawn(async move |shell, cx| {
+            if !enabled {
+                state.terminals.write().await.clear();
+                return;
+            }
+            loop {
+                let Ok(jobs) = shell.update(cx, |shell, cx| {
+                    let mut jobs = Vec::new();
+                    // Iced's queue_log_server_sync includes main tabs in every
+                    // workspace, including hidden tabs, but not bottom terminals.
+                    for workspace in &shell.workspaces {
+                        let bottom = bottom_pane_ids(workspace, cx);
+                        for session in &workspace.sessions {
+                            let id = session_pane_id(session.id);
+                            if bottom.contains(&id) {
+                                continue;
+                            }
+                            let Some(pane) = workspace.panes.get(&id) else {
+                                continue;
+                            };
+                            let pane = pane.read(cx);
+                            let pane::PaneContent::Terminal(view) = &pane.content else {
+                                continue;
+                            };
+                            let Some(target) = &pane.session else {
+                                continue;
+                            };
+                            let snapshot = gitterm_core::log_server::TerminalSnapshot {
+                                tab_id: target.tab_id,
+                                tab_name: pane
+                                    .task_folder(cx)
+                                    .and_then(|path| {
+                                        path.file_name().map(|s| s.to_string_lossy().into_owned())
+                                    })
+                                    .unwrap_or_else(|| pane.title.clone()),
+                                content: String::new(),
+                            };
+                            jobs.push((snapshot, view.read(cx).backend().export_job()));
+                        }
+                    }
+                    jobs
+                }) else {
+                    break;
+                };
+                let mut snapshots = HashMap::new();
+                let mut error = None;
+                for (mut snapshot, job) in jobs {
+                    let result = match job {
+                        Ok(job) => loop {
+                            match job.poll() {
+                                gitterm_terminal::JobState::Ready(result) => break result,
+                                gitterm_terminal::JobState::Pending => {
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(20))
+                                        .await;
+                                }
+                            }
+                        },
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(content) => {
+                            snapshot.content = content;
+                            snapshots.insert(snapshot.tab_id, snapshot);
+                        }
+                        Err(failed) => {
+                            if error.is_none() || failed != gitterm_terminal::ServiceError::Busy {
+                                error = Some(failed);
+                            }
+                        }
+                    }
+                }
+                let retry = error == Some(gitterm_terminal::ServiceError::Busy);
+                if let Some(error) = error {
+                    if error != gitterm_terminal::ServiceError::Busy {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.owner.update(cx, |owner, cx| {
+                                owner.error = Some(format!("Mirror terminal logs: {error:?}"));
+                                cx.notify();
+                            });
+                        });
+                    }
+                } else {
+                    // A single cancellable task orders exports, publication and
+                    // opt-out clearing; late export workers cannot republish.
+                    *state.terminals.write().await = snapshots;
+                }
+                cx.background_executor()
+                    .timer(if retry {
+                        std::time::Duration::from_millis(100)
+                    } else {
+                        std::time::Duration::from_secs(15)
+                    })
+                    .await;
+            }
+        }));
     }
 
     pub(super) fn save_global_geometry(&mut self, cx: &mut Context<Self>) {

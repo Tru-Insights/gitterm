@@ -145,6 +145,7 @@ pub struct Shell {
     bottom: Entity<bottom_panel::BottomPanel>,
     run_tabs: HashMap<String, bottom_panel::RunTab>,
     run_url_poll: Option<gpui::Task<()>>,
+    terminal_mirror: Option<gpui::Task<()>>,
     plans_open: bool,
     plans_return_focus: Option<FocusHandle>,
     usage_open: bool,
@@ -461,6 +462,7 @@ impl Shell {
             bottom,
             run_tabs: HashMap::new(),
             run_url_poll: None,
+            terminal_mirror: None,
             plans_open: false,
             plans_return_focus: None,
             usage_open: false,
@@ -587,6 +589,7 @@ impl Shell {
         {
             theme::set_chat_width(width, cx);
         }
+        shell.sync_log_mirroring(cx);
         Ok(shell)
     }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
