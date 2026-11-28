@@ -483,6 +483,16 @@ fn live_review_consult_match_iced_runner_argv_env_cwd(cx: &mut TestAppContext) {
             );
         }
     }
+    let delivered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = delivered.clone();
+    owner.update(cx, |owner, cx| {
+        owner.submit_hook = Some(Box::new(move |submission| { captured.borrow_mut().push(submission.clone()); Some(true) }));
+        owner.deliver_results(cx);
+        owner.deliver_results(cx);
+    });
+    assert_eq!(delivered.borrow().len(), 1);
+    assert_eq!(delivered.borrow()[0].batch.delegation_ids.len(), 2);
+    assert!(TaskStore::load(fixture.source()).unwrap().delegations().iter().all(|d| d.is_delivered()));
     owner.update(cx, |owner, cx| owner.quit(cx));
 }
 
@@ -529,8 +539,14 @@ fn live_delegate_final_stop_grace_and_reused_identity_refusal(cx: &mut TestAppCo
             Some(session),
         )
         .unwrap();
-        let began = Instant::now();
         owner.update(cx, |owner, cx| owner.live_worker_tick(cx));
+        assert!(!fake.file("term", n).exists(), "open parent must receive its result before final close");
+        let began = Instant::now();
+        owner.update(cx, |owner, cx| {
+            owner.submit_hook = Some(Box::new(|_| Some(true)));
+            owner.deliver_results(cx);
+            owner.live_worker_tick(cx);
+        });
         assert!(owner.read_with(cx, |owner, _| {
             owner.host_terminals().iter().any(|id| id == session)
         }));
@@ -693,6 +709,11 @@ fn live_worker_deadline_uses_iced_time_limit_result_and_stop(cx: &mut TestAppCon
     assert!(record.time_limit_reached_at.is_some());
     assert!(record.status.is_final());
     assert!(!record.is_delivered());
+    owner.update(cx, |owner, cx| {
+        owner.submit_hook = Some(Box::new(|_| Some(true)));
+        owner.deliver_results(cx);
+        owner.live_worker_tick(cx);
+    });
     wait_until(cx, |cx| {
         owner.read_with(cx, |owner, _| {
             !owner.host_terminals().iter().any(|id| id == session)

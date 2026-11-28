@@ -4599,3 +4599,57 @@ fn saved_live_settings_reach_first_send_before_a_redraw(cx: &mut TestAppContext)
     });
     assert_eq!(captured.borrow().as_ref(), Some(&chosen));
 }
+
+#[gpui::test]
+fn live_delegation_buttons_emit_the_iced_intents(cx: &mut TestAppContext) {
+    use crate::delegation::tests::{card, with_findings};
+    use crate::interactions::TranscriptAction as A;
+    let (chat, cx) = setup(vec![], cx);
+    cx.simulate_resize(size(px(1400.), px(1000.)));
+    let actions = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let workers = Rc::new(std::cell::RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let captured = actions.clone();
+        cx.subscribe(&chat, move |_, action: &A, _| {
+            captured.borrow_mut().push(action.clone())
+        })
+        .detach();
+        let captured = workers.clone();
+        cx.subscribe(
+            &chat,
+            move |_, action: &crate::model::roster::RosterOutcome, _| {
+                captured.borrow_mut().push(action.clone())
+            },
+        )
+        .detach();
+    });
+    chat.update_in(cx, |view, _, cx| view.enable_delegation_actions(cx));
+    for (card, label) in [
+        (with_findings(), "Send to Claude-primary"),
+        (card("review", "completed"), "Re-run"),
+        (card("review", "completed"), "Dismiss"),
+        (card("consult", "running"), "Cancel"),
+        (card("implement", "running"), "Stop tracking"),
+        (card("implement", "running"), "Open worker tab"),
+    ] {
+        install_card(card, &chat, cx);
+        let id = chat.read_with(cx, |view, _| view.model.rows[0].id);
+        click_selector(format!("delegation-action-{id}-{label}"), cx);
+    }
+    let actions = actions.borrow();
+    assert_eq!(actions.len(), 5);
+    assert!(
+        matches!(&actions[0], A::SendDelegation { id, finding_ids } if id == "review-1" && !finding_ids.is_empty())
+    );
+    assert!(matches!(&actions[1], A::RerunDelegation { id } if id == "review-1"));
+    for (action, label, active) in [
+        (&actions[2], "Dismiss", false),
+        (&actions[3], "Cancel", true),
+        (&actions[4], "Stop tracking", true),
+    ] {
+        assert!(
+            matches!(action, A::Dismiss(request) if request.id == "review-1" && request.label == label && request.active == active)
+        );
+    }
+    assert!(workers.borrow().iter().any(|action| matches!(action, crate::model::roster::RosterOutcome::OpenWorker { id } if id == "review-1")));
+}
