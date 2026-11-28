@@ -1254,6 +1254,7 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     Persist(
         Box<resume::LiveTab>,
+        gitterm_core::desktop_store::DesktopStore,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
@@ -1276,8 +1277,8 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, reply) => {
-                            let result = tab.persist().map_err(|error| {
+                        ShutdownCommand::Persist(tab, store, reply) => {
+                            let result = tab.persist(&store).map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {
@@ -1363,12 +1364,17 @@ impl Render for ChatPane {
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
-            .children(self.resume_error.clone().map(|error| {
-                div().p_2().child(error).child(
-                    gpui_component::button::Button::new("start-fresh-chat")
-                        .label("Start a fresh chat here")
-                        .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
-                )
+            .children(self.resume_error.as_ref().map(|_| {
+                div()
+                    .id("resume-failure-recovery")
+                    .debug_selector(|| "resume-failure-recovery".into())
+                    .p_2()
+                    .child(
+                        gpui_component::button::Button::new("start-fresh-chat")
+                            .debug_selector(|| "start-fresh-chat".into())
+                            .label("Start a fresh chat here")
+                            .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
+                    )
             }))
     }
 }
