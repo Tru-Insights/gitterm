@@ -50,6 +50,9 @@ impl Shell {
         let Some(source) = source else {
             return;
         };
+        if source.read(cx).is_remote() {
+            return;
+        }
         let current = source.read(cx).cwd();
         if let Some(path) = gitterm_core::editor::known_checkout_path(
             &[],
@@ -80,7 +83,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.local {
+        if !self.local || source.read(cx).is_remote() {
             return;
         }
         let Some(workspace) = self.workspaces.iter().find(|workspace| workspace.panes.values().any(|pane| matches!(&pane.read(cx).content, pane::PaneContent::PreviewChat(chat) if chat == source))) else { return; };
