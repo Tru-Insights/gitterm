@@ -58,6 +58,7 @@ mod pane;
 mod park;
 pub mod park_sheet;
 pub mod phone;
+mod plans_viewer;
 mod pr_confirm;
 mod pr_live;
 pub mod preview;
@@ -101,9 +102,8 @@ use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
-    size,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
     Root, StyledExt,
@@ -151,6 +151,8 @@ pub struct Shell {
     run_url_poll: Option<gpui::Task<()>>,
     terminal_mirror: Option<gpui::Task<()>>,
     plans_open: bool,
+    plans_content: Entity<content::window::ContentWindow>,
+    plans_request: Option<plans_viewer::Request>,
     plans_return_focus: Option<FocusHandle>,
     usage_open: bool,
     usage_return_focus: Option<FocusHandle>,
@@ -288,6 +290,7 @@ impl Shell {
         let usage_page = cx.new(|_| usage::UsagePage::from_input(usage_input.clone()));
         gitterm_gpui_review::init(cx);
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
+        let plans_content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
         let saved_parked = if local {
             owner.read(cx).saved_parked()
@@ -364,6 +367,17 @@ impl Shell {
             }
             cx.notify();
         })];
+        subscriptions.push(
+            cx.observe_in(&plans_content, window, |this, content, window, cx| {
+                let close = content.update(cx, |content, _| {
+                    std::mem::take(&mut content.close_requested)
+                });
+                if close && this.plans_open {
+                    this.toggle_plans(window, cx);
+                }
+                cx.notify();
+            }),
+        );
         for state in &mut workspaces {
             if !state.store.path.exists() {
                 state.store.regions.bottom_height = bottom.read(cx).input.height;
@@ -476,6 +490,8 @@ impl Shell {
             run_url_poll: None,
             terminal_mirror: None,
             plans_open: false,
+            plans_content,
+            plans_request: None,
             plans_return_focus: None,
             usage_open: false,
             usage_return_focus: None,
@@ -4457,81 +4473,6 @@ impl Shell {
         }
         cx.notify();
     }
-    fn toggle_plans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.plans_open {
-            self.plans_open = false;
-            if let Some(focus) = self.plans_return_focus.take() {
-                focus.focus(window, cx);
-            }
-        } else if self.active_workspace(cx).is_some() {
-            self.plans_return_focus = window.focused(cx);
-            self.plans_open = true;
-            self.focus.focus(window, cx);
-        }
-        cx.notify();
-    }
-    fn plans_viewer(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let p = Palette::current(cx);
-        let workspace = self.active(cx).workspace.id;
-        let state = self.work_state.borrow();
-        let documents = state.documents(workspace.0);
-        let mut list = div()
-            .id("plans-documents")
-            .debug_selector(|| "plans-documents".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_2();
-        if let Some(result) = documents.and_then(|docs| docs.result.as_ref()) {
-            if result.documents.is_empty() {
-                list = list.child("No documents found.");
-            }
-            for (index, document) in result.documents.iter().enumerate() {
-                let path = document.newest().path.clone();
-                list = list.child(
-                    Button::new(("plan", index))
-                        .debug_selector(move || format!("plan-{index}"))
-                        .label(format!("{} · {}", document.title, document.rel))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_plans(window, cx);
-                            this.owner.update(cx, |owner, cx| {
-                                owner.open_file(workspace, path.clone(), cx)
-                            });
-                        })),
-                );
-            }
-            if result.truncated {
-                list = list.child("Some documents may be missing: scan limit reached.");
-            }
-        } else {
-            list = list.child("Loading documents…");
-        }
-        if let Some(error) = documents.and_then(|docs| docs.error.as_ref()) {
-            list = list.child(div().text_color(rgb(p.red)).child(error.clone()));
-        }
-        div()
-            .id("plans-viewer")
-            .debug_selector(|| "plans-viewer".into())
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_4()
-            .gap_3()
-            .bg(rgb(p.base))
-            .child(
-                div().flex().justify_between().child("Documents").child(
-                    Button::new("close-plans")
-                        .label("Close")
-                        .on_click(cx.listener(|this, _, w, cx| this.toggle_plans(w, cx))),
-                ),
-            )
-            .child(list)
-    }
     fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
         if size == theme::chat_appearance(cx).font_size {
@@ -4908,6 +4849,7 @@ impl Render for Shell {
             }
         }
         self.sync_content_selection(cx);
+        self.sync_plans_viewer(window, cx);
         if let Some(switcher) = &self.task_switcher {
             let inputs = self.switcher_inputs(cx);
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
@@ -4946,6 +4888,11 @@ impl Render for Shell {
                                 window,
                                 cx,
                             );
+                        }
+                        if let work_sidebar::WorkSidebarOutcome::OpenDocument { workspace, path } =
+                            outcome
+                        {
+                            shell.open_work_document(WorkspaceId(*workspace), path, window, cx);
                         }
                         shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
@@ -5095,6 +5042,8 @@ impl Render for Shell {
                                     .h_full()
                                     .child(self.usage_page.clone())
                                     .into_any_element()
+                            } else if self.plans_open {
+                                self.plans_viewer(cx).into_any_element()
                             } else {
                                 self.find_content(cx).into_any_element()
                             }),
@@ -5144,7 +5093,6 @@ impl Render for Shell {
                     .as_ref()
                     .and_then(|panel| task_panel::modal_view(panel, self.task_inputs(cx), cx)),
             )
-            .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
             .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))

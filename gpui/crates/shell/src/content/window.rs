@@ -102,6 +102,7 @@ impl SurfaceHost for WindowHost {
     }
 }
 enum Source {
+    Prepared,
     Local {
         root: PathBuf,
         relative: PathBuf,
@@ -139,6 +140,7 @@ pub struct ContentWindow {
     pub selected: Option<String>,
     covered: [bool; 3],
     pub picker: bool,
+    pub(crate) close_requested: bool,
     pub resizing: bool,
     prior_focus: Option<WeakFocusHandle>,
     fallback_focus: FocusHandle,
@@ -163,6 +165,10 @@ impl ContentWindow {
                         for entry in this.entries.values_mut() {
                             let before = entry.viewer.state();
                             if let Some(host) = &mut entry.viewer.host_mut().native {
+                                if host.take_close_requested() {
+                                    this.close_requested = true;
+                                    changed = true;
+                                }
                                 for url in host.drain_external() {
                                     cx.open_url(&url);
                                 }
@@ -201,6 +207,7 @@ impl ContentWindow {
             selected: None,
             covered: [false; 3],
             picker: false,
+            close_requested: false,
             resizing: false,
             prior_focus: None,
             fallback_focus: cx.focus_handle(),
@@ -305,6 +312,60 @@ impl ContentWindow {
         // Newly opened entries also inherit covers that predate their creation.
         self.apply_covers(window, cx);
     }
+    /// A dedicated read-only document prepared off-thread, with the same cover,
+    /// geometry and stale-completion handling as ordinary Viewer content.
+    pub(crate) fn open_prepared(
+        &mut self,
+        id: String,
+        origin: Origin,
+        prepare: impl FnOnce() -> Result<Document, String> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close(&id);
+        self.close_requested = false;
+        let mut failed = None;
+        let host = WindowHost::new(window, None).unwrap_or_else(|error| {
+            failed = Some(error);
+            WindowHost {
+                native: None,
+                navigation: vec![],
+                page: None,
+            }
+        });
+        let mut viewer = RetainedViewer::new(host);
+        let ticket = viewer.begin_content(origin);
+        self.entries.insert(
+            id.clone(),
+            Entry {
+                source: Source::Prepared,
+                viewer,
+                covers: [None; 3],
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(error) = failed {
+                        Err(error)
+                    } else {
+                        prepare()
+                    }
+                })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if let Some(entry) = this.entries.get_mut(&id) {
+                    entry.viewer.complete_content(&ticket, result);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        self.apply_covers(window, cx);
+        cx.notify();
+    }
+
     /// Load `url` in the Page entry `id`. The same store reuses its surface;
     /// another store rebuilds it, since a WebKit view's store is fixed.
     #[allow(clippy::too_many_arguments)]
@@ -468,7 +529,7 @@ impl ContentWindow {
         }
     }
     #[cfg(test)]
-    pub(super) fn document(&self, id: &str) -> Option<&Document> {
+    pub(crate) fn document(&self, id: &str) -> Option<&Document> {
         let viewer = &self.entries.get(id)?.viewer;
         (viewer.state() != State::Loading)
             .then(|| viewer.document())
@@ -477,14 +538,14 @@ impl ContentWindow {
     pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.entries.get(id)?.source {
             Source::Local { root, relative } => Some((root.clone(), relative.clone())),
-            Source::Page { .. } => None,
+            Source::Page { .. } | Source::Prepared => None,
         }
     }
     /// The URL and login store a Page entry was asked to show.
     pub(crate) fn page(&self, id: &str) -> Option<(&str, &PageStore)> {
         match &self.entries.get(id)?.source {
             Source::Page { url, store, .. } => Some((url, store)),
-            Source::Local { .. } => None,
+            Source::Local { .. } | Source::Prepared => None,
         }
     }
     /// Whether the workspace's viewer cover currently shows this pane.

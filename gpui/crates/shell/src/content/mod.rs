@@ -3,8 +3,8 @@
 //! `window` owns the shell's surfaces, off-thread preparation, native result
 //! draining, deadlines, selection and window-relative pane geometry. Component
 //! popup/dialog state and native pickers cover the selected surface before paint.
-//! There are no IPC handlers. Document links follow the Iced Viewer
-//! network/navigation policy; a remote Page has its own login store and policy.
+//! A local message can only request viewer dismissal. Document links follow the
+//! Iced Viewer network/navigation policy; a remote Page has its own login store and policy.
 pub(crate) mod actions;
 pub mod host;
 pub mod overlay;
@@ -176,6 +176,15 @@ impl Document {
             return Err(format!("Invalid plan path: {relative}"));
         }
         Self::local_file(root, Path::new(relative), dark)
+    }
+
+    pub(crate) fn plans_viewer(html: String) -> Self {
+        Self {
+            html,
+            text: String::new(),
+            signature: None,
+            page_url: None,
+        }
     }
 
     /// A remote Page. Only HTTP(S) URLs are accepted.

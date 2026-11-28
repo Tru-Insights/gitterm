@@ -260,67 +260,6 @@ fn park_submit_uses_sheet_once_and_preserves_its_note(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn plans_document_uses_existing_read_only_file_viewer(cx: &mut TestAppContext) {
-    let _test_app = crate::test_app::Cleanup::new(cx);
-    use gitterm_core::work::{
-        documents::{CopySource, Document, DocumentCopy, ScanResult},
-        state::{Effect, Intent},
-    };
-    let (root, shell, cx) = h7_tests::fixture(cx);
-    let path = root.path().join("work/file.txt");
-    cx.update(|_, cx| {
-        shell.update(cx, |shell, cx| {
-            let workspace = shell.active(cx).workspace.id.0;
-            let effects = shell
-                .work_state
-                .borrow_mut()
-                .reduce(Intent::ScanDocuments(workspace));
-            let stamp = effects
-                .into_iter()
-                .find_map(|effect| match effect {
-                    Effect::ScanDocuments { stamp, .. } => Some(stamp),
-                    _ => None,
-                })
-                .unwrap();
-            shell
-                .work_state
-                .borrow_mut()
-                .reduce(Intent::DocumentsFinished {
-                    stamp,
-                    result: Ok(ScanResult {
-                        documents: vec![Document {
-                            key: "fixture".into(),
-                            title: "Fixture document".into(),
-                            rel: ".plans/fixture.md".into(),
-                            differ: false,
-                            copies: vec![DocumentCopy {
-                                path: path.clone(),
-                                source: CopySource::WorkDocs,
-                                modified: std::time::SystemTime::now(),
-                            }],
-                        }],
-                        truncated: false,
-                    }),
-                    now: Instant::now(),
-                });
-            cx.notify();
-        })
-    });
-    dispatch(OpenPlansViewer, cx);
-    let bounds = cx.debug_bounds("plan-0").unwrap();
-    cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-    draw(cx);
-    cx.read(|cx| {
-        let shell = shell.read(cx);
-        assert!(!shell.plans_open);
-        assert_eq!(
-            shell.selected_files[&shell.active(cx).workspace.id].path,
-            path
-        );
-    });
-}
-
-#[gpui::test]
 fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppContext) {
     let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h6_tests::sample(cx);
