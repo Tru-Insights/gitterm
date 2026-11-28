@@ -2276,7 +2276,7 @@ pub trait RemoteAgentsFileStore: Sized {
 
 impl RemoteAgentsFileStore for RemoteAgentsFile {
     fn save_for_shutdown(&self) -> Result<(), String> {
-        save_shutdown_json(&Self::file_path(), self)
+        gitterm_core::remote::connect::save_remote_agents(&global_config_dir(), self)
     }
 
     fn file_path() -> PathBuf {
@@ -2294,12 +2294,10 @@ impl RemoteAgentsFileStore for RemoteAgentsFile {
     }
 
     fn save(&self) {
-        let path = Self::file_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+        if let Err(error) =
+            gitterm_core::remote::connect::save_remote_agents(&global_config_dir(), self)
+        {
+            eprintln!("{error}");
         }
     }
 }

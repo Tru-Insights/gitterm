@@ -2,6 +2,8 @@
 #[cfg(feature = "runtime")]
 pub mod client;
 pub mod config;
+#[cfg(feature = "runtime")]
+pub mod connect;
 pub mod phone_panel;
 #[cfg(feature = "runtime")]
 pub mod protocol;
