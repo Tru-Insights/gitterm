@@ -392,6 +392,8 @@ fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut 
     use gitterm_gpui_chat::review::{ReviewKind, ReviewOutcome};
     cx.update(install_app_menus);
     let (root, shell, cx) = fixture(cx);
+    cx.simulate_resize(size(px(1400.), px(900.)));
+    draw(cx);
     let source = root.path().join("iced");
     std::fs::write(source.join("settings.json"), r#"{"review":{"default_reviewer":"codex","subagent_model":"fable","codex_model":"gpt-6.1-sol"}}"#).unwrap();
     let before = ["workspaces.json", "settings.json", "tasks.json"]
@@ -400,6 +402,7 @@ fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut 
         shell.select_workspace_id(WorkspaceId(2), window, cx)
     });
     draw(cx);
+    workspace_navigation::settle_slide(cx, 1);
     let chat = cx.read(|cx| {
         let shell = shell.read(cx);
         let state = shell.active(cx);
