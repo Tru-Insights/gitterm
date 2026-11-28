@@ -7,6 +7,7 @@
 //! tick persists identities, enforces time limits, promotes queues and closes
 //! final workers after identity-checked TERM/grace. Delivery stays closed.
 //! Live creates tasks and saves handoffs through core on the locked V6 store.
+//! Live merge plans use the same root and the watch owned by `crate::pr_live`.
 //! Later-slice writes, restore and delivery retain the Preview notices.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
@@ -1147,7 +1148,7 @@ impl TaskHostOwner {
     }
 
     /// Iced's `merge_plan_set` for the caller's root chat, written to the
-    /// preview's merge-plan dir (never Iced's). The target is the caller
+    /// admitted Live root or the fixture preview's own merge-plan dir. The target is the caller
     /// pane's directory. The write is synchronous, so no second set can
     /// interleave with it as Iced's `plan_writes` guards against.
     // shortcut: the plan file is written on the UI thread; move it to the
@@ -1172,12 +1173,25 @@ impl TaskHostOwner {
             .collect();
         self.authorize_write(label, &target)?;
         let (conversation, links) = self.caller_conversation(TOOL, caller, cx)?;
-        let root = root_chat(&self.iced_config, &links, &conversation);
+        let live_prs = self
+            .is_live()
+            .then(|| cx.try_global::<crate::pr_live::LivePrs>().cloned())
+            .flatten();
+        let root = live_prs
+            .as_ref()
+            .map(|prs| prs.root_chat(&conversation, &links))
+            .unwrap_or_else(|| root_chat(&self.iced_config, &links, &conversation));
         let entries = merge_plan::validate_entries(request.entries)?;
-        let dir = merge_plan::plans_dir(self.roots.root());
-        self.roots
-            .create_private_dir(&dir)
-            .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        let dir = if self.is_live() {
+            merge_plan::plans_dir(self.host.services().state_root())
+        } else {
+            merge_plan::plans_dir(self.roots.root())
+        };
+        if !self.is_live() {
+            self.roots
+                .create_private_dir(&dir)
+                .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        }
         let mut plan = merge_plan::load_plans(&dir)
             .remove(&root)
             .unwrap_or_else(|| MergePlan {
@@ -1187,16 +1201,23 @@ impl TaskHostOwner {
         let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let kept_holds = plan.replace_entries(entries, &stamp);
         let file = merge_plan::plan_path(&dir, &root)?;
-        self.roots
-            .scoped(&file)
-            .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        if !self.is_live() {
+            self.roots
+                .scoped(&file)
+                .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        }
         merge_plan::write_plan(&dir, &plan)
             .map_err(|error| format!("the merge plan was not saved: {error}"))?;
         eprintln!(
             "[merge-plan] {root}: plan set with {} PR(s)",
             plan.entries.len()
         );
-        let mut value = merge_plan_in(&self.iced_config, &dir, &links, &conversation);
+        if let Some(prs) = &live_prs {
+            prs.request_refresh();
+        }
+        let mut value = live_prs
+            .map(|prs| prs.merge_plan(&conversation, &links))
+            .unwrap_or_else(|| merge_plan_in(&self.iced_config, &dir, &links, &conversation));
         value["kept_holds"] =
             serde_json::Value::from(kept_holds.iter().map(|key| key.label()).collect::<Vec<_>>());
         Ok(value)
@@ -1601,6 +1622,15 @@ impl TaskHostOwner {
             Ok(resolved) => resolved,
             Err(error) => return reply.send(Err(error)),
         };
+        if self.is_live()
+            && let Some(prs) = cx.try_global::<crate::pr_live::LivePrs>().cloned()
+        {
+            cx.background_spawn(async move {
+                reply.send(Ok(prs.merge_plan(&conversation, &links)));
+            })
+            .detach();
+            return;
+        }
         let (iced_config, plans_dir) = (self.iced_config.clone(), self.plans_dir());
         cx.background_spawn(async move {
             reply.send(Ok(merge_plan_in(

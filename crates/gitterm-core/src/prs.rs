@@ -992,10 +992,28 @@ pub async fn run_action(
         Some(user) => Some(account_token(user).await?),
         None => None,
     };
-    let mut command = gh_async(token.as_deref())?;
-    let args = action_args(action, &key);
+    run_action_with_token(action, key, token.as_deref(), account.as_deref(), None).await
+}
+
+/// Runs with the same credential that was verified by the Live confirmation.
+/// Iced keeps its existing argv; Live merge also pins GitHub's head precondition.
+#[cfg(feature = "runtime")]
+pub async fn run_action_with_token(
+    action: PrAction,
+    key: PrKey,
+    token: Option<&str>,
+    account: Option<&str>,
+    expected_head: Option<&str>,
+) -> Result<String, String> {
+    let mut command = gh_async(token)?;
+    let mut args = action_args(action, &key);
+    if matches!(action, PrAction::Merge(_)) {
+        if let Some(head) = expected_head {
+            args.extend(["--match-head-commit".to_string(), head.to_string()]);
+        }
+    }
     command.args(&args);
-    let what = action_command_line(action, &key, account.as_deref());
+    let what = action_command_line(action, &key, account);
     let output = output_within(command, &what).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

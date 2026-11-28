@@ -56,6 +56,7 @@ mod park;
 pub mod park_sheet;
 pub mod phone;
 mod pr_confirm;
+mod pr_live;
 pub mod preview;
 #[cfg(test)]
 mod region_tests;
@@ -4995,6 +4996,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
             // namespace included), so keep a copy of the one the host gets.
             let chat_services = live_services.as_deref().cloned();
             let started = if let Some(services) = live_services {
+                pr_live::LivePrs::install(services.clone(), cx);
                 task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
             } else {
                 task_host::TaskHostOwner::start_locked(config, host_lock, cx)
