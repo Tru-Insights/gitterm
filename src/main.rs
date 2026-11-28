@@ -17418,11 +17418,15 @@ impl App {
                     ));
                 }
                 ReviewEffect::SaveMarks => {
-                    if let Some(Ok(marks)) = self.review.marks() {
+                    if let (Some(Ok(marks)), Some(previous)) =
+                        (self.review.marks(), self.review.marks_before_save())
+                    {
                         if let Err(error) =
-                            review_pane::save_viewed_marks(marks, &config::global_config_dir())
+                            marks.save_changes(previous, &config::global_config_dir())
                         {
                             eprintln!("[review] {error}");
+                        } else {
+                            self.review.marks_saved();
                         }
                     }
                 }

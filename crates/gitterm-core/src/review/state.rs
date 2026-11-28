@@ -156,6 +156,7 @@ pub struct State {
     pane: Option<Pane>,
     generation: u64,
     marks: Option<Result<ViewedMarks, String>>,
+    marks_before_save: Option<ViewedMarks>,
 }
 impl State {
     pub fn pane(&self) -> Option<&Pane> {
@@ -163,6 +164,13 @@ impl State {
     }
     pub fn marks(&self) -> Option<&Result<ViewedMarks, String>> {
         self.marks.as_ref()
+    }
+    /// Snapshot before pending edits; retained until the host acknowledges a save.
+    pub fn marks_before_save(&self) -> Option<&ViewedMarks> {
+        self.marks_before_save.as_ref()
+    }
+    pub fn marks_saved(&mut self) {
+        self.marks_before_save = None;
     }
     pub fn accepts_ipc(&self, message: &ReviewIpc, visible: bool) -> bool {
         visible
@@ -284,6 +292,7 @@ impl State {
                 match *result {
                     Ok(load) => {
                         if let (Some(live), Some(Ok(marks))) = (&load.live_paths, &mut self.marks) {
+                            self.marks_before_save.get_or_insert_with(|| marks.clone());
                             if marks.prune(&load.canonical_checkout, live) {
                                 effects.push(Effect::SaveMarks);
                             }
@@ -304,6 +313,7 @@ impl State {
                 effects
             }
             Intent::MarksLoaded(marks) => {
+                self.marks_before_save = None;
                 self.marks = Some(marks);
                 Vec::new()
             }
@@ -320,6 +330,7 @@ impl State {
                 };
                 match self.marks.as_mut() {
                     Some(Ok(marks)) => {
+                        self.marks_before_save.get_or_insert_with(|| marks.clone());
                         if marks.set(canonical, file, viewed) {
                             vec![Effect::SaveMarks]
                         } else {
