@@ -455,6 +455,8 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
+        subscriptions
+            .push(cx.observe(&owner, |shell, _, cx| shell.sync_settings_sheet_pending(cx)));
         // Panes, their sessions and the active one change with the shell.
         subscriptions.push(cx.observe_self(|shell, cx| shell.sync_task_panes(cx)));
         let mut shell = Self {
