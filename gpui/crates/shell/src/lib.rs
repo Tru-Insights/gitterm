@@ -81,6 +81,7 @@ mod task_host_tests;
 mod task_panel;
 pub mod task_switcher;
 pub mod tasks;
+mod terminal_setup;
 mod theme;
 pub mod usage;
 pub mod work_sidebar;
@@ -265,6 +266,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        cx.set_global(terminal_setup::Scrollback(settings.scrollback_lines));
         let client_height = f32::from(window.viewport_size().height);
         owner.update(cx, |owner, _| {
             if let Some(notifications) = &mut owner.notifications {
@@ -3605,15 +3607,16 @@ impl Shell {
         };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
-            gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
-                .with_exit_callback(move |_, cx| {
+            terminal_setup::launch(launch, terminal_setup::Placement::Main, cx).with_exit_callback(
+                move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
                             pane.mark_exited(cx);
                             cx.notify();
                         }
                     });
-                })
+                },
+            )
         });
         self._subscriptions
             .push(cx.observe_in(&view, window, |_, view, window, cx| {
@@ -4897,6 +4900,7 @@ impl Render for Shell {
             ));
         }
         for state in &self.workspaces {
+            terminal_setup::sync_workspace_insets(state, cx);
             for pane in state.panes.values() {
                 if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
                     view.clone()

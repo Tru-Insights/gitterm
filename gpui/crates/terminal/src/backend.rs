@@ -412,6 +412,11 @@ impl Backend {
         self.events.mark_dirty();
     }
     pub fn set_history_limit(&mut self, lines: usize) {
+        // A first render may synchronize the grid before starting the deferred PTY.
+        // Keep the startup settings in sync so startup cannot restore the old limit.
+        if let Some(settings) = &mut self.pending_settings {
+            settings.scrollback_lines = lines;
+        }
         self.pending_history = Some(lines);
         self.events.mark_dirty();
     }
