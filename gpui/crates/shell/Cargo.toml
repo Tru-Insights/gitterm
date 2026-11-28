@@ -25,6 +25,7 @@ shell-words = "=1.1.1"
 gpui-kit = "=0.11.0"
 gpui-component = "=0.11.0"
 anyhow = "1"
+base64 = "0.22"
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }

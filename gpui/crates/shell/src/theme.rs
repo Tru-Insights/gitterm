@@ -136,6 +136,7 @@ pub fn apply_settings<C, U, R>(
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
+    cx.set_global(crate::terminal_setup::Scrollback(settings.scrollback_lines));
     cx.set_global(ChatFontSize(settings.chat_font_size));
     set_chat_width(settings.chat_width, cx);
     // Iced selects Light only for the exact persisted value "light".
@@ -153,10 +154,15 @@ pub fn apply_settings<C, U, R>(
 pub fn sync_terminal_typography(view: &gpui::Entity<gitterm_terminal::TerminalView>, cx: &mut App) {
     let theme = Theme::global(cx);
     let current = view.read(cx).config();
-    if current.font_family == theme.mono_font_family && current.font_size == theme.mono_font_size {
+    let colors = gitterm_terminal::ColorPalette::for_theme(theme.mode.is_dark());
+    if current.font_family == theme.mono_font_family
+        && current.font_size == theme.mono_font_size
+        && current.colors == colors
+    {
         return;
     }
     let mut config = current.clone();
+    config.colors = colors;
     config.font_family = theme.mono_font_family.to_string();
     config.font_size = theme.mono_font_size;
     view.update(cx, |view, cx| view.update_config(config, cx));

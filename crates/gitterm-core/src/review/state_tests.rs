@@ -314,6 +314,14 @@ fn viewed_pruning_and_errors_keep_the_single_marks_authority() {
     ));
     assert_eq!(
         state
+            .marks_before_save()
+            .unwrap()
+            .state(&stamp.target.checkout, &file),
+        ViewedState::Viewed
+    );
+    state.marks_saved();
+    assert_eq!(
+        state
             .marks()
             .unwrap()
             .as_ref()
@@ -336,6 +344,13 @@ fn viewed_pruning_and_errors_keep_the_single_marks_authority() {
     ));
     assert_eq!(
         state
+            .marks_before_save()
+            .unwrap()
+            .state(&stamp.target.checkout, &file),
+        ViewedState::Unviewed
+    );
+    assert_eq!(
+        state
             .marks()
             .unwrap()
             .as_ref()
@@ -343,6 +358,16 @@ fn viewed_pruning_and_errors_keep_the_single_marks_authority() {
             .state(&stamp.target.checkout, &file),
         ViewedState::Viewed
     );
+    // A failed host save has no acknowledgement: the next edit must retry all
+    // pending changes against the same original snapshot.
+    let pending = state.marks_before_save().cloned();
+    state.reduce(Intent::ToggleViewed {
+        path: "a.rs".into(),
+        viewed: false,
+    });
+    assert_eq!(state.marks_before_save(), pending.as_ref());
+    state.marks_saved();
+    assert!(state.marks_before_save().is_none());
     state.reduce(Intent::MarksLoaded(Err("malformed store".into())));
     assert!(matches!(
         ipc(
@@ -381,4 +406,25 @@ fn viewed_pruning_and_errors_keep_the_single_marks_authority() {
         .as_slice(),
         [Effect::OpenFile(_)]
     ));
+}
+
+#[test]
+fn noise_filter_is_presentation_only_and_preserves_the_loaded_generation() {
+    let mut state = State::default();
+    assert!(state.reduce(Intent::SetHideNoise(false)).is_empty());
+    let stamp = open(&mut state, "/tmp/checkout", "page");
+    state.reduce(Intent::CollectFinished {
+        stamp: stamp.clone(),
+        result: Box::new(Ok(load(&stamp))),
+    });
+    assert!(matches!(
+        state.reduce(Intent::SetHideNoise(false)).as_slice(),
+        [Effect::Render]
+    ));
+    let pane = state.pane().unwrap();
+    assert!(!pane.hide_noise);
+    assert_eq!(pane.generation, stamp.generation);
+    assert!(pane.loaded.is_some());
+    assert_eq!(pane.token, "page");
+    assert_eq!(pane.focus.as_deref(), Some("a.rs"));
 }

@@ -264,22 +264,7 @@ impl App {
     /// The Usage glyph's tooltip: the shortcut, then each window's % and
     /// reset, alerts, and "as of" for an old reading.
     pub(super) fn plan_limits_tooltip(&self) -> String {
-        let now = now_unix();
-        let mut lines = vec!["Usage  ⌘⇧U".to_string()];
-        match self.plan_limits.file().usage_badge.level {
-            plan_limits::UsageBadgeLevel::Hot => lines.push("Plan usage is running hot".into()),
-            plan_limits::UsageBadgeLevel::Urgent => lines.push("Plan usage is urgent".into()),
-            plan_limits::UsageBadgeLevel::OnTrack => {}
-        }
-        for reading in self.plan_limits.file().readings() {
-            lines.extend(plan_limits::tooltip_lines(
-                reading,
-                &self.plan_limits.file().history,
-                now,
-                &chrono::Local,
-            ));
-        }
-        lines.join("\n")
+        plan_limits::usage_tooltip(self.plan_limits.file(), now_unix(), &chrono::Local)
     }
 
     /// "Plan limits" at the top of the Usage view: one block per provider.

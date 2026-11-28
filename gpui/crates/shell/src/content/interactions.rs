@@ -69,7 +69,7 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
             shell.open_file_viewer(
                 &FileOpen {
                     workspace: WorkspaceId(1),
-                    path,
+                    path: path.clone(),
                     changed: None,
                     from_files: true,
                 },
@@ -78,11 +78,15 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
             );
         })
     });
+    wait_for_document(shell, &path, cx);
+
     draw(cx);
 }
 
 #[gpui::test]
-fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestAppContext) {
+fn copy_all_uses_displayed_snapshot_including_large_preview_and_browser_still_uses_full_file(
+    cx: &mut TestAppContext,
+) {
     let _test_app = crate::test_app::Cleanup::new(cx);
     let (folder, config, shell, cx) = fixture(cx);
     let out = tempfile::tempdir().unwrap();
@@ -109,14 +113,16 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
     );
     open(&shell, raw.clone(), cx);
     let copy_config_before = tree_bytes(config.path());
+    std::fs::write(&raw, "changed on disk after opening").unwrap();
     click(cx, "viewer-copy-all");
     cx.read(|cx| {
         assert_eq!(
             cx.read_from_clipboard().unwrap().text().as_deref(),
-            Some(text.as_str())
+            Some(preview.text.as_str())
         )
     });
     assert_eq!(tree_bytes(config.path()), copy_config_before);
+    std::fs::write(&raw, &text).unwrap();
     for path in [&raw, &markdown, &long_markdown, &html] {
         open(&shell, path.clone(), cx);
         assert_eq!(cx.debug_bounds("viewer-copy-all").is_some(), path == &raw);
@@ -449,6 +455,133 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[gpui::test]
+fn chat_edit_review_changed_file_opens_owning_checkout_in_preview(cx: &mut TestAppContext) {
+    chat_edit_review(cx, false);
+}
+
+#[gpui::test]
+fn chat_edit_review_committed_file_opens_against_base_in_preview(cx: &mut TestAppContext) {
+    chat_edit_review(cx, true);
+}
+
+fn chat_edit_review(cx: &mut TestAppContext, committed: bool) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (_folder, _config, shell, cx) = fixture_with_preview(cx, true);
+    let repo = tempfile::tempdir_in("/private/tmp").unwrap();
+    let git = |root: &Path, args: &[&str]| {
+        let output = gitterm_core::git_status::git_command()
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(repo.path(), &["init", "-qb", "main"]);
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "base"]);
+    let checkout = repo.path().join("linked");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir(checkout.join("tests")).unwrap();
+    let file = checkout.join("tests/[edit].rs");
+    std::fs::write(&file, "fn placeholder() {}\n").unwrap();
+    if committed {
+        git(&checkout, &["add", "."]);
+        git(&checkout, &["commit", "-qm", "edit"]);
+    }
+    let before = tree_bytes(repo.path());
+    let chat = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.new_claude_chat(None, window, cx);
+            let state = shell.active(cx);
+            let pane::PaneContent::PreviewChat(chat) = &state.panes
+                [&session_pane_id(state.active_session.unwrap())]
+                .read(cx)
+                .content
+            else {
+                panic!("chat pane")
+            };
+            chat.clone()
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open_chat_file(&chat, &file, (true, None), window, cx);
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        draw(cx);
+        let loaded = cx.read(|cx| {
+            let shell = shell.read(cx);
+            let Some(visit) = shell.content.read(cx).visits.get(&WorkspaceId(1)) else {
+                return false;
+            };
+            let pane = &shell.active(cx).panes[&visit.pane];
+            let pane::PaneContent::Review(review) = &pane.read(cx).content else {
+                panic!("aggregate review pane")
+            };
+            let Some(pane) = review.read(cx).branch_review(cx) else {
+                return false;
+            };
+            assert!(pane.error.is_none(), "{:?}", pane.error);
+            if pane.loaded.is_none() {
+                return false;
+            }
+            assert_eq!(pane.target.checkout, checkout);
+            assert_eq!(
+                pane.source,
+                if committed {
+                    gitterm_core::review::model::ReviewSource::VsBase
+                } else {
+                    gitterm_core::review::model::ReviewSource::Uncommitted
+                }
+            );
+            assert_eq!(pane.focus.as_deref(), Some("tests/[edit].rs"));
+            assert!(!pane.hide_noise, "a focused test file must stay visible");
+            assert!(
+                pane.loaded
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .file("tests/[edit].rs")
+                    .is_some()
+            );
+            assert!(
+                shell.owner.read(cx).reviews.is_empty(),
+                "aggregate review must not use workspace status"
+            );
+            true
+        });
+        if loaded {
+            break;
+        }
+        assert!(Instant::now() < deadline, "chat edit review did not load");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        tree_bytes(repo.path()),
+        before,
+        "review must not write checkout or Git metadata"
+    );
+}
+
+#[gpui::test]
 fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
     cx: &mut TestAppContext,
 ) {
@@ -615,4 +748,270 @@ fn work_sidebar_and_chat_navigation_reach_the_shared_editor_request(cx: &mut Tes
         )
     });
     assert_eq!(std::fs::read_to_string(path).unwrap(), "unchanged");
+}
+
+#[gpui::test]
+fn review_host_live_marks_use_iced_file_and_reader(cx: &mut TestAppContext) {
+    review_host_marks_mode(true, cx);
+}
+
+#[gpui::test]
+fn review_host_preview_marks_leave_iced_bytes_untouched(cx: &mut TestAppContext) {
+    review_host_marks_mode(false, cx);
+}
+
+fn review_host_marks_mode(live: bool, cx: &mut TestAppContext) {
+    use gitterm_core::review::{
+        model::ReviewSource,
+        state::{Effect, Intent},
+        viewed::{VIEWED_FILE, ViewedMarks, ViewedState},
+    };
+    use gitterm_gpui_review::model::AggregateModel;
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let iced = root.path().join("iced");
+    let iced_path = iced.join(VIEWED_FILE);
+    let initial = br#"{"checkouts":{"/tmp/other-checkout":{"other.rs":"existing"}}}"#;
+    std::fs::write(&iced_path, initial).unwrap();
+    let host = cx.update(|_, cx| {
+        if live {
+            let services = gitterm_core::preview::service::ServiceContext::production(
+                &iced,
+                "review-marks-test",
+            )
+            .unwrap();
+            crate::chat::policy::install_live(services, cx).unwrap();
+        }
+        shell.update(cx, |shell, cx| shell.review_host(WorkspaceId(1), cx))
+    });
+    let repo = edit_card_repo();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (target, _) = executor
+        .block_on(gitterm_gpui_review::repo::aggregate_target(
+            repo.path().into(),
+        ))
+        .unwrap();
+    let mut model = AggregateModel::default();
+    model.dispatch(Intent::MarksLoaded(
+        gitterm_gpui_review::marks::load_merged(
+            host.iced_marks_dir.as_deref(),
+            host.preview_marks_dir.as_deref(),
+        ),
+    ));
+    let effects = model.dispatch(Intent::Open {
+        target,
+        source: ReviewSource::Uncommitted,
+        hide_noise: false,
+        focus: None,
+        page: AggregateModel::page(),
+    });
+    let stamp = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Collect(stamp) => Some(stamp),
+            _ => None,
+        })
+        .unwrap();
+    model.dispatch(executor.block_on(gitterm_gpui_review::repo::collect_aggregate(stamp)));
+    let file = model.projection().files[0].file.clone();
+    let intent = model.viewed_intent(&file.path).unwrap();
+    assert!(
+        model
+            .dispatch(intent)
+            .iter()
+            .any(|effect| matches!(effect, Effect::SaveMarks))
+    );
+    let marks = model.state().marks().unwrap().as_ref().unwrap();
+    let overlay = gitterm_gpui_review::marks::overlay(
+        host.iced_marks_dir.as_deref(),
+        host.preview_marks_dir.as_deref(),
+        marks,
+    )
+    .unwrap();
+    (host.save_marks.as_ref().unwrap())(overlay.encode().unwrap()).unwrap();
+    let saved_dir = if live {
+        iced.clone()
+    } else {
+        host.preview_marks_dir.clone().unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ViewedMarks::load(&saved_dir)
+            .unwrap()
+            .state(repo.path(), &file)
+            == ViewedState::Viewed
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "viewed marks not saved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if live {
+        assert!(host.preview_marks_dir.is_none());
+        assert_eq!(
+            ViewedMarks::load(&iced).unwrap(),
+            *marks,
+            "Iced's reader sees the mark"
+        );
+        assert_eq!(
+            std::fs::read(&iced_path).unwrap(),
+            marks.encode().unwrap(),
+            "Iced's saved bytes"
+        );
+        assert!(!root.path().join("preview").join(VIEWED_FILE).exists());
+    } else {
+        assert_eq!(std::fs::read(&iced_path).unwrap(), initial);
+        let merged =
+            gitterm_gpui_review::marks::load_merged(Some(&iced), Some(&saved_dir)).unwrap();
+        assert_eq!(merged.state(repo.path(), &file), ViewedState::Viewed);
+    }
+}
+
+fn edit_card_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir_in("/private/tmp").unwrap();
+    review_git(repo.path(), &["init", "-qb", "main"]);
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    review_git(repo.path(), &["add", "."]);
+    review_git(repo.path(), &["commit", "-qm", "base"]);
+    review_git(repo.path(), &["switch", "-qc", "feature"]);
+    std::fs::create_dir(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/done.rs"), "fn done() {}\n").unwrap();
+    review_git(repo.path(), &["add", "."]);
+    review_git(repo.path(), &["commit", "-qm", "done"]);
+    std::fs::write(repo.path().join("src/[pending].rs"), "fn pending() {}\n").unwrap();
+    repo
+}
+
+fn review_git(root: &Path, args: &[&str]) {
+    let output = gitterm_core::git_status::git_command()
+        .current_dir(root)
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+
+fn wait_for_document(shell: &Entity<Shell>, path: &Path, cx: &mut VisualTestContext) {
+    let id = crate::content_pane_id(WorkspaceId(1), path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        cx.executor().advance_clock(Duration::from_millis(30));
+        draw(cx);
+        if cx.read(|cx| shell.read(cx).content.read(cx).document(&id).is_some()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "document did not load: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[gpui::test]
+fn clicking_open_file_reuses_unchanged_snapshot_and_reloads_iced_change_signature(
+    cx: &mut TestAppContext,
+) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (folder, _config, shell, cx) = fixture(cx);
+    let path = folder.path().join("reload.txt");
+    std::fs::write(&path, "before").unwrap();
+    let id = crate::content_pane_id(WorkspaceId(1), &path);
+    open(&shell, path.clone(), cx);
+    let (signature, address, panes) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let doc = shell.content.read(cx).document(&id).unwrap();
+        (
+            doc.signature.unwrap(),
+            doc.html().as_ptr() as usize,
+            shell.active(cx).panes.len(),
+        )
+    });
+    open(&shell, path.clone(), cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell
+                .read(cx)
+                .content
+                .read(cx)
+                .document(&id)
+                .unwrap()
+                .html()
+                .as_ptr() as usize,
+            address
+        )
+    });
+    // Same byte length: mtime is essential, not just size.
+    std::fs::write(&path, "AFTER!").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100)),
+        )
+        .unwrap();
+    open(&shell, path.clone(), cx);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let doc = shell.content.read(cx).document(&id).unwrap();
+        assert_eq!(doc.text, "AFTER!");
+        assert_ne!(doc.signature, Some(signature));
+        assert_eq!(shell.active(cx).panes.len(), panes);
+    });
+    // Preserve mtime while changing length: both parts of Iced's signature matter.
+    std::fs::write(&path, "longer snapshot").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100)),
+        )
+        .unwrap();
+    open(&shell, path, cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).content.read(cx).document(&id).unwrap().text,
+            "longer snapshot"
+        )
+    });
+}
+
+#[gpui::test]
+fn closing_file_viewer_clears_files_row_selection(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (folder, _config, shell, cx) = fixture(cx);
+    let path = folder.path().join("selected.txt");
+    std::fs::write(&path, "snapshot").unwrap();
+    let owner = shell.read_with(cx, |shell, _| shell.owner.clone());
+    let files = cx.new(|cx| {
+        crate::files_view::FilesView::new(
+            WorkspaceId(1),
+            Rc::new(data::LocalData(owner.clone())),
+            cx,
+        )
+    });
+    owner.update(cx, |owner, cx| {
+        owner.open_file(WorkspaceId(1), path.clone(), cx)
+    });
+    wait_for_document(&shell, &path, cx);
+    assert_eq!(
+        files.read_with(cx, |view, _| view.selected_file().map(Path::to_path_buf)),
+        Some(path)
+    );
+    click(cx, "close-file-viewer");
+    assert!(files.read_with(cx, |view, _| view.selected_file().is_none()));
 }

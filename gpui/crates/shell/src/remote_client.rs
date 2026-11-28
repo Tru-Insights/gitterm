@@ -26,6 +26,44 @@ use gitterm_core::{
 /// Blocking reads, run on the background executor. Errors are user-facing.
 pub trait RemoteClient: Send + Sync {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String>;
+    /// Live only; Preview callers never enter this route. Default fakes stay offline.
+    fn start_session(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _workspace: String,
+        _launch: gitterm_core::remote::launch::AgentSessionLaunch,
+    ) -> Result<String, String> {
+        Err("remote session launch unavailable".into())
+    }
+    /// Live chat supervision; defaults keep Preview and read-only fakes inert.
+    fn chat_runtime(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _config: gitterm_core::harness::claude::ClaudeSessionConfig,
+        _attach: Option<String>,
+    ) -> Result<
+        (
+            gitterm_core::chat::runtime::Session,
+            tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::types::HarnessEvent>,
+        ),
+        String,
+    > {
+        Err("Remote chat unavailable".into())
+    }
+    fn chat_history(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _id: &str,
+    ) -> Result<Vec<gitterm_core::chat::state::AgentEvent>, String> {
+        Err("Remote chat history unavailable".into())
+    }
+    fn running_chat(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _id: &str,
+    ) -> Result<Option<String>, String> {
+        Err("Remote running chats unavailable".into())
+    }
     /// Iced's picker source: the remote's whole filesystem (root "/").
     fn list_dir(&self, remote: &RemoteAgentConfig, dir: String) -> SourceDirListing;
     fn list_chats(&self, remote: &RemoteAgentConfig) -> Result<Vec<ChatIndexEntry>, String>;
@@ -71,6 +109,87 @@ impl RemoteClient for AgentClient {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String> {
         let backend = PreviewSourceHost::backend(remote.clone().into());
         block_on(backend.handshake())?.map_err(|error| error.to_string())
+    }
+    fn start_session(
+        &self,
+        remote: &RemoteAgentConfig,
+        workspace: String,
+        launch: gitterm_core::remote::launch::AgentSessionLaunch,
+    ) -> Result<String, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(backend.start_session(
+            workspace,
+            launch.cwd,
+            launch.kind,
+            launch.command,
+            launch.env,
+            launch.cols,
+            launch.rows,
+        ))?
+        .map(|session| session.session_id)
+        .map_err(|error| error.to_string())
+    }
+    fn chat_runtime(
+        &self,
+        remote: &RemoteAgentConfig,
+        config: gitterm_core::harness::claude::ClaudeSessionConfig,
+        attach: Option<String>,
+    ) -> Result<
+        (
+            gitterm_core::chat::runtime::Session,
+            tokio::sync::mpsc::UnboundedReceiver<gitterm_core::chat::types::HarnessEvent>,
+        ),
+        String,
+    > {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        Ok(match attach {
+            Some(id) => gitterm_core::harness::remote_chat::attach_remote(backend, config, id),
+            None => gitterm_core::harness::remote_chat::spawn_remote(backend, config),
+        })
+    }
+    fn chat_history(
+        &self,
+        remote: &RemoteAgentConfig,
+        id: &str,
+    ) -> Result<Vec<gitterm_core::chat::state::AgentEvent>, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        let entries = block_on(backend.claude_chat_history(id.into()))?
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        Ok(gitterm_core::chat::history::history_timeline(entries, &[])
+            .into_iter()
+            .map(|event| match event {
+                gitterm_core::chat::history::HistoryEvent::Harness(event) => {
+                    gitterm_core::chat::state::AgentEvent::Harness(event)
+                }
+                gitterm_core::chat::history::HistoryEvent::Other(value) => {
+                    gitterm_core::chat::state::AgentEvent::Other(value)
+                }
+            })
+            .collect())
+    }
+    fn running_chat(&self, remote: &RemoteAgentConfig, id: &str) -> Result<Option<String>, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(async {
+            let handshake = backend
+                .handshake()
+                .await
+                .map_err(|error| error.to_string())?;
+            if !handshake
+                .capabilities
+                .iter()
+                .any(|c| c == gitterm_core::harness::remote_chat::CLAUDE_CHAT_PERSISTENT_CAPABILITY)
+            {
+                return Ok(None);
+            }
+            Ok(backend
+                .list_claude_chats()
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|chat| chat.claude_session_id == id)
+                .map(|chat| chat.chat_id))
+        })?
     }
     fn list_dir(&self, remote: &RemoteAgentConfig, dir: String) -> SourceDirListing {
         let source = WorkspaceSource::<PreviewSourceHost>::RemoteAgent {

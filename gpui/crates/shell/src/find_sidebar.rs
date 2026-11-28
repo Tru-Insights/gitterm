@@ -2760,9 +2760,30 @@ impl crate::Shell {
                 .reduce(Intent::ClosePreview(target_owner));
             self.refresh_find(window, cx);
             cx.notify();
-        } else if self.live_chat_enabled(cx) && id.remote_id.is_none() {
+        } else if self.live_chat_enabled(cx) {
             let indexed = entry(&self.find_state.borrow(), id).cloned();
-            if let Some(workspace) = self.active_workspace(cx) {
+            let workspace = self
+                .active_workspace(cx)
+                .filter(|&workspace| {
+                    self.owner
+                        .read(cx)
+                        .iced_workspace(workspace)
+                        .and_then(crate::workspace_config::workspace_remote_id)
+                        == id.remote_id
+                })
+                .or_else(|| {
+                    self.workspaces
+                        .iter()
+                        .find(|state| {
+                            self.owner
+                                .read(cx)
+                                .iced_workspace(state.workspace.id)
+                                .and_then(crate::workspace_config::workspace_remote_id)
+                                == id.remote_id
+                        })
+                        .map(|state| state.workspace.id)
+                });
+            if let Some(workspace) = workspace {
                 match self.open_saved_live_chat(workspace, &id.id, indexed, window, cx) {
                     Ok(()) => {
                         self.find_state
@@ -2774,6 +2795,12 @@ impl crate::Shell {
                         cx.notify();
                     }),
                 }
+            } else {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error =
+                        Some("Open a workspace on this remote machine to resume its chat.".into());
+                    cx.notify();
+                });
             }
         } else {
             self.owner.update(cx, |owner, cx| {

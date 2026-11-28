@@ -16,7 +16,7 @@ gpui-kit = "=0.11.0"
 gpui-component = { version = "=0.11.0", features = ["syntect"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-gpui-pre = { version = "=0.3.14", features = ["test-support"] }
+gpui-pre = { version = "=0.3.14", features = ["test-support", "bench-support"] }
 gpui-component = { version = "=0.11.0", features = ["test-support"] }
 
 [dev-dependencies]

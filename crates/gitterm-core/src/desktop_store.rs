@@ -192,6 +192,98 @@ impl DesktopStore {
         })
     }
 
+    /// Sheet writes share the serialized V6 owner, including guidelines' sidecar.
+    pub fn edit_workspace_settings(
+        &self,
+        target: crate::workspace_config::WorkspaceTarget,
+        edit: crate::workspace_settings::Edit,
+    ) -> Receipt<WorkspacesFile> {
+        use crate::workspace_settings::Edit;
+        if matches!(
+            edit,
+            Edit::GuidelinesEnabled(_) | Edit::GuidelinesRepo { .. }
+        ) {
+            return self.submit(move |state, root| {
+                let file = match &state.workspaces.loaded {
+                    LoadState::Valid(file) => file,
+                    LoadState::Refused(error) => return Err(error.clone()),
+                    LoadState::Missing => return Err("Workspace is no longer open".into()),
+                };
+                target.index(file)?;
+                let path = root.join(crate::guidelines::SETTINGS_FILE);
+                let previous = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::symlink_metadata(&path) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => None,
+                            _ => return Err(format!("cannot read {}: {error}", path.display())),
+                        }
+                    }
+                    Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+                };
+                let mut wire: serde_json::Value = match &previous {
+                    Some(bytes) => serde_json::from_slice(bytes)
+                        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?,
+                    None => serde_json::json!({}),
+                };
+                if !wire.is_object() {
+                    return Err(format!(
+                        "cannot parse {}: expected an object",
+                        path.display()
+                    ));
+                }
+                let mut settings: crate::guidelines::GuidelinesSettings =
+                    serde_json::from_value(wire.clone())
+                        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+                match edit {
+                    Edit::GuidelinesEnabled(on) => settings.enabled = on,
+                    Edit::GuidelinesRepo { repo, enabled } => {
+                        settings.set_repo_off(&repo, !enabled)
+                    }
+                    _ => unreachable!(),
+                }
+                // Iced's two fields, keeping fields belonging to newer desktops.
+                wire["enabled"] = settings.enabled.into();
+                wire["off_repos"] =
+                    serde_json::to_value(settings.off_repos).map_err(|e| e.to_string())?;
+                if previous.as_ref().is_none_or(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(bytes)
+                        .ok()
+                        .as_ref()
+                        != Some(&wire)
+                }) {
+                    let bytes = serde_json::to_vec_pretty(&wire).map_err(|e| e.to_string())?;
+                    crate::atomic_file::write_atomically(&path, &bytes)?;
+                }
+                Ok(file.clone())
+            });
+        }
+        let root = self.root().to_path_buf();
+        self.try_edit_workspaces(move |file| {
+            let index = target.index(file)?;
+            match edit {
+                Edit::Env(edit) => file.edit_workspace_env(&target, edit)?,
+                Edit::Profile(name) => {
+                    // Like Iced, a profile that vanished between render and click is a no-op.
+                    if let Some(profile) = crate::workspace_settings::load_profiles(&root)
+                        .and_then(|mut profiles| profiles.remove(&name))
+                    {
+                        file.edit_workspace_env(
+                            &target,
+                            crate::workspace_settings::EnvEdit::Profile(profile),
+                        )?;
+                    }
+                }
+                Edit::GuidelinesWorkspace(on) => file.workspaces[index].guidelines_off = !on,
+                Edit::Chrome(on) => file.workspaces[index].claude_in_chrome = on,
+                Edit::Decisions(dir) => file.workspaces[index].decisions_repo = dir,
+                Edit::Color(color) => file.workspaces[index].color = color,
+                _ => unreachable!(),
+            }
+            Ok(())
+        })
+    }
+
     pub fn edit_settings(
         &self,
         edit: impl FnOnce(&mut DesktopSettings) + Send + 'static,
@@ -613,5 +705,52 @@ mod transaction_tests {
             std::fs::read(root.path().join("workspaces.json")).unwrap(),
             bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_settings_tests {
+    use super::*;
+    use crate::{workspace_config::WorkspaceTarget, workspace_settings::Edit};
+
+    #[test]
+    fn workspace_settings_guidelines_preserve_unknown_fields_and_refuse_malformed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let file: WorkspacesFile = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[{"name":"Work","abbrev":"W","dir":"/tmp/repo","color":"blue","tabs":[]}]})).unwrap();
+        std::fs::write(
+            root.path().join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let store = DesktopStore::open(root.path()).unwrap();
+        let path = root.path().join(crate::guidelines::SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            br#"{"enabled":true,"off_repos":[],"future":{"keep":true}}"#,
+        )
+        .unwrap();
+        store
+            .edit_workspace_settings(target.clone(), Edit::GuidelinesEnabled(false))
+            .wait()
+            .unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"enabled":false,"off_repos":[],"future":{"keep":true}})
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        store
+            .edit_workspace_settings(target.clone(), Edit::GuidelinesEnabled(false))
+            .wait()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, b"{malformed").unwrap();
+        assert!(store
+            .edit_workspace_settings(target, Edit::GuidelinesEnabled(true))
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{malformed");
     }
 }

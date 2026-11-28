@@ -36,6 +36,9 @@ use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
+use gitterm_core::content::syntax::{
+    syntect_syntax_for_path, syntect_syntax_set, syntect_theme_for, syntect_theme_set,
+};
 use similar::{ChangeTag, TextDiff};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,8 +49,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 #[cfg(feature = "excalidraw")]
@@ -2403,38 +2404,7 @@ impl ParkMode {
     }
 }
 
-/// Why a running parked workspace came back to the bar (TRU-186), shown
-/// on its chip until it is visited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeReason {
-    NeedsYou,
-    Finished,
-    Failed,
-}
-
-impl WakeReason {
-    /// The chat attention marks that wake it: a question or permission
-    /// request, a finished turn, an error. Delegation results are not a
-    /// chat of its own asking.
-    fn for_attention(reason: AttentionReason) -> Option<Self> {
-        match reason {
-            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
-            AttentionReason::CompletedUnread => Some(Self::Finished),
-            AttentionReason::AgentFailed => Some(Self::Failed),
-            AttentionReason::DelegationReady(_)
-            | AttentionReason::DelegationFailed(_)
-            | AttentionReason::DelegationBlocked(_) => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NeedsYou => "needs you",
-            Self::Finished => "finished",
-            Self::Failed => "failed",
-        }
-    }
-}
+use gitterm_core::park::WakeReason;
 
 /// The wake a chat event raises: the attention mark it drives today
 /// (`agent_event_attention_reason`), no detection of its own.
@@ -2973,9 +2943,6 @@ const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
 const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
 const LARGE_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
 const LARGE_TEXT_PREVIEW_LINES: usize = 2000;
-const MAX_SYNTAX_HIGHLIGHT_BYTES: usize = 96 * 1024;
-const MAX_SYNTAX_HIGHLIGHT_LINES: usize = 1200;
-const MAX_SYNTAX_HIGHLIGHT_SEGMENTS: usize = 8000;
 const MAX_FILE_VIEW_RENDER_LINES: usize = 1200;
 const MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX: usize = 1200;
 const MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES: usize = 768 * 1024;
@@ -3126,17 +3093,9 @@ pub struct FileVersionSignature {
 }
 
 fn file_version_signature(path: &Path) -> Option<FileVersionSignature> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified_unix_nanos = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-
-    Some(FileVersionSignature {
-        modified_unix_nanos,
-        file_len: metadata.len(),
+    gitterm_core::content::file_version_signature(path).map(|signature| FileVersionSignature {
+        modified_unix_nanos: signature.modified_unix_nanos,
+        file_len: signature.file_len,
     })
 }
 
@@ -3238,41 +3197,6 @@ fn hash_diff_lines(diff_lines: &[DiffLine]) -> u64 {
     hasher.finish()
 }
 
-fn syntect_syntax_set() -> &'static SyntaxSet {
-    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn syntect_theme_set() -> &'static ThemeSet {
-    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
-
-fn syntect_theme_for(is_dark_theme: bool) -> &'static syntect::highlighting::Theme {
-    let theme_set = syntect_theme_set();
-    let preferred = if is_dark_theme {
-        [
-            "base16-eighties.dark",
-            "base16-ocean.dark",
-            "Solarized (dark)",
-        ]
-    } else {
-        ["InspiredGitHub", "base16-ocean.light", "Solarized (light)"]
-    };
-
-    for name in preferred {
-        if let Some(theme) = theme_set.themes.get(name) {
-            return theme;
-        }
-    }
-
-    theme_set
-        .themes
-        .values()
-        .next()
-        .expect("syntect default themes should not be empty")
-}
-
 fn warm_syntect_engine() {
     let started = Instant::now();
     let syntax_set = syntect_syntax_set();
@@ -3312,61 +3236,6 @@ fn warm_syntect_engine() {
     perf_log!("syntect warmup took={}ms", started.elapsed().as_millis());
 }
 
-fn syntect_syntax_for_path(path: &Path) -> &'static SyntaxReference {
-    let syntax_set = syntect_syntax_set();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_ascii_lowercase();
-        if let Some(syntax) = syntax_set.find_syntax_by_extension(&ext) {
-            return syntax;
-        }
-
-        // Some packaged syntax sets do not register TS/TSX extensions.
-        // Fall back to close JavaScript/TypeScript aliases before plain text.
-        let alias_extensions: &[&str] = match ext.as_str() {
-            "ts" => &["tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
-            "tsx" => &["ts", "jsx", "js", "mjs", "cjs"],
-            "mts" | "cts" => &["ts", "js", "mjs", "cjs"],
-            "jsx" => &["js", "tsx", "ts", "mjs", "cjs"],
-            "mjs" | "cjs" => &["js", "jsx", "ts", "tsx"],
-            _ => &[],
-        };
-        for alias in alias_extensions {
-            if let Some(syntax) = syntax_set.find_syntax_by_extension(alias) {
-                return syntax;
-            }
-        }
-
-        let alias_tokens: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &["typescript", "ts", "tsx", "javascript", "js", "jsx"],
-            "js" | "jsx" | "mjs" | "cjs" => &["javascript", "js", "jsx", "typescript", "ts", "tsx"],
-            _ => &[],
-        };
-        for token in alias_tokens {
-            if let Some(syntax) = syntax_set.find_syntax_by_token(token) {
-                return syntax;
-            }
-        }
-
-        let alias_names: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &[
-                "TypeScript",
-                "TypeScript React",
-                "JavaScript",
-                "JavaScript (Babel)",
-            ],
-            "js" | "jsx" | "mjs" | "cjs" => &["JavaScript", "JavaScript (Babel)", "TypeScript"],
-            _ => &[],
-        };
-        for name in alias_names {
-            if let Some(syntax) = syntax_set.find_syntax_by_name(name) {
-                return syntax;
-            }
-        }
-    }
-
-    syntax_set.find_syntax_plain_text()
-}
-
 fn syntect_color_to_iced(color: syntect::highlighting::Color) -> iced::Color {
     // Keep syntax colors fully opaque in the Iced viewer; some themes encode alpha in ways
     // that can make token colors appear washed out or invisible.
@@ -3394,94 +3263,27 @@ fn build_syntax_highlight_lines(
         }
     }
 
-    let total_bytes = content.len();
-
-    let syntax_set = syntect_syntax_set();
-    let syntax = syntect_syntax_for_path(path);
-    let theme = syntect_theme_for(is_dark_theme);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let fallback_color = if is_dark_theme {
-        color!(0xcdd6f4)
-    } else {
-        color!(0x4c4f69)
-    };
-
-    let mut highlighted_lines =
-        Vec::with_capacity(total_line_count.min(MAX_SYNTAX_HIGHLIGHT_LINES));
-    let mut parse_errors = 0usize;
-    let mut highlighted_line_count = 0usize;
-    let mut highlighted_bytes = 0usize;
-    let mut highlighted_segment_count = 0usize;
-    let mut truncation_notice: Option<String> = None;
-
-    for line_with_ending in LinesWithEndings::from(content) {
-        let line_bytes = line_with_ending.len();
-        if highlighted_line_count >= MAX_SYNTAX_HIGHLIGHT_LINES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} lines for performance.",
-                MAX_SYNTAX_HIGHLIGHT_LINES
-            ));
-            break;
-        }
-        if highlighted_bytes + line_bytes > MAX_SYNTAX_HIGHLIGHT_BYTES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first ~{} KB for performance.",
-                MAX_SYNTAX_HIGHLIGHT_BYTES / 1024
-            ));
-            break;
-        }
-
-        let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        let mut segments = Vec::new();
-        if let Ok(ranges) = highlighter.highlight_line(line_with_ending, syntax_set) {
-            for (style, token) in ranges {
-                let token = token.trim_end_matches(['\r', '\n']);
-                if token.is_empty() {
-                    continue;
-                }
-                segments.push(SyntaxHighlightSegment {
-                    text: token.to_string(),
-                    color: syntect_color_to_iced(style.foreground),
-                });
-            }
-        } else {
-            parse_errors += 1;
-        }
-
-        highlighted_segment_count += segments.len();
-        if highlighted_segment_count > MAX_SYNTAX_HIGHLIGHT_SEGMENTS {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} tokens for performance.",
-                MAX_SYNTAX_HIGHLIGHT_SEGMENTS
-            ));
-            break;
-        }
-
-        if segments.is_empty() {
-            let fallback_text = if line.is_empty() { " " } else { line };
-            segments.push(SyntaxHighlightSegment {
-                text: fallback_text.to_string(),
-                color: fallback_color,
-            });
-        }
-
-        highlighted_line_count += 1;
-        highlighted_bytes += line_bytes;
-        highlighted_lines.push(SyntaxHighlightLine { segments });
-    }
-
-    perf_log!(
-        "syntect path={} syntax={} lines={} highlighted_lines={} bytes={} highlighted_bytes={} parse_errors={} truncated={}",
-        path.display(),
-        syntax.name,
-        total_line_count,
-        highlighted_lines.len(),
-        total_bytes,
-        highlighted_bytes,
-        parse_errors,
-        truncation_notice.is_some()
-    );
-    let lines = Some(highlighted_lines);
+    let (lines, truncation_notice) =
+        gitterm_core::content::syntax::build_syntax_highlight_lines(path, content, is_dark_theme);
+    let lines = lines.map(|lines| {
+        lines
+            .into_iter()
+            .map(|line| SyntaxHighlightLine {
+                segments: line
+                    .segments
+                    .into_iter()
+                    .map(|segment| SyntaxHighlightSegment {
+                        text: segment.text,
+                        color: iced::Color::from_rgb8(
+                            segment.color[0],
+                            segment.color[1],
+                            segment.color[2],
+                        ),
+                    })
+                    .collect(),
+            })
+            .collect()
+    });
     if let Some(key) = cache_key {
         if let Ok(mut cache) = syntax_highlight_cache().lock() {
             cache.put(
@@ -3730,58 +3532,7 @@ impl RunOutput {
 
 use gitterm_core::workspace_config::detect_run_command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionReason {
-    HumanInputRequired,
-    AgentFailed,
-    CompletedUnread,
-    /// A Codex review or consult this tab requested has its result (TRU-142).
-    DelegationReady(gitterm::tasks::DelegationKind),
-    /// A Codex review or consult this tab requested failed.
-    DelegationFailed(gitterm::tasks::DelegationKind),
-    /// A worker this tab delegated reported itself blocked (TRU-142 S6):
-    /// it needs the human.
-    DelegationBlocked(gitterm::tasks::DelegationKind),
-}
-
-impl AttentionReason {
-    /// Rank on the shared attention scale: 0 input needed · 1 failed ·
-    /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
-    /// completions by construction.
-    fn priority(self) -> u8 {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => 0,
-            Self::AgentFailed | Self::DelegationFailed(_) => 1,
-            Self::CompletedUnread | Self::DelegationReady(_) => 3,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired => gitterm_core::attention_notifications::INPUT_REQUIRED,
-            Self::AgentFailed => "Agent failed",
-            Self::CompletedUnread => "Ready to review",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Consult) => "Consult ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Implement) => "Worker done",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
-            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => {
-                gitterm_core::attention_notifications::WORKER_BLOCKED
-            }
-            Self::DelegationBlocked(_) => gitterm_core::attention_notifications::DELEGATION_BLOCKED,
-        }
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => "●",
-            Self::AgentFailed | Self::DelegationFailed(_) => "!",
-            Self::CompletedUnread | Self::DelegationReady(_) => "✓",
-        }
-    }
-}
+use gitterm_core::attention::AttentionReason;
 
 #[derive(Debug, Clone, Copy)]
 struct TabAttention {
@@ -4081,9 +3832,7 @@ use gitterm_core::attention_notifications::{
 };
 
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
-    title
-        .starts_with('✳')
-        .then_some(AttentionReason::HumanInputRequired)
+    gitterm_core::attention::terminal_title_attention_reason(title)
 }
 
 /// Row presentation for a task attention reason on the shared priority
@@ -4100,49 +3849,13 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
     }
 }
 
-/// What a chat tab's icon in the session strip says about its live session
-/// (TRU-140). Terminal tabs get this from Claude's own title; a chat tab
-/// has no title, so the strip reads the agent session instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatTabMarker {
-    /// A permission prompt or question waits on the human: the strip's
-    /// "needs you" dot. `pulse` is off on the tab in front, whose page
-    /// already shows the request card.
-    NeedsYou { pulse: bool },
-    /// A turn is running: the strip's ▶ marker.
-    Running,
-}
-
-/// The marker for a chat tab: a pending request outranks a running turn
-/// (the human is the blocker); neither means the tab falls back to its
-/// attention icon or the idle chat glyph. Clears as soon as the requests
-/// are answered and the turn ends, since both inputs are live state.
-fn chat_tab_marker(
-    turn_running: bool,
-    pending_requests: usize,
-    is_active: bool,
-) -> Option<ChatTabMarker> {
-    if pending_requests > 0 {
-        Some(ChatTabMarker::NeedsYou { pulse: !is_active })
-    } else if turn_running {
-        Some(ChatTabMarker::Running)
-    } else {
-        None
-    }
-}
+use gitterm_core::attention::{chat_tab_marker, ChatTabMarker};
 
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
     match event {
-        tab::AgentEvent::Harness(harness_event) => match harness_event {
-            HarnessEvent::RuntimeRequest { .. } => Some(AttentionReason::HumanInputRequired),
-            HarnessEvent::TurnCompleted { status, .. } => match status {
-                TurnStatus::Completed => Some(AttentionReason::CompletedUnread),
-                TurnStatus::Failed(_) => Some(AttentionReason::AgentFailed),
-                TurnStatus::Interrupted => None,
-            },
-            HarnessEvent::Error(_) => Some(AttentionReason::AgentFailed),
-            _ => None,
-        },
+        tab::AgentEvent::Harness(event) => {
+            gitterm_core::attention::harness_event_attention_reason(event)
+        }
         tab::AgentEvent::Result(_) => Some(AttentionReason::CompletedUnread),
         tab::AgentEvent::Other(value) => match value.get("type").and_then(|value| value.as_str()) {
             Some("done") => Some(AttentionReason::CompletedUnread),
@@ -6314,10 +6027,6 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -8342,23 +8051,8 @@ impl TerminalRedrawQueue {
     }
 }
 
-use gitterm_core::remote::token::expand_home_path;
-
 fn remote_session_definition_from_config(config: &RemoteSessionConfig) -> RemoteSessionDefinition {
-    RemoteSessionDefinition {
-        host: RemoteHostConfig {
-            name: config.host_name.clone(),
-            ssh_target: config.ssh_target.clone(),
-            identity_file: expand_home_path(&config.identity_file),
-            tmux_path: config.tmux_path.clone(),
-        },
-        label: config.label.clone(),
-        session_name: config.session_name.clone(),
-        remote_dir: config.remote_dir.clone(),
-        shell_command: config.shell_command.clone(),
-        codex_command: config.codex_command.clone(),
-        claude_command: config.claude_command.clone(),
-    }
+    config.into()
 }
 
 fn remote_session_config_from_definition(
@@ -8402,23 +8096,21 @@ fn remote_agent_for_session<'a>(
     definitions: &'a [RemoteAgentConfig],
     session: &RemoteSessionDefinition,
 ) -> Option<&'a RemoteAgentConfig> {
-    definitions.iter().find(|agent| {
-        agent.id == session.host.name
-            || agent.name == session.host.name
-            || agent.name.eq_ignore_ascii_case(&session.host.name)
-    })
+    gitterm_core::remote::launch::remote_agent_for_session(definitions, session)
 }
 
 fn remote_agent_location_for_session(
     definitions: &[RemoteAgentConfig],
     session: &RemoteSessionDefinition,
 ) -> Option<WorkspaceLocation> {
-    let agent = remote_agent_for_session(definitions, session)?;
-    Some(WorkspaceLocation::RemoteAgent {
-        remote_id: agent.id.clone(),
-        workspace_id: session.session_name.clone(),
-        root: session.remote_dir.clone(),
-    })
+    let location =
+        gitterm_core::remote::launch::remote_agent_location_for_session(definitions, session)?;
+    Some(workspace_location_from_config(
+        Some(&location),
+        Path::new("."),
+        None,
+        definitions,
+    ))
 }
 
 /// Cached chat index for one remote machine (TRU-78 slice 4).
@@ -8463,18 +8155,7 @@ fn remote_tab_title_for_startup_command(
     session: &RemoteSessionDefinition,
     startup_command: Option<&str>,
 ) -> String {
-    let Some(startup_command) = startup_command else {
-        return "Shell".to_string();
-    };
-    if startup_command.contains(&remote_codex_session_name(session)) {
-        "Codex".to_string()
-    } else if startup_command.contains(&remote_claude_session_name(session)) {
-        "Claude".to_string()
-    } else if startup_command.contains(&session.session_name) {
-        "Shell".to_string()
-    } else {
-        "Remote".to_string()
-    }
+    gitterm_core::remote::launch::tab_title(session, startup_command)
 }
 
 fn default_remote_session_definitions() -> Vec<RemoteSessionDefinition> {
@@ -8581,6 +8262,7 @@ fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
         return None;
     }
     Some(RepoConfig {
+        extra: Default::default(),
         dir: repo_config_dir(repo),
         location: workspace_location_config_from_location(&repo.location),
         run_command: repo.run_command.clone(),
@@ -8887,16 +8569,7 @@ pub use gitterm_core::remote::ssh_sessions::{
     RemoteHostConfig, RemoteSessionEntry, RemoteSessionsSnapshot,
 };
 
-#[derive(Debug, Clone)]
-pub struct RemoteSessionDefinition {
-    host: RemoteHostConfig,
-    label: String,
-    session_name: String,
-    remote_dir: String,
-    shell_command: String,
-    codex_command: Option<String>,
-    claude_command: Option<String>,
-}
+pub use gitterm_core::remote::launch::RemoteSessionDefinition;
 
 #[derive(Debug, Clone)]
 pub struct DiffSnapshot {
@@ -10374,6 +10047,7 @@ impl App {
                 })
                 .collect(),
             env: self.workspace_repo_env(ws, ws.home),
+            legacy_env_base: None,
             active: true,
             chats: ws.chats.clone(),
             parked: None,
@@ -10514,21 +10188,7 @@ impl App {
     /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
-        let path = config::global_config_dir().join("profiles.json");
-        let contents = std::fs::read_to_string(&path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct Profile {
-            #[allow(dead_code)]
-            description: Option<String>,
-            env: HashMap<String, String>,
-        }
-        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
-        Some(
-            profiles
-                .into_iter()
-                .map(|(name, p)| (name, p.env))
-                .collect(),
-        )
+        gitterm_core::workspace_settings::load_profiles(&config::global_config_dir())
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -15869,35 +15529,21 @@ impl App {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        if let Some(overridden) = ws.env_overrides.get_mut(&key) {
-            match value {
-                Some(value) => *overridden = value,
-                None => {
-                    ws.env_overrides.remove(&key);
-                }
-            }
-            return;
-        }
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            match value {
-                Some(value) => repo.env.insert(key, value),
-                None => repo.env.remove(&key),
-            };
-        }
+        gitterm_core::workspace_settings::EnvEdit::Set { key, value }.apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
-    /// A profile replaces workspace `idx`'s env: its home repo's env
-    /// becomes the profile and its overrides are cleared.
+    /// A profile replaces the home repo's env and clears workspace overrides.
     fn apply_env_profile(&mut self, idx: usize, profile: HashMap<String, String>) {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        ws.env_overrides.clear();
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            repo.env = profile;
-        }
+        gitterm_core::workspace_settings::EnvEdit::Profile(profile).apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
     /// Adds `workspace` to the bar in machine order, makes it active and
@@ -17652,11 +17298,15 @@ impl App {
                     ));
                 }
                 ReviewEffect::SaveMarks => {
-                    if let Some(Ok(marks)) = self.review.marks() {
+                    if let (Some(Ok(marks)), Some(previous)) =
+                        (self.review.marks(), self.review.marks_before_save())
+                    {
                         if let Err(error) =
-                            review_pane::save_viewed_marks(marks, &config::global_config_dir())
+                            marks.save_changes(previous, &config::global_config_dir())
                         {
                             eprintln!("[review] {error}");
+                        } else {
+                            self.review.marks_saved();
                         }
                     }
                 }
@@ -20903,7 +20553,12 @@ impl App {
                     if tab_config.startup_command.is_some() {
                         // Legacy SSH/tmux terminal tab: keeps its
                         // remote session dir purely for display.
-                        let local_cwd = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                        let local_cwd = gitterm_core::remote::launch::restored_terminal_paths(
+                            true,
+                            tab_config,
+                            dirs::home_dir(),
+                        )
+                        .cwd;
                         self.add_tab_to_workspace_with_command(
                             &mut workspace,
                             local_cwd,
@@ -20955,22 +20610,10 @@ impl App {
                     remote_agent_files_tab_added = true;
                     continue;
                 }
-                let tab_dir = PathBuf::from(&tab_config.dir);
-                let repo_dir = tab_config
-                    .repo_dir
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .or_else(|| {
-                        Repository::discover(&tab_dir)
-                            .ok()
-                            .and_then(|repo| repo.workdir().map(PathBuf::from))
-                    })
-                    .unwrap_or_else(|| tab_dir.clone());
-                let current_dir = if tab_dir.is_dir() {
-                    tab_dir
-                } else {
-                    repo_dir.clone()
-                };
+                let gitterm_core::remote::launch::TerminalPaths {
+                    cwd: repo_dir,
+                    current_dir,
+                } = gitterm_core::remote::launch::restored_terminal_paths(false, tab_config, None);
                 // Fixed before the terminal starts so the Codex
                 // notify hook can carry the session identity.
                 let restored_task_session_id = tab_config.task_id.as_ref().map(|_| {
@@ -21856,44 +21499,6 @@ impl App {
             .and_then(|ws| self.remote_agent_id_for_workspace(ws))
             .map(str::to_string)
             .and_then(|remote_id| self.fresh_remote_agent_config(&remote_id));
-        // Preset names like "Claude Code" resolve by full lowercased name,
-        // then by first word ("claude"), against the remote's configured
-        // session_commands; the last resort is the first word on the
-        // remote PATH.
-        let normalized = preset_name.as_deref().map(|name| {
-            let full = name.to_lowercase();
-            let first_word = full
-                .split_whitespace()
-                .next()
-                .unwrap_or("shell")
-                .to_string();
-            (full, first_word)
-        });
-        let kind = normalized
-            .as_ref()
-            .map(|(_, first_word)| first_word.clone())
-            .unwrap_or_else(|| "shell".to_string());
-        let remote_command = match (&normalized, &agent_config) {
-            (Some((full, first_word)), Some(config)) => config
-                .session_commands
-                .get(full)
-                .or_else(|| config.session_commands.get(first_word))
-                .cloned()
-                .unwrap_or_else(|| first_word.clone()),
-            (Some((_, first_word)), None) => first_word.clone(),
-            (None, Some(config)) => config
-                .shell_command
-                .clone()
-                .unwrap_or_else(|| "/bin/zsh -il".to_string()),
-            (None, None) => "/bin/zsh -il".to_string(),
-        };
-        // A Claude launch on the remote gets the workspace's Claude in
-        // Chrome choice too (TRU-181); other commands are unchanged.
-        let remote_command = gitterm::harness::claude::configure_terminal_chrome(
-            &remote_command,
-            self.active_workspace()
-                .is_some_and(|ws| ws.claude_in_chrome),
-        );
         // Start the session in the directory the user is browsing — but
         // only when that browser state belongs to this source (an attach
         // tab's browser is local and would be meaningless on the remote).
@@ -21902,24 +21507,32 @@ impl App {
             root: root.clone(),
             client: client.clone(),
         };
-        let cwd = self
+        let remote_browser_dir = self
             .active_tab()
             .map(|tab| tab.files.dir.clone())
             .filter(|dir| source_for_cwd.owns(dir))
-            .map(|dir| dir.display())
-            .unwrap_or_else(|| root.clone());
+            .map(|dir| dir.display());
+        let launch = gitterm_core::remote::launch::agent_session_launch(
+            preset_name.as_deref(),
+            agent_config.as_ref(),
+            &root,
+            remote_browser_dir.as_deref(),
+            self.active_workspace()
+                .is_some_and(|ws| ws.claude_in_chrome),
+        );
+        let kind = launch.kind.clone();
 
         Task::perform(
             async move {
                 RemoteAgentBackend::new(client)
                     .start_session(
                         workspace_id,
-                        cwd,
+                        launch.cwd,
                         kind.clone(),
-                        vec!["/bin/sh".to_string(), "-lc".to_string(), remote_command],
-                        Vec::new(),
-                        120,
-                        32,
+                        launch.command,
+                        launch.env,
+                        launch.cols,
+                        launch.rows,
                     )
                     .await
                     .map(|session| (session.session_id, kind, None))
@@ -21936,21 +21549,10 @@ impl App {
         let workspace = self.active_workspace()?;
         let remote_id = self.remote_agent_id_for_workspace(workspace)?.to_string();
         let config = self.fresh_remote_agent_config(&remote_id)?;
-        let token_ref = match &config.auth {
-            config::RemoteAgentAuthConfig::Token { token_ref } => token_ref.clone(),
-        };
-        let agent_bin = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("gitterm-v6-agent")))
-            .filter(|path| path.exists())
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gitterm-v6-agent".to_string());
-        Some(format!(
-            "{} attach --endpoint {} --token-ref {} --session {}",
-            shell_quote(&agent_bin),
-            shell_quote(&config.endpoint),
-            shell_quote(&token_ref),
-            shell_quote(session_id),
+        Some(gitterm_core::remote::launch::remote_session_attach_command(
+            &gitterm_core::remote::launch::agent_binary(),
+            &config,
+            session_id,
         ))
     }
 
@@ -22942,27 +22544,14 @@ impl App {
     }
 
     fn remote_attach_command(
-        &self,
         session: &RemoteSessionDefinition,
         tmux_session_name: &str,
         startup_command: &str,
     ) -> String {
-        let remote_script = format!(
-            "SESSION={}; DIR={}; {} has-session -t \"$SESSION\" 2>/dev/null || {} new-session -d -s \"$SESSION\" -c \"$DIR\" {}; {} set-option -t \"$SESSION\" mouse on >/dev/null 2>&1 || true; exec {} attach -t \"$SESSION\"",
-            shell_quote(tmux_session_name),
-            shell_quote(&session.remote_dir),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(startup_command),
-            shell_quote(&session.host.tmux_path),
-            shell_quote(&session.host.tmux_path),
-        );
-
-        format!(
-            "exec ssh -t -i {} -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 {} {}",
-            shell_quote(session.host.identity_file.to_string_lossy().as_ref()),
-            shell_quote(&session.host.ssh_target),
-            shell_quote(&remote_script),
+        gitterm_core::remote::launch::remote_attach_command(
+            session,
+            tmux_session_name,
+            startup_command,
         )
     }
 
@@ -22974,7 +22563,7 @@ impl App {
         title_suffix: Option<&str>,
     ) -> Task<Event> {
         let startup_command =
-            self.remote_attach_command(&session, &tmux_session_name, &startup_command);
+            Self::remote_attach_command(&session, &tmux_session_name, &startup_command);
         let ws_idx = self.active_workspace_index();
         if ws_idx >= self.workspaces.len() {
             return Task::none();
@@ -22996,11 +22585,11 @@ impl App {
         }
 
         let workspace_name = self.workspaces[ws_idx].name.clone();
-        let local_cwd = if self.workspace_has_remote_identity(&self.workspaces[ws_idx]) {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            self.workspaces[ws_idx].dir.clone()
-        };
+        let local_cwd = gitterm_core::remote::launch::attach_cwd(
+            self.workspace_has_remote_identity(&self.workspaces[ws_idx]),
+            &self.workspaces[ws_idx].dir,
+            dirs::home_dir(),
+        );
         let mut tab =
             self.create_tab_for_workspace(local_cwd, Some(startup_command), Some(&workspace_name));
         tab.status
@@ -23014,43 +22603,31 @@ impl App {
     }
 
     fn open_remote_session_tab(&mut self, session_name: &str) -> Task<Event> {
-        let Some(session) = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace))
-            .filter(|def| def.session_name == session_name)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            session.session_name.clone(),
-            session.shell_command.clone(),
-            None,
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Shell,
         )
     }
 
     fn open_remote_codex_session_tab(&mut self, session_name: &str) -> Task<Event> {
-        let Some(session) = self
-            .active_workspace()
-            .and_then(|workspace| self.remote_session_for_workspace(workspace))
-            .filter(|def| def.session_name == session_name)
-            .cloned()
-        else {
-            return Task::none();
-        };
-        let Some(codex_command) = session.codex_command.clone() else {
-            return Task::none();
-        };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            remote_codex_session_name(&session),
-            codex_command,
-            Some("Codex"),
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Codex,
         )
     }
 
     fn open_remote_claude_session_tab(&mut self, session_name: &str) -> Task<Event> {
+        self.open_remote_session_kind(
+            session_name,
+            gitterm_core::remote::launch::SessionKind::Claude,
+        )
+    }
+
+    fn open_remote_session_kind(
+        &mut self,
+        session_name: &str,
+        kind: gitterm_core::remote::launch::SessionKind,
+    ) -> Task<Event> {
         let Some(session) = self
             .active_workspace()
             .and_then(|workspace| self.remote_session_for_workspace(workspace))
@@ -23059,15 +22636,12 @@ impl App {
         else {
             return Task::none();
         };
-        let Some(claude_command) = session.claude_command.clone() else {
+        let Some((name, command, title)) =
+            gitterm_core::remote::launch::session_command(&session, kind)
+        else {
             return Task::none();
         };
-        self.open_remote_session_tab_with_command(
-            session.clone(),
-            remote_claude_session_name(&session),
-            claude_command,
-            Some("Claude"),
-        )
+        self.open_remote_session_tab_with_command(session, name, command, Some(title))
     }
 
     fn any_tab_requires_attention_pulse(&self) -> bool {
@@ -24172,7 +23746,8 @@ impl App {
         let stt_recording = false;
         if self.any_tab_requires_attention_pulse() || stt_recording {
             subs.push(
-                iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
+                iced::time::every(gitterm_core::attention::PULSE_INTERVAL)
+                    .map(|_| Event::AttentionPulseTick),
             );
         }
 
@@ -53293,6 +52868,28 @@ mod tests {
         assert!(summary.chars().count() <= 41);
     }
 
+    #[test]
+    fn golive19_iced_remote_command_pin() {
+        let session = RemoteSessionDefinition {
+            host: RemoteHostConfig {
+                name: "Placeholder".into(),
+                ssh_target: "user@remote.example".into(),
+                identity_file: PathBuf::from("/tmp/placeholder key"),
+                tmux_path: "/opt/bin/tmux".into(),
+            },
+            label: "Placeholder".into(),
+            session_name: "placeholder".into(),
+            remote_dir: "/srv/project folder".into(),
+            shell_command: "/bin/zsh -il".into(),
+            codex_command: None,
+            claude_command: None,
+        };
+        assert_eq!(
+            App::remote_attach_command(&session, "placeholder", "/bin/zsh -il"),
+            r#"exec ssh -t -i '/tmp/placeholder key' -o IdentitiesOnly=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 'user@remote.example' 'SESSION='\''placeholder'\''; DIR='\''/srv/project folder'\''; '\''/opt/bin/tmux'\'' has-session -t "$SESSION" 2>/dev/null || '\''/opt/bin/tmux'\'' new-session -d -s "$SESSION" -c "$DIR" '\''/bin/zsh -il'\''; '\''/opt/bin/tmux'\'' set-option -t "$SESSION" mouse on >/dev/null 2>&1 || true; exec '\''/opt/bin/tmux'\'' attach -t "$SESSION"'"#
+        );
+    }
+
     fn test_remote_session() -> RemoteSessionDefinition {
         RemoteSessionDefinition {
             host: RemoteHostConfig {
@@ -55270,6 +54867,7 @@ mod tests {
             run_command: None,
             bottom_terminals: Vec::new(),
             env: HashMap::new(),
+            legacy_env_base: None,
             active: false,
             chats: Vec::new(),
             parked: parked_at.map(|at| ParkedInfo {
@@ -55580,6 +55178,7 @@ mod tests {
     #[test]
     fn the_repos_section_keeps_open_repos_and_those_closed_workspaces_list() {
         let open = vec![RepoConfig {
+            extra: Default::default(),
             dir: "/tmp/tru180-open".into(),
             location: None,
             run_command: None,
@@ -55587,6 +55186,7 @@ mod tests {
             bottom_terminals: Vec::new(),
         }];
         let stored_for = |dir: &str| RepoConfig {
+            extra: Default::default(),
             dir: dir.into(),
             location: None,
             run_command: Some("make".into()),

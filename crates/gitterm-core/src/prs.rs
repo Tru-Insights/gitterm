@@ -992,21 +992,121 @@ pub async fn run_action(
         Some(user) => Some(account_token(user).await?),
         None => None,
     };
-    let mut command = gh_async(token.as_deref())?;
-    let args = action_args(action, &key);
-    command.args(&args);
-    let what = action_command_line(action, &key, account.as_deref());
-    let output = output_within(command, &what).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() {
-        Ok(if stdout.is_empty() { stderr } else { stdout })
-    } else {
-        Err(format!(
-            "{what} failed: {}",
-            if stderr.is_empty() { stdout } else { stderr }
-        ))
+    run_action_with_token(action, key, token.as_deref(), account.as_deref(), None).await
+}
+
+/// Runs with the same credential that was verified by the Live confirmation.
+/// Iced keeps its existing argv; Live supplies the guarded head.
+#[cfg(feature = "runtime")]
+pub async fn run_action_with_token(
+    action: PrAction,
+    key: PrKey,
+    token: Option<&str>,
+    account: Option<&str>,
+    expected_head: Option<&str>,
+) -> Result<String, String> {
+    run_action_using(action, &key, token, account, expected_head, &mut GhClient).await
+}
+
+// Keep the real command boundary replaceable without spawning gh in tests.
+#[cfg(feature = "runtime")]
+trait PrClient {
+    async fn read(
+        &mut self,
+        path: &str,
+        etag: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<ApiResponse, String>;
+    async fn write(
+        &mut self,
+        args: &[String],
+        what: &str,
+        token: Option<&str>,
+    ) -> Result<String, String>;
+}
+
+#[cfg(feature = "runtime")]
+struct GhClient;
+#[cfg(feature = "runtime")]
+impl PrClient for GhClient {
+    async fn read(
+        &mut self,
+        path: &str,
+        etag: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<ApiResponse, String> {
+        gh_api(path, etag, token).await
     }
+    async fn write(
+        &mut self,
+        args: &[String],
+        what: &str,
+        token: Option<&str>,
+    ) -> Result<String, String> {
+        let mut command = gh_async(token)?;
+        command.args(args);
+        let output = output_within(command, what).await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.success() {
+            Ok(if stdout.is_empty() { stderr } else { stdout })
+        } else {
+            Err(format!(
+                "{what} failed: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
+async fn run_action_using(
+    action: PrAction,
+    key: &PrKey,
+    token: Option<&str>,
+    account: Option<&str>,
+    expected_head: Option<&str>,
+    client: &mut impl PrClient,
+) -> Result<String, String> {
+    let mut args = action_args(action, key);
+    if let Some(head) = expected_head {
+        match action {
+            PrAction::Approve => {
+                args = vec![
+                    "api".into(),
+                    "--method".into(),
+                    "POST".into(),
+                    format!("repos/{}/pulls/{}/reviews", key.repo, key.number),
+                    "-H".into(),
+                    "Accept: application/vnd.github+json".into(),
+                    "--raw-field".into(),
+                    "event=APPROVE".into(),
+                    "--raw-field".into(),
+                    format!("commit_id={head}"),
+                ];
+            }
+            PrAction::Merge(_) => args.extend(["--match-head-commit".into(), head.into()]),
+            PrAction::Ready => {
+                // Ready has no server-side head precondition. Minimize the race
+                // with an unconditional read immediately before the write.
+                let path = format!("repos/{}/pulls/{}", key.repo, key.number);
+                let mut reader = Reader {
+                    token,
+                    previous: &BTreeMap::new(),
+                    etags: BTreeMap::new(),
+                };
+                let Read::Changed(value) = reader.read(&path, client).await? else {
+                    return Err("Fresh PR head is missing; refresh and reopen".into());
+                };
+                if parse_pull(&value)?.head_sha != head {
+                    return Err("PR head moved before Ready; refresh and reopen".into());
+                }
+            }
+        }
+    }
+    client
+        .write(&args, &action_command_line(action, key, account), token)
+        .await
 }
 
 /// A branch discovery retains creation time for delegation attribution.
@@ -1181,9 +1281,9 @@ struct Reader<'a> {
 impl Reader<'_> {
     /// Reads `path`; a 304 is `Unchanged` (the previous ETag carries over),
     /// anything but 200 or 304 an error naming the status.
-    async fn read(&mut self, path: &str) -> Result<Read, String> {
+    async fn read(&mut self, path: &str, client: &mut impl PrClient) -> Result<Read, String> {
         let known = self.previous.get(path).map(String::as_str);
-        let response = gh_api(path, known, self.token).await?;
+        let response = client.read(path, known, self.token).await?;
         match response.status {
             304 => {
                 if let Some(etag) = known {
@@ -1436,6 +1536,29 @@ pub async fn fetch_pr(
     etags: &BTreeMap<String, String>,
     token: Option<&str>,
 ) -> Result<Fetched, String> {
+    fetch_pr_using(key, previous, etags, token, false, &mut GhClient).await
+}
+
+/// Live confirmation refuses incomplete required-check reads instead of
+/// comparing the opening snapshot with stale fallback data.
+#[cfg(feature = "runtime")]
+pub async fn fetch_pr_strict(
+    key: &PrKey,
+    previous: &PrSnapshot,
+    token: Option<&str>,
+) -> Result<Fetched, String> {
+    fetch_pr_using(key, previous, &BTreeMap::new(), token, true, &mut GhClient).await
+}
+
+#[cfg(feature = "runtime")]
+async fn fetch_pr_using(
+    key: &PrKey,
+    previous: &PrSnapshot,
+    etags: &BTreeMap<String, String>,
+    token: Option<&str>,
+    strict: bool,
+    client: &mut impl PrClient,
+) -> Result<Fetched, String> {
     let repo = &key.repo;
     let pull_path = format!("repos/{repo}/pulls/{}", key.number);
     let usable_etags = etags_for_pull(key, previous, etags);
@@ -1445,7 +1568,7 @@ pub async fn fetch_pr(
         etags: BTreeMap::new(),
     };
     let mut snapshot = previous.clone();
-    match reader.read(&pull_path).await? {
+    match reader.read(&pull_path, client).await? {
         Read::Changed(value) => snapshot.core = Some(parse_pull(&value)?),
         Read::Unchanged if previous.core.is_some() => {}
         Read::Unchanged => return Err(format!("gh api {pull_path}: 304 with nothing cached")),
@@ -1468,11 +1591,11 @@ pub async fn fetch_pr(
     }
     if !core.head_sha.is_empty() {
         let runs = format!("repos/{repo}/commits/{}/check-runs?{PAGE}", core.head_sha);
-        if let Read::Changed(value) = reader.read(&runs).await? {
+        if let Read::Changed(value) = reader.read(&runs, client).await? {
             snapshot.check_runs = parse_check_runs(&value);
         }
         let status = format!("repos/{repo}/commits/{}/status?{PAGE}", core.head_sha);
-        if let Read::Changed(value) = reader.read(&status).await? {
+        if let Read::Changed(value) = reader.read(&status, client).await? {
             snapshot.statuses = parse_statuses(&value);
         }
         if !snapshot.check_runs.is_empty() || !snapshot.statuses.is_empty() {
@@ -1483,25 +1606,30 @@ pub async fn fetch_pr(
     // Required checks of the base branch. A source the token cannot read
     // (protection is hidden from some tokens) keeps what it had and is
     // logged.
+    if strict && (core.head_sha.is_empty() || core.base_ref.is_empty()) {
+        return Err("PR head or base is unknown; refresh and reopen".into());
+    }
     if !core.base_ref.is_empty() {
         let base = branch_path(&core.base_ref);
         let protection = format!("repos/{repo}/branches/{base}");
-        match reader.read(&protection).await {
+        match reader.read(&protection, client).await {
             Ok(Read::Changed(value)) => snapshot.required = parse_branch_required(&value),
             Ok(Read::Unchanged) => {}
+            Err(error) if strict => return Err(format!("Cannot verify required checks: {error}")),
             Err(error) => eprintln!("[pr-watch] {}: required checks: {error}", key.label()),
         }
         let rules = format!("repos/{repo}/rules/branches/{base}");
-        match reader.read(&rules).await {
+        match reader.read(&rules, client).await {
             Ok(Read::Changed(value)) => snapshot.required_rules = parse_rules_required(&value),
             Ok(Read::Unchanged) => {}
+            Err(error) if strict => return Err(format!("Cannot verify required checks: {error}")),
             Err(error) => eprintln!("[pr-watch] {}: ruleset checks: {error}", key.label()),
         }
     }
 
     // Reviews and comments.
     let reviews = format!("repos/{repo}/pulls/{}/reviews?{PAGE}", key.number);
-    if let Read::Changed(value) = reader.read(&reviews).await? {
+    if let Read::Changed(value) = reader.read(&reviews, client).await? {
         snapshot.reviews = parse_activity(&value, "review");
     }
     let mut comments: Vec<Activity> = previous.comments.clone();
@@ -1517,7 +1645,7 @@ pub async fn fetch_pr(
             "line",
         ),
     ] {
-        if let Read::Changed(value) = reader.read(&path).await? {
+        if let Read::Changed(value) = reader.read(&path, client).await? {
             comments_changed = true;
             by_prefix.insert(prefix, parse_activity(&value, prefix));
         }
@@ -1751,6 +1879,183 @@ pub fn pr_live_value(watched: Option<&WatchedPr>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "runtime")]
+    #[derive(Default)]
+    struct FakePrClient {
+        head: String,
+        fail_path: Option<String>,
+        reads: Vec<String>,
+        writes: Vec<Vec<String>>,
+    }
+    #[cfg(feature = "runtime")]
+    impl PrClient for FakePrClient {
+        async fn read(
+            &mut self,
+            path: &str,
+            etag: Option<&str>,
+            token: Option<&str>,
+        ) -> Result<ApiResponse, String> {
+            assert_eq!(token, Some("fixture-token"));
+            assert!(etag.is_none());
+            self.reads.push(path.into());
+            if self.fail_path.as_deref() == Some(path) {
+                return Ok(ApiResponse {
+                    status: 403,
+                    etag: None,
+                    body: r#"{"message":"fixture denied"}"#.into(),
+                });
+            }
+            let body = if path == "repos/owner/repo/pulls/53" {
+                serde_json::json!({"state":"open","head":{"sha":self.head},"base":{"ref":"main"}})
+            } else if path.contains("/branches/main") && !path.contains("/rules/") {
+                serde_json::json!({"protection":{"required_status_checks":{"contexts":["build"]}}})
+            } else {
+                serde_json::json!([])
+            };
+            Ok(ApiResponse {
+                status: 200,
+                etag: None,
+                body: body.to_string(),
+            })
+        }
+        async fn write(
+            &mut self,
+            args: &[String],
+            _: &str,
+            token: Option<&str>,
+        ) -> Result<String, String> {
+            assert_eq!(token, Some("fixture-token"));
+            self.writes.push(args.to_vec());
+            Ok("done".into())
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn live_pr_f1_actions_pin_guarded_commit_and_preserve_iced_argv() {
+        let key = PrKey::new("owner/repo", 53);
+        for action in [
+            PrAction::Approve,
+            PrAction::Ready,
+            PrAction::Merge(MergeMethod::Squash),
+        ] {
+            // A push after the guard read, before the write runner starts.
+            let mut client = FakePrClient {
+                head: "head-two".into(),
+                ..Default::default()
+            };
+            let result = run_action_using(
+                action,
+                &key,
+                Some("fixture-token"),
+                None,
+                Some("head-one"),
+                &mut client,
+            )
+            .await;
+            match action {
+                PrAction::Approve => {
+                    result.unwrap();
+                    assert_eq!(
+                        client.writes[0],
+                        [
+                            "api",
+                            "--method",
+                            "POST",
+                            "repos/owner/repo/pulls/53/reviews",
+                            "-H",
+                            "Accept: application/vnd.github+json",
+                            "--raw-field",
+                            "event=APPROVE",
+                            "--raw-field",
+                            "commit_id=head-one"
+                        ]
+                    );
+                }
+                PrAction::Merge(_) => {
+                    result.unwrap();
+                    assert!(client.writes[0]
+                        .ends_with(&["--match-head-commit".into(), "head-one".into()]));
+                }
+                PrAction::Ready => {
+                    assert!(result.unwrap_err().contains("head moved before Ready"));
+                    assert!(client.writes.is_empty());
+                    assert_eq!(client.reads, ["repos/owner/repo/pulls/53"]);
+                    client.head = "head-one".into();
+                    run_action_using(
+                        action,
+                        &key,
+                        Some("fixture-token"),
+                        None,
+                        Some("head-one"),
+                        &mut client,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(client.writes[0], action_args(action, &key));
+                }
+            }
+            client.reads.clear();
+            client.writes.clear();
+            run_action_using(action, &key, Some("fixture-token"), None, None, &mut client)
+                .await
+                .unwrap();
+            assert_eq!(client.writes, [action_args(action, &key)]);
+            assert!(client.reads.is_empty());
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn live_pr_f2_incomplete_required_checks_fail_closed() {
+        let key = PrKey::new("owner/repo", 53);
+        let previous = PrSnapshot {
+            required: vec!["opening-check".into()],
+            required_rules: vec!["opening-rule".into()],
+            ..Default::default()
+        };
+        for path in [
+            "repos/owner/repo/branches/main",
+            "repos/owner/repo/rules/branches/main",
+        ] {
+            let mut client = FakePrClient {
+                head: "head-one".into(),
+                fail_path: Some(path.into()),
+                ..Default::default()
+            };
+            let error = fetch_pr_using(
+                &key,
+                &previous,
+                &BTreeMap::new(),
+                Some("fixture-token"),
+                true,
+                &mut client,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("Cannot verify required checks"), "{error}");
+            assert!(error.contains(path), "{error}");
+            assert!(client.writes.is_empty());
+            // Iced still tolerates unreadable protection/rulesets and keeps
+            // the corresponding previous list.
+            let fetched = fetch_pr_using(
+                &key,
+                &previous,
+                &BTreeMap::new(),
+                Some("fixture-token"),
+                false,
+                &mut client,
+            )
+            .await
+            .unwrap();
+            if path.contains("/rules/") {
+                assert_eq!(fetched.snapshot.required_rules, previous.required_rules);
+            } else {
+                assert_eq!(fetched.snapshot.required, previous.required);
+            }
+        }
+    }
 
     fn branch_answer(number: u64, head: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
