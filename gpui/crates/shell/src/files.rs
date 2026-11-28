@@ -22,7 +22,14 @@ pub struct Outcome {
     pub request: Request,
     pub result: Result<Listing, String>,
 }
+#[derive(Clone)]
+pub(crate) struct RemoteNavigation {
+    pub current: PathBuf,
+    pub parent: Option<PathBuf>,
+    pub display: String,
+}
 pub struct Listing {
+    navigation: Option<RemoteNavigation>,
     entries: Vec<Entry>,
     more: bool,
 }
@@ -30,6 +37,7 @@ pub struct Listing {
 struct Directory {
     generation: u64,
     limit: usize,
+    navigation: Option<RemoteNavigation>,
     entries: Vec<Entry>,
     more: bool,
     loading: bool,
@@ -131,12 +139,16 @@ impl FileTree {
         directory.loading = false;
         match outcome.result {
             Ok(listing) => {
+                directory.navigation = listing.navigation;
                 directory.entries = listing.entries;
                 directory.more = listing.more;
                 directory.error = None;
             }
             Err(error) => directory.error = Some(error),
         }
+    }
+    pub(crate) fn remote_navigation(&self) -> Option<&RemoteNavigation> {
+        self.directories.get(&self.root)?.navigation.as_ref()
     }
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![];
@@ -208,7 +220,11 @@ pub fn list(request: &Request) -> Result<Listing, String> {
     entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
     let more = entries.len() > request.limit;
     entries.truncate(request.limit);
-    Ok(Listing { entries, more })
+    Ok(Listing {
+        entries,
+        more,
+        navigation: None,
+    })
 }
 
 /// Small owner-scoped job set, using the same executor as status. Replaced jobs
@@ -218,10 +234,11 @@ pub struct FileJobs {
     jobs: HashMap<(WorkspaceId, PathBuf), tokio::task::JoinHandle<()>>,
 }
 impl FileJobs {
-    pub fn execute(
+    pub(crate) fn execute(
         &mut self,
         handle: &tokio::runtime::Handle,
         request: Request,
+        source: Result<Option<crate::remote_client::source::RemoteSource>, String>,
         sender: tokio::sync::mpsc::UnboundedSender<Outcome>,
     ) {
         self.jobs.retain(|_, job| !job.is_finished());
@@ -235,7 +252,11 @@ impl FileJobs {
             handle.spawn(async move {
                 let blocking_request = request.clone();
                 let result = executor
-                    .spawn_blocking(move || list(&blocking_request))
+                    .spawn_blocking(move || match source {
+                        Ok(None) => list(&blocking_request),
+                        Ok(Some(source)) => list_remote(&blocking_request, &source),
+                        Err(error) => Err(error),
+                    })
                     .await
                     .unwrap_or_else(|error| {
                         Err(format!(
@@ -254,6 +275,41 @@ impl Drop for FileJobs {
             job.abort();
         }
     }
+}
+
+fn list_remote(
+    request: &Request,
+    source: &crate::remote_client::source::RemoteSource,
+) -> Result<Listing, String> {
+    let listing = source.client.source_list(
+        &source.spec,
+        request.path.to_string_lossy().into_owned(),
+        request.show_hidden,
+    )?;
+    if let Some(error) = listing.error {
+        return Err(error);
+    }
+    let navigation = RemoteNavigation {
+        current: PathBuf::from(listing.current_dir.display()),
+        parent: listing.parent.map(|path| PathBuf::from(path.display())),
+        display: listing.display_dir,
+    };
+    let mut entries: Vec<_> = listing
+        .entries
+        .into_iter()
+        .map(|entry| Entry {
+            path: PathBuf::from(entry.path.display()),
+            name: entry.name,
+            is_dir: entry.is_dir,
+        })
+        .collect();
+    let more = entries.len() > request.limit;
+    entries.truncate(request.limit);
+    Ok(Listing {
+        entries,
+        more,
+        navigation: Some(navigation),
+    })
 }
 
 #[cfg(test)]

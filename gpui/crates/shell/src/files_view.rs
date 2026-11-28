@@ -27,6 +27,8 @@ struct Navigation {
 }
 
 pub(crate) struct FilesView {
+    remote_navigation: Option<crate::files::RemoteNavigation>,
+    remote: bool,
     owner: Option<Entity<WorkspaceOwner>>,
     workspace: WorkspaceId,
     actions: HashMap<SharedString, EntryAction>,
@@ -54,9 +56,17 @@ impl FilesView {
         cx: &mut Context<Self>,
     ) -> Self {
         let owner = data.local_owner();
+        let remote = owner.as_ref().is_some_and(|owner| {
+            owner
+                .read(cx)
+                .model
+                .workspaces
+                .iter()
+                .any(|w| w.id == workspace && w.remote)
+        });
         let roots = owner.as_ref().and_then(|owner| {
             let saved = owner.read(cx).iced_workspace(workspace)?;
-            let work = gitterm_core::work::catalog::is_work(&saved.chats, false);
+            let work = !remote && gitterm_core::work::catalog::is_work(&saved.chats, false);
             work.then(|| work_roots(&saved.repos, PathBuf::from(&saved.dir).join("docs")))
         });
         let directory = owner
@@ -68,21 +78,44 @@ impl FilesView {
                     .get(&workspace)
                     .map(|tree| tree.root.clone())
             })
+            .or_else(|| {
+                if !remote {
+                    return None;
+                }
+                let owner = owner.as_ref()?.read(cx);
+                Some(PathBuf::from(&owner.iced_workspace(workspace)?.dir))
+            })
             .or_else(|| data.terminal_cwd(workspace, cx))
             .unwrap_or_default();
         let source_root = owner
             .as_ref()
             .and_then(|owner| {
-                owner
-                    .read(cx)
-                    .model
-                    .workspaces
-                    .iter()
-                    .find(|local| local.id == workspace)
-                    .map(|local| local.root.clone())
+                if !remote {
+                    return None;
+                }
+                match &owner.read(cx).iced_workspace(workspace)?.location {
+                    Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent {
+                        root,
+                        ..
+                    }) => Some(PathBuf::from(root)),
+                    _ => None,
+                }
+            })
+            .or_else(|| {
+                owner.as_ref().and_then(|owner| {
+                    owner
+                        .read(cx)
+                        .model
+                        .workspaces
+                        .iter()
+                        .find(|local| local.id == workspace)
+                        .map(|local| local.root.clone())
+                })
             })
             .unwrap_or_else(|| directory.clone());
         let mut this = Self {
+            remote,
+            remote_navigation: None,
             owner,
             workspace,
             actions: HashMap::new(),
@@ -140,9 +173,10 @@ impl FilesView {
         self.source_root = root.clone();
         if let Some(owner) = &self.owner {
             owner.update(cx, |owner, cx| {
-                if let Some(tab) = self
-                    .session
-                    .and_then(|id| owner.model.session_contexts.get_mut(&id))
+                if !self.remote
+                    && let Some(tab) = self
+                        .session
+                        .and_then(|id| owner.model.session_contexts.get_mut(&id))
                 {
                     tab.panel_repo = Some(root.clone());
                     let root = tab.panel_root();
@@ -164,9 +198,10 @@ impl FilesView {
         if let Some(owner) = &self.owner {
             let changed = owner.update(cx, |owner, cx| {
                 let mut changed = false;
-                if let Some(tab) = self
-                    .session
-                    .and_then(|id| owner.model.session_contexts.get_mut(&id))
+                if !self.remote
+                    && let Some(tab) = self
+                        .session
+                        .and_then(|id| owner.model.session_contexts.get_mut(&id))
                     && tab.task_root.is_none()
                     && !tab
                         .panel_repo
@@ -264,6 +299,9 @@ impl FilesView {
         .detach();
     }
     fn parent(&self) -> Option<PathBuf> {
+        if let Some(navigation) = &self.remote_navigation {
+            return navigation.parent.clone();
+        }
         self.directory
             .parent()
             .filter(|parent| parent.starts_with(&self.source_root))
@@ -279,7 +317,11 @@ impl FilesView {
                 let tab = session.and_then(|id| owner.model.session_contexts.get(&id));
                 (
                     session,
-                    tab.map(|tab| tab.panel_root()),
+                    if self.remote {
+                        Some(self.source_root.clone())
+                    } else {
+                        tab.map(|tab| tab.panel_root())
+                    },
                     tab.map(|tab| tab.cwd.clone()),
                     tab.is_some_and(|tab| {
                         tab.task_root.is_some()
@@ -326,9 +368,17 @@ impl FilesView {
             if overridden {
                 self.browsing_root = Some(self.source_root.clone());
             }
-            if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
+            if !self.remote
+                && let Some(saved) = owner.read(cx).iced_workspace(self.workspace)
+            {
                 self.roots = gitterm_core::work::catalog::is_work(&saved.chats, false)
                     .then(|| work_roots(&saved.repos, PathBuf::from(&saved.dir).join("docs")));
+            }
+            if let Some(tree) = owner.read(cx).files.get(&self.workspace)
+                && tree.root == self.directory
+                && let Some(navigation) = tree.remote_navigation()
+            {
+                self.directory = navigation.current.clone();
             }
             if owner
                 .read(cx)
@@ -339,6 +389,12 @@ impl FilesView {
                 self.navigate(self.directory.clone(), cx);
                 return;
             }
+            self.remote_navigation = owner
+                .read(cx)
+                .files
+                .get(&self.workspace)
+                .and_then(|tree| tree.remote_navigation())
+                .cloned();
             let rows = owner
                 .read(cx)
                 .files
@@ -467,6 +523,9 @@ impl FilesView {
         }
     }
     fn edit_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote {
+            return;
+        }
         let request = crate::content::actions::OpenEditor::terminal(path);
         #[cfg(test)]
         cx.emit(request.clone());
@@ -597,7 +656,9 @@ impl Render for FilesView {
             .directory
             .strip_prefix(&self.source_root)
             .unwrap_or(&self.directory);
-        let display = if relative.as_os_str().is_empty() {
+        let display = if let Some(navigation) = &self.remote_navigation {
+            navigation.display.clone()
+        } else if relative.as_os_str().is_empty() {
             format!("{root_name}/")
         } else {
             format!("{root_name}/{}/", relative.display())

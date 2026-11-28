@@ -25,6 +25,7 @@ pub struct WorkspaceOwner {
     pub(crate) chats: std::collections::HashMap<String, Entity<crate::chat::ChatPane>>,
     pub files: std::collections::HashMap<crate::data::WorkspaceId, crate::files::FileTree>,
     file_jobs: crate::files::FileJobs,
+    pub(crate) source_client: Arc<dyn crate::remote_client::RemoteClient>,
     pub(crate) reviews: std::collections::HashMap<
         crate::data::WorkspaceId,
         Entity<gitterm_gpui_review::ReviewView>,
@@ -208,6 +209,10 @@ impl WorkspaceOwner {
             files: Default::default(),
             reviews: Default::default(),
             file_jobs: Default::default(),
+            #[cfg(not(test))]
+            source_client: Arc::new(crate::remote_client::AgentClient),
+            #[cfg(test)]
+            source_client: Arc::new(crate::remote_client::Offline),
             file_sender,
             error: None,
             workspace_save_pending: false,
@@ -603,6 +608,57 @@ impl WorkspaceOwner {
             .as_ref()
             .and_then(|s| s.guard.as_ref().map(|g| g.preview().clone()))
     }
+    /// Same identity as Iced's source_for_active_tab, never a local fallback.
+    pub(crate) fn remote_source(
+        &self,
+        workspace: crate::data::WorkspaceId,
+        cx: &App,
+    ) -> Result<Option<crate::remote_client::source::RemoteSource>, String> {
+        use gitterm_core::remote::config::WorkspaceLocationConfig;
+        if !self
+            .model
+            .workspaces
+            .iter()
+            .any(|w| w.id == workspace && w.remote)
+        {
+            return Ok(None);
+        }
+        if !crate::chat::policy::is_live(cx) {
+            return Err(gitterm_core::preview::service::preview_notice(
+                "Remote Files and Git",
+            ));
+        }
+        let saved = self
+            .iced_workspace(workspace)
+            .ok_or("Remote workspace is unavailable")?;
+        let Some(WorkspaceLocationConfig::RemoteAgent {
+            remote_id,
+            workspace_id,
+            root,
+        }) = &saved.location
+        else {
+            return Err(
+                "This workspace uses the legacy SSH remote prototype, which has no file browser"
+                    .into(),
+            );
+        };
+        let catalog = self.iced_catalog().ok_or("Remote catalog is unavailable")?;
+        let remote = crate::remote_client::read_remotes(&catalog.source)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|remote| &remote.id == remote_id)
+            .ok_or_else(|| {
+                format!("Remote \"{remote_id}\" is not configured in remote-agents.json")
+            })?;
+        Ok(Some(crate::remote_client::source::RemoteSource {
+            spec: crate::remote_client::source::Spec {
+                remote,
+                workspace_id: workspace_id.clone(),
+                root: root.clone(),
+            },
+            client: self.source_client.clone(),
+        }))
+    }
     fn complete_context_status(
         &mut self,
         workspace: crate::data::WorkspaceId,
@@ -634,6 +690,59 @@ impl WorkspaceOwner {
             if let Command::Status { owner, command } = command
                 && let Some(executor) = &self.executor
             {
+                let workspace = crate::data::WorkspaceId(owner as u64);
+                let source = self.remote_source(workspace, cx);
+                if !matches!(source, Ok(None)) {
+                    if matches!(
+                        command,
+                        gitterm_core::status::StatusCommand::CollectStatus { .. }
+                    ) {
+                        let context = self
+                            .status_contexts
+                            .get(&workspace)
+                            .copied()
+                            .unwrap_or_default();
+                        let root = self
+                            .model
+                            .workspaces
+                            .iter()
+                            .find(|w| w.id == workspace)
+                            .unwrap()
+                            .root
+                            .clone();
+                        let failed_root = root.clone();
+                        let job = self.jobs.collect_remote(
+                            executor.handle(),
+                            owner,
+                            root.clone(),
+                            async move {
+                                tokio::task::spawn_blocking(move || match source {
+                                    Ok(Some(source)) => source.status(owner),
+                                    Err(error) => {
+                                        gitterm_core::remote::source::source_git_status_snapshot(
+                                            owner,
+                                            root,
+                                            Err(error),
+                                        )
+                                    }
+                                    Ok(None) => unreachable!(),
+                                })
+                                .await
+                                .unwrap_or_else(|error| {
+                                    gitterm_core::remote::source::source_git_status_snapshot(
+                                        owner,
+                                        failed_root,
+                                        Err(format!("Remote status worker failed: {error}")),
+                                    )
+                                })
+                            },
+                        );
+                        if let Some(job) = job {
+                            self.status_requests.insert(job, (workspace, context));
+                        }
+                    }
+                    continue;
+                }
                 let target = self
                     .model
                     .workspaces
@@ -672,21 +781,22 @@ impl WorkspaceOwner {
                 .model
                 .workspaces
                 .iter()
-                .find(|w| Some(w.id) == self.model.active() && !w.remote)
+                .find(|w| Some(w.id) == self.model.active())
         {
             let request = self
                 .files
                 .entry(workspace.id)
                 .or_default()
                 .refresh(workspace.id, workspace.folder.clone());
-            self.run_file_job(request);
+            self.run_file_job(request, cx);
         }
         cx.notify();
     }
-    fn run_file_job(&mut self, request: crate::files::Request) {
+    fn run_file_job(&mut self, request: crate::files::Request, cx: &App) {
+        let source = self.remote_source(request.workspace, cx);
         if let Some(executor) = &self.executor {
             self.file_jobs
-                .execute(executor.handle(), request, self.file_sender.clone());
+                .execute(executor.handle(), request, source, self.file_sender.clone());
         }
     }
     pub fn toggle_directory(
@@ -700,7 +810,7 @@ impl WorkspaceOwner {
             .get_mut(&workspace)
             .and_then(|tree| tree.toggle(workspace, path))
         {
-            self.run_file_job(request);
+            self.run_file_job(request, cx);
         }
         cx.notify();
     }
@@ -715,7 +825,7 @@ impl WorkspaceOwner {
             .get_mut(&workspace)
             .and_then(|tree| tree.more(workspace, path))
         {
-            self.run_file_job(request);
+            self.run_file_job(request, cx);
         }
         cx.notify();
     }
@@ -813,6 +923,7 @@ impl WorkspaceOwner {
         let Some(local) = self.model.workspaces.iter().find(|w| w.id == workspace) else {
             return;
         };
+        let source = self.remote_source(workspace, cx);
         let state = self.review_loads.entry(workspace).or_default();
         if !force && !state.visible {
             return;
@@ -828,7 +939,13 @@ impl WorkspaceOwner {
         let handle = executor.handle().clone();
         workers.jobs.retain(|job| !job.is_finished());
         workers.jobs.push(executor.spawn(async move {
-            let result = gitterm_gpui_review::repo::load(&handle, workspace.0 as usize, root).await;
+            let result = match source {
+                Ok(Some(source)) => executor_source_review(source, workspace.0 as usize).await,
+                Ok(None) => {
+                    gitterm_gpui_review::repo::load(&handle, workspace.0 as usize, root).await
+                }
+                Err(error) => Err(error),
+            };
             let _ = sender.send(result);
         }));
         drop(workers);
@@ -975,6 +1092,21 @@ impl WorkspaceOwner {
         cx.notify();
         id
     }
+}
+
+async fn executor_source_review(
+    source: crate::remote_client::source::RemoteSource,
+    owner: usize,
+) -> Result<
+    (
+        gitterm_core::status::GitStatusSnapshot,
+        gitterm_gpui_review::model::Patches,
+    ),
+    String,
+> {
+    tokio::task::spawn_blocking(move || source.review(owner))
+        .await
+        .map_err(|error| format!("Remote review worker failed: {error}"))?
 }
 
 #[cfg(test)]
