@@ -4,9 +4,17 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptAction {
+    SendDelegation {
+        id: String,
+        finding_ids: Vec<String>,
+    },
+    RerunDelegation {
+        id: String,
+    },
     OpenFile {
         path: PathBuf,
         review: bool,
+        line: Option<usize>,
     },
     OpenWorker {
         id: String,

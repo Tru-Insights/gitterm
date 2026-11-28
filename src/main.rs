@@ -21007,9 +21007,7 @@ fn load_task_store_for_startup(
     path: PathBuf,
     timestamp: &str,
 ) -> Result<(TaskStore, usize), TaskStoreError> {
-    let mut store = TaskStore::load(path)?;
-    let reconciled = store.reconcile_after_restart(timestamp)?;
-    Ok((store, reconciled))
+    gitterm_core::task_host::load_task_store_for_startup(path, timestamp)
 }
 
 impl App {
@@ -26837,20 +26835,10 @@ impl App {
             Event::DelegationOpenWorkerRequested(tab_id, delegation_id) => {
                 let target = self
                     .tab_delegation(tab_id, &delegation_id)
-                    .and_then(|delegation| match &delegation.child {
-                        gitterm::tasks::DelegationChild::TaskSession {
-                            task_session_id: Some(session),
-                            ..
-                        } => find_task_session_tab(&self.workspaces, session).ok_or_else(|| {
-                            "The worker's tab is closed. Open its task from the Tasks rail to \
-                             resume it."
-                                .to_string()
-                        }),
-                        gitterm::tasks::DelegationChild::TaskSession { .. } => Err(
-                            "The worker has not started yet (it is queued behind other tasks)."
-                                .to_string(),
-                        ),
-                        _ => Err(format!("delegation {delegation_id} has no worker tab")),
+                    .and_then(|delegation| {
+                        gitterm::delegations::worker_tab_target(delegation, |session| {
+                            find_task_session_tab(&self.workspaces, session)
+                        })
                     });
                 return match target {
                     Ok((ws_idx, worker_tab_idx)) => {
@@ -27888,8 +27876,7 @@ impl App {
                     return Task::none();
                 };
                 // Open a file in $EDITOR (fallback: vim) in a new tab
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-                let cmd = format!("{} \"{}\"", editor, path.display());
+                let cmd = editor::terminal_command(std::env::var("EDITOR").ok().as_deref(), &path);
                 if let Some(ws) = self.active_workspace() {
                     let dir = ws
                         .active_tab()

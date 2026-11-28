@@ -1,3 +1,10 @@
+/// The host validates the current chat checkout before opening its editor.
+#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[action(namespace = native_chat, no_json)]
+pub struct OpenCheckout {
+    pub path: Option<std::path::PathBuf>,
+}
+
 mod attachments;
 #[path = "copy.rs"]
 mod copy;
@@ -179,6 +186,7 @@ pub struct ChatView {
     shadow: Option<gitterm_core::chat::state::State>,
     checkout_source: Option<crate::composer::CheckoutSource>,
     dismiss_gate: Option<crate::interactions::DismissGate>,
+    delegation_actions_live: bool,
     callback: Option<IntentCallback>,
     images: Vec<gitterm_core::chat::types::ImageAttachment>,
     image_previews: Vec<Option<Arc<gpui::Image>>>,
@@ -225,6 +233,7 @@ pub struct ChatView {
 }
 impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
 impl gpui::EventEmitter<crate::review::ReviewOutcome> for ChatView {}
+impl gpui::EventEmitter<crate::interactions::TranscriptAction> for ChatView {}
 
 impl ChatView {
     pub fn new(records: Vec<Record>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -325,6 +334,7 @@ impl ChatView {
             shadow: None,
             checkout_source: None,
             dismiss_gate: None,
+            delegation_actions_live: false,
             callback: None,
             images: vec![],
             image_previews: vec![],
@@ -710,6 +720,12 @@ impl ChatView {
         self.checkout_source = Some(source);
         cx.notify();
     }
+    /// Live card actions are executed by the owning task host. Preview and
+    /// fixture views retain their existing notices.
+    pub fn enable_delegation_actions(&mut self, cx: &mut Context<Self>) {
+        self.delegation_actions_live = true;
+        cx.notify();
+    }
     /// The host's gate for delegation card dismissals.
     pub fn set_dismiss_gate(
         &mut self,
@@ -790,14 +806,15 @@ impl ChatView {
         self.focus_composer(window, cx);
         cx.notify();
     }
-    /// Iced posts `open_checkout` to launch the configured editor; the preview
-    /// launches nothing and says so as the other Open in editor controls do.
+    /// Iced posts `open_checkout`; the host validates and opens this checkout.
     pub(crate) fn open_checkout_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_state.picker = None;
-        self.composer_state.notice = Some(format!(
-            "Open in editor · {}",
-            crate::composer::NOT_IN_PREVIEW
-        ));
+        window.dispatch_action(
+            Box::new(OpenCheckout {
+                path: self.composer_state.checkout_path.as_ref().map(Into::into),
+            }),
+            cx,
+        );
         self.focus_composer(window, cx);
         cx.notify();
     }
@@ -812,11 +829,10 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         if picker == crate::pickers::Picker::Checkout {
-            if self.read_only_reason.is_some() {
-                return;
-            }
-            // A locked chat's menu lists only Open in editor, as in Iced.
-            if self.composer_state.checkout_locked.is_none()
+            // Opening the current checkout is safe even when this chat cannot send.
+            // Keep checkout changes behind the existing read-only fence.
+            if self.read_only_reason.is_none()
+                && self.composer_state.checkout_locked.is_none()
                 && let Some(source) = &self.checkout_source
             {
                 self.composer_state.checkout_choices = source(cx);
@@ -2770,7 +2786,7 @@ impl Render for RowView {
                                                         action(
                                         crate::interactions::TranscriptAction::OpenFile {
                                             path: path.clone(),
-                                            review: true,
+                                            review: true, line: None,
                                         },
                                         cx,
                                     );

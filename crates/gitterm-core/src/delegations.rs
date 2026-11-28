@@ -540,6 +540,28 @@ pub fn worker_session_state(
     }
 }
 
+/// Resolve Open worker tab without creating or resuming a session.
+pub fn worker_tab_target<T>(
+    delegation: &Delegation,
+    find: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, String> {
+    match &delegation.child {
+        DelegationChild::TaskSession {
+            task_session_id: Some(session),
+            ..
+        } => find(session).ok_or_else(|| {
+            "The worker's tab is closed. Open its task from the Tasks rail to resume it.".into()
+        }),
+        DelegationChild::TaskSession { .. } => {
+            Err("The worker has not started yet (it is queued behind other tasks).".into())
+        }
+        _ => Err(format!(
+            "delegation {} has no worker tab",
+            delegation.delegation_id
+        )),
+    }
+}
+
 /// What the chat card and roster show about a worker beyond the record:
 /// the task, where it works, its live state and latest progress line.
 pub fn worker_card_info(
