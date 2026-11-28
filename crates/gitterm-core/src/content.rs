@@ -16,6 +16,20 @@ pub struct FileVersionSignature {
     pub file_len: u64,
 }
 
+/// Iced's change signature: modified time in nanoseconds plus byte length.
+pub fn file_version_signature(path: &Path) -> Option<FileVersionSignature> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileVersionSignature {
+        modified_unix_nanos: metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+        file_len: metadata.len(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct FileLoadSnapshot {
     pub tab_id: usize,
@@ -53,6 +67,8 @@ macro_rules! perf_log {
         }
     }};
 }
+
+pub mod syntax;
 
 /// Root-bound local preview. Existing unrestricted Iced callers retain their
 /// original reader; new frontends must supply a captured root and relative path.

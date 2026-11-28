@@ -69,7 +69,7 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
             shell.open_file_viewer(
                 &FileOpen {
                     workspace: WorkspaceId(1),
-                    path,
+                    path: path.clone(),
                     changed: None,
                     from_files: true,
                 },
@@ -78,11 +78,15 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
             );
         })
     });
+    wait_for_document(shell, &path, cx);
+
     draw(cx);
 }
 
 #[gpui::test]
-fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestAppContext) {
+fn copy_all_uses_displayed_snapshot_including_large_preview_and_browser_still_uses_full_file(
+    cx: &mut TestAppContext,
+) {
     let _test_app = crate::test_app::Cleanup::new(cx);
     let (folder, config, shell, cx) = fixture(cx);
     let out = tempfile::tempdir().unwrap();
@@ -109,14 +113,16 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
     );
     open(&shell, raw.clone(), cx);
     let copy_config_before = tree_bytes(config.path());
+    std::fs::write(&raw, "changed on disk after opening").unwrap();
     click(cx, "viewer-copy-all");
     cx.read(|cx| {
         assert_eq!(
             cx.read_from_clipboard().unwrap().text().as_deref(),
-            Some(text.as_str())
+            Some(preview.text.as_str())
         )
     });
     assert_eq!(tree_bytes(config.path()), copy_config_before);
+    std::fs::write(&raw, &text).unwrap();
     for path in [&raw, &markdown, &long_markdown, &html] {
         open(&shell, path.clone(), cx);
         assert_eq!(cx.debug_bounds("viewer-copy-all").is_some(), path == &raw);
@@ -615,4 +621,120 @@ fn work_sidebar_and_chat_navigation_reach_the_shared_editor_request(cx: &mut Tes
         )
     });
     assert_eq!(std::fs::read_to_string(path).unwrap(), "unchanged");
+}
+
+fn wait_for_document(shell: &Entity<Shell>, path: &Path, cx: &mut VisualTestContext) {
+    let id = crate::content_pane_id(WorkspaceId(1), path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        cx.executor().advance_clock(Duration::from_millis(30));
+        draw(cx);
+        if cx.read(|cx| shell.read(cx).content.read(cx).document(&id).is_some()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "document did not load: {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[gpui::test]
+fn clicking_open_file_reuses_unchanged_snapshot_and_reloads_iced_change_signature(
+    cx: &mut TestAppContext,
+) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (folder, _config, shell, cx) = fixture(cx);
+    let path = folder.path().join("reload.txt");
+    std::fs::write(&path, "before").unwrap();
+    let id = crate::content_pane_id(WorkspaceId(1), &path);
+    open(&shell, path.clone(), cx);
+    let (signature, address, panes) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let doc = shell.content.read(cx).document(&id).unwrap();
+        (
+            doc.signature.unwrap(),
+            doc.html().as_ptr() as usize,
+            shell.active(cx).panes.len(),
+        )
+    });
+    open(&shell, path.clone(), cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell
+                .read(cx)
+                .content
+                .read(cx)
+                .document(&id)
+                .unwrap()
+                .html()
+                .as_ptr() as usize,
+            address
+        )
+    });
+    // Same byte length: mtime is essential, not just size.
+    std::fs::write(&path, "AFTER!").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100)),
+        )
+        .unwrap();
+    open(&shell, path.clone(), cx);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let doc = shell.content.read(cx).document(&id).unwrap();
+        assert_eq!(doc.text, "AFTER!");
+        assert_ne!(doc.signature, Some(signature));
+        assert_eq!(shell.active(cx).panes.len(), panes);
+    });
+    // Preserve mtime while changing length: both parts of Iced's signature matter.
+    std::fs::write(&path, "longer snapshot").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100)),
+        )
+        .unwrap();
+    open(&shell, path, cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).content.read(cx).document(&id).unwrap().text,
+            "longer snapshot"
+        )
+    });
+}
+
+#[gpui::test]
+fn closing_file_viewer_clears_files_row_selection(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (folder, _config, shell, cx) = fixture(cx);
+    let path = folder.path().join("selected.txt");
+    std::fs::write(&path, "snapshot").unwrap();
+    let owner = shell.read_with(cx, |shell, _| shell.owner.clone());
+    let files = cx.new(|cx| {
+        crate::files_view::FilesView::new(
+            WorkspaceId(1),
+            Rc::new(data::LocalData(owner.clone())),
+            cx,
+        )
+    });
+    owner.update(cx, |owner, cx| {
+        owner.open_file(WorkspaceId(1), path.clone(), cx)
+    });
+    wait_for_document(&shell, &path, cx);
+    assert_eq!(
+        files.read_with(cx, |view, _| view.selected_file().map(Path::to_path_buf)),
+        Some(path)
+    );
+    click(cx, "close-file-viewer");
+    assert!(files.read_with(cx, |view, _| view.selected_file().is_none()));
 }

@@ -455,26 +455,26 @@ impl Shell {
                     cx,
                 )
             });
-            let dark = gpui_component::Theme::global(cx).mode.is_dark();
-            self.content.update(cx, |content, cx| {
-                content.open(
-                    id.clone(),
-                    super::window::ContentRequest {
-                        root: root.clone(),
-                        relative: relative.to_owned(),
-                        workspace: event.workspace.0,
-                        pane: pane.entity_id().as_u64(),
-                        dark,
-                    },
-                    window,
-                    cx,
-                )
-            });
             self.registry
                 .borrow_mut()
                 .insert(id.clone(), pane.downgrade());
             state.panes.insert(id.clone(), pane);
         }
+        let dark = gpui_component::Theme::global(cx).mode.is_dark();
+        self.content.update(cx, |content, cx| {
+            content.open(
+                id.clone(),
+                super::window::ContentRequest {
+                    root: root.clone(),
+                    relative: relative.to_owned(),
+                    workspace: event.workspace.0,
+                    pane: state.panes[&id].entity_id().as_u64(),
+                    dark,
+                },
+                window,
+                cx,
+            )
+        });
         self.content
             .update(cx, |content, _| content.select(Some(id.clone())));
         self.show_workspace_pane(event.workspace, &id, window, cx);
@@ -515,6 +515,9 @@ impl Shell {
                 .update(cx, |dock, cx| dock.select_panel(panel, window, cx));
             pane.focus_handle(cx).focus(window, cx);
         }
+        self.owner.update(cx, |_, cx| {
+            cx.emit(crate::files_view::FileViewerClosed(workspace))
+        });
         self.content.update(cx, |content, cx| {
             content.select(None);
             cx.notify();
