@@ -713,6 +713,23 @@ where
     lines
 }
 
+/// The Usage rail tooltip shared by Iced and GPUI.
+pub fn usage_tooltip<Tz: TimeZone>(file: &PlanLimitsFile, now: i64, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let mut lines = vec!["Usage  ⌘⇧U".to_string()];
+    match file.usage_badge.level {
+        UsageBadgeLevel::Hot => lines.push("Plan usage is running hot".into()),
+        UsageBadgeLevel::Urgent => lines.push("Plan usage is urgent".into()),
+        UsageBadgeLevel::OnTrack => {}
+    }
+    for reading in file.readings() {
+        lines.extend(tooltip_lines(reading, &file.history, now, tz));
+    }
+    lines.join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // Shared routing policy (TRU-214). Evaluation is pure; the app owns saves/tells.
 // ---------------------------------------------------------------------------

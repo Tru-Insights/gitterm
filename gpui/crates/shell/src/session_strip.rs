@@ -178,11 +178,11 @@ impl Session {
     pub fn icon(&self, active: bool, pulse: bool, c: Colors) -> (&'static str, u32) {
         let needs = if pulse && !active { c.peach } else { c.yellow };
         if self.kind == SessionKind::Chat {
-            if self.pending_requests > 0 {
-                return ("● ", needs);
-            }
-            if self.running {
-                return ("▶ ", c.green);
+            use gitterm_core::attention::{ChatTabMarker, chat_tab_marker};
+            match chat_tab_marker(self.running, self.pending_requests, active) {
+                Some(ChatTabMarker::NeedsYou { .. }) => return ("● ", needs),
+                Some(ChatTabMarker::Running) => return ("▶ ", c.green),
+                None => {}
             }
         }
         match self.attention {

@@ -1,19 +1,27 @@
 //! Live's adapter for Iced's needs-you policy. No persistence or transcript reads.
 use crate::{
-    Shell,
+    Shell, WorkspaceDock,
+    data::SessionId,
     owner::WorkspaceOwner,
     pane::{Pane, PaneContent},
+    workspace_bar::AttentionKind,
 };
 use gitterm_core::{
+    attention::{
+        AttentionReason, PULSE_INTERVAL, harness_event_attention_reason,
+        terminal_title_attention_reason,
+    },
     attention_notifications::{
         INPUT_REQUIRED as INPUT, NeedsYouNotifier, NeedsYouObservation, WORKER_BLOCKED as BLOCKED,
         needs_you_notification_script, strip_title_status_glyphs, terminal_title_shows_working,
     },
-    chat::types::{HarnessEvent, TurnStatus},
+    chat::types::HarnessEvent,
+    park::WakeReason,
     task_mcp::HandoffStatus,
+    tasks::DelegationKind,
     tasks::{TaskAttentionReason, TaskLifecycle},
 };
-use gpui::{App, Context, WeakEntity};
+use gpui::{App, Context, Subscription, WeakEntity};
 use std::{
     collections::HashSet,
     time::{Duration, Instant},
@@ -23,41 +31,66 @@ use std::{
 /// report replaces the prior reason; visiting acknowledges delegation results.
 #[derive(Default)]
 pub(crate) struct ChatAttention {
-    reason: Option<&'static str>,
+    reason: Option<AttentionReason>,
     front: bool,
+    pending: HashSet<String>,
+    since: Option<Instant>,
+    pub(crate) wake: Option<WakeReason>,
 }
 impl ChatAttention {
     pub(crate) fn event(&mut self, event: &HarnessEvent, pending: bool) {
         match event {
-            HarnessEvent::RuntimeRequest { .. } => self.reason = Some(INPUT),
-            HarnessEvent::RuntimeRequestResolved { .. } if !pending => self.working(),
-            HarnessEvent::TurnCompleted {
-                status: TurnStatus::Completed,
-                ..
-            } => {
-                self.reason = (!self.front).then_some("Ready to review");
+            HarnessEvent::RuntimeRequest { request_id, .. } => {
+                self.pending.insert(request_id.clone());
             }
-            HarnessEvent::TurnCompleted {
-                status: TurnStatus::Failed(_),
-                ..
+            HarnessEvent::RuntimeRequestResolved { request_id } => {
+                self.pending.remove(request_id);
             }
-            | HarnessEvent::Error(_) => self.reason = Some("Agent failed"),
             _ => {}
         }
+        if !pending {
+            self.pending.clear();
+        }
+        if let Some(reason) = harness_event_attention_reason(event) {
+            if self.wake.is_none() {
+                self.wake = WakeReason::for_attention(reason);
+            }
+            if reason == AttentionReason::CompletedUnread && self.front {
+                self.reason = None;
+                self.since = None;
+            } else {
+                self.set(reason);
+            }
+        } else if matches!(event, HarnessEvent::RuntimeRequestResolved { .. }) && !pending {
+            self.working();
+        }
     }
+    fn set(&mut self, reason: AttentionReason) {
+        if self.reason != Some(reason) {
+            self.since = Some(Instant::now());
+        }
+        self.reason = Some(reason);
+    }
+
     fn needs_you(&self) -> Option<&'static str> {
         self.reason
+            .map(AttentionReason::label)
             .filter(|reason| matches!(*reason, INPUT | BLOCKED))
     }
     pub(crate) fn working(&mut self) {
-        if self.reason == Some(INPUT) {
+        if self.reason == Some(AttentionReason::HumanInputRequired) {
             self.reason = None;
         }
     }
     pub(crate) fn visit(&mut self) {
         if matches!(
             self.reason,
-            Some(BLOCKED | "Ready to review" | "Worker done")
+            Some(
+                AttentionReason::CompletedUnread
+                    | AttentionReason::DelegationReady(_)
+                    | AttentionReason::DelegationFailed(_)
+                    | AttentionReason::DelegationBlocked(_)
+            )
         ) {
             self.reason = None;
         }
@@ -74,11 +107,15 @@ struct PaneSnapshot {
     pane: WeakEntity<Pane>,
     repo_title: String,
     front: bool,
+    _attention: Option<Subscription>,
 }
 pub(crate) struct Notifications {
     notifier: NeedsYouNotifier<Target>,
     pub(crate) enabled: bool,
     panes: Vec<PaneSnapshot>,
+    pulse_bright: bool,
+    pulse_task: Option<gpui::Task<()>>,
+    pub(crate) woke: std::collections::HashMap<u64, WakeReason>,
 }
 impl Notifications {
     pub(crate) fn new(now: Instant) -> Self {
@@ -86,7 +123,139 @@ impl Notifications {
             notifier: NeedsYouNotifier::new(now),
             enabled: true,
             panes: vec![],
+            pulse_bright: false,
+            pulse_task: None,
+            woke: Default::default(),
         }
+    }
+}
+
+/// One session projection feeds the strip, workspace chips, rail and keyboard jump.
+#[derive(Default)]
+pub(crate) struct SessionAttention {
+    pub kind: Option<AttentionKind>,
+    pub pending: usize,
+    pub running: bool,
+    pub reason: Option<AttentionReason>,
+    pub waiting: Duration,
+}
+fn kind(reason: AttentionReason) -> AttentionKind {
+    match reason.priority() {
+        0 => AttentionKind::NeedsYou,
+        1 => AttentionKind::Failed,
+        _ => AttentionKind::Review,
+    }
+}
+fn live_attention(pane: &Pane, cx: &App) -> SessionAttention {
+    match &pane.content {
+        PaneContent::PreviewChat(view) => {
+            let chat = view.read(cx);
+            let attention = &chat.notification_attention;
+            SessionAttention {
+                kind: attention.reason.map(kind),
+                pending: attention.pending.len(),
+                running: chat.is_working(),
+                reason: attention.reason,
+                waiting: attention
+                    .since
+                    .map(|since| since.elapsed())
+                    .unwrap_or_default(),
+            }
+        }
+        PaneContent::Terminal(_) => {
+            let title = pane.notification_terminal_title();
+            let reason = if pane.needs_input(cx) {
+                Some(AttentionReason::HumanInputRequired)
+            } else {
+                title.and_then(terminal_title_attention_reason)
+            };
+            SessionAttention {
+                kind: reason.map(kind),
+                reason,
+                running: title.is_some_and(terminal_title_shows_working),
+                ..Default::default()
+            }
+        }
+        _ => SessionAttention::default(),
+    }
+}
+impl Shell {
+    pub(crate) fn attention_pulse(&self, cx: &App) -> bool {
+        self.owner
+            .read(cx)
+            .notifications
+            .as_ref()
+            .is_some_and(|s| s.pulse_bright)
+    }
+    pub(crate) fn session_attention(
+        &self,
+        state: &WorkspaceDock,
+        id: SessionId,
+        cx: &App,
+    ) -> SessionAttention {
+        let mut live = state
+            .panes
+            .get(&crate::session_pane_id(id))
+            .map(|p| live_attention(p.read(cx), cx))
+            .unwrap_or_default();
+        if crate::session_needs_input(state, id, cx) {
+            live.kind = Some(AttentionKind::NeedsYou);
+        }
+        let owner = self.owner.read(cx);
+        let tab = owner.iced_workspace(state.workspace.id).and_then(|saved| {
+            owner
+                .iced_sessions(saved)
+                .iter()
+                .position(|session| session.id == id)
+                .and_then(|i| saved.tabs.get(i))
+        });
+        let sidebar = self
+            .work_sidebars
+            .get(&state.workspace.id)
+            .map(|s| s.read(cx));
+        let tasks = sidebar
+            .map(|s| s.tasks())
+            .or_else(|| self.roster_facts.as_ref().map(|f| f.tasks.as_slice()))
+            .unwrap_or_default();
+        let workers = sidebar
+            .map(|s| s.workers())
+            .or_else(|| self.roster_facts.as_ref().map(|f| f.workers.as_slice()))
+            .unwrap_or_default();
+        let target = state
+            .panes
+            .get(&crate::session_pane_id(id))
+            .and_then(|pane| {
+                let pane = pane.read(cx);
+                match &pane.content {
+                    PaneContent::PreviewChat(view) => Some(view.read(cx).target()),
+                    _ => pane.session.clone(),
+                }
+            });
+        let task_id = tab
+            .and_then(|t| t.task_id.as_deref())
+            .or_else(|| target.as_ref().and_then(|t| t.task_id.as_deref()));
+        let task = task_id.and_then(|id| tasks.iter().find(|t| t.task_id == id));
+        let durable = crate::session_strip::attention(
+            task.map(|t| &t.attention),
+            workers,
+            tab.and_then(|t| t.session_uid.as_deref())
+                .or_else(|| target.as_ref().map(|t| t.session_uid.as_str())),
+        );
+        let live_kind = live.kind;
+        live.kind = live
+            .kind
+            .into_iter()
+            .chain(durable)
+            .min_by_key(|kind| match kind {
+                AttentionKind::NeedsYou => 0,
+                AttentionKind::Failed => 1,
+                AttentionKind::Review => 3,
+            });
+        if live.kind != live_kind {
+            live.reason = None;
+            live.waiting = Duration::ZERO;
+        }
+        live
     }
 }
 
@@ -124,23 +293,37 @@ impl Shell {
             return;
         }
         let active = self.owner.read(cx).model.active();
-        let panes = self
-            .workspaces
-            .iter()
-            .flat_map(|state| {
-                state.sessions.iter().filter_map(|session| {
-                    let pane = state.panes.get(&crate::session_pane_id(session.id))?;
-                    Some(PaneSnapshot {
-                        id: session.id.0,
-                        pane: pane.downgrade(),
-                        repo_title: self.data.status(state.workspace.id, cx).repository,
-                        front: active == Some(state.workspace.id)
-                            && state.active_session == Some(session.id),
+        let mut panes = Vec::new();
+        for state in &self.workspaces {
+            for session in &state.sessions {
+                let Some(pane) = state.panes.get(&crate::session_pane_id(session.id)) else {
+                    continue;
+                };
+                let chat = match &pane.read(cx).content {
+                    PaneContent::PreviewChat(chat) => Some(chat.clone()),
+                    _ => None,
+                };
+                let weak_pane = pane.downgrade();
+                let attention = chat.map(|chat| {
+                    cx.observe(&chat, move |_, _, cx| {
+                        // The dock's pane observer has the window needed to return
+                        // a running park; delivery follows the chat's update.
+                        if let Some(pane) = weak_pane.upgrade() {
+                            pane.update(cx, |_, cx| cx.notify());
+                        }
+                        cx.notify();
                     })
-                })
-            })
-            .collect();
-        let panes: Vec<PaneSnapshot> = panes;
+                });
+                panes.push(PaneSnapshot {
+                    id: session.id.0,
+                    _attention: attention,
+                    pane: pane.downgrade(),
+                    repo_title: self.data.status(state.workspace.id, cx).repository,
+                    front: active == Some(state.workspace.id)
+                        && state.active_session == Some(session.id),
+                });
+            }
+        }
         for entry in &panes {
             let chat = entry
                 .pane
@@ -158,13 +341,59 @@ impl Shell {
                 });
             }
         }
-        self.owner.update(cx, |owner, _| {
-            owner.notifications.as_mut().unwrap().panes = panes;
+        self.owner.update(cx, |owner, cx| {
+            let active_uid = self
+                .workspaces
+                .iter()
+                .find(|w| Some(w.workspace.id) == active)
+                .map(|w| w.runtime_uid);
+            let state = owner.notifications.as_mut().unwrap();
+            state.panes = panes;
+            if let Some(uid) = active_uid {
+                state.woke.remove(&uid);
+            }
+            owner.sync_attention_pulse(cx);
         });
     }
 }
 
 impl WorkspaceOwner {
+    fn sync_attention_pulse(&mut self, cx: &mut Context<Self>) {
+        let active = self.notifications.as_ref().is_some_and(|state| {
+            state.panes.iter().any(|entry| {
+                entry.pane.upgrade().is_some_and(|pane| {
+                    live_attention(pane.read(cx), cx).reason
+                        == Some(AttentionReason::HumanInputRequired)
+                })
+            })
+        });
+        let Some(state) = self.notifications.as_mut() else {
+            return;
+        };
+        if !active {
+            state.pulse_task = None;
+        } else if state.pulse_task.is_none() {
+            // Like Iced's conditional subscription, the first edge starts a
+            // full 500ms interval, and resolving the last request cancels it.
+            state.pulse_task = Some(cx.spawn(async move |owner, cx| {
+                loop {
+                    cx.background_executor().timer(PULSE_INTERVAL).await;
+                    if owner
+                        .update(cx, |owner, cx| {
+                            if let Some(state) = &mut owner.notifications {
+                                state.pulse_bright = !state.pulse_bright;
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
     fn notification_scripts(&mut self, now: Instant, cx: &mut Context<Self>) -> Vec<String> {
         let Some(state) = self.notifications.as_mut().filter(|s| s.enabled) else {
             return vec![];
@@ -296,11 +525,12 @@ pub(crate) fn worker_reported(parent: &str, status: HandoffStatus, cx: &mut App)
         });
         if !front {
             chat.update(cx, |chat, _| {
-                chat.notification_attention.reason = Some(if status == HandoffStatus::Blocked {
-                    BLOCKED
-                } else {
-                    "Worker done"
-                });
+                chat.notification_attention
+                    .set(if status == HandoffStatus::Blocked {
+                        AttentionReason::DelegationBlocked(DelegationKind::Implement)
+                    } else {
+                        AttentionReason::DelegationReady(DelegationKind::Implement)
+                    });
             });
         }
     });
@@ -309,11 +539,14 @@ pub(crate) fn worker_reported(parent: &str, status: HandoffStatus, cx: &mut App)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gitterm_core::chat::{runtime::RuntimeEvent, types::RuntimeRequestKind};
+    use gitterm_core::chat::{
+        runtime::RuntimeEvent,
+        types::{RuntimeRequestKind, TurnStatus},
+    };
     use gpui::{AppContext, Entity, TestAppContext};
     use std::rc::Rc;
 
-    fn request(id: &str, question: bool) -> HarnessEvent {
+    pub(super) fn request(id: &str, question: bool) -> HarnessEvent {
         HarnessEvent::RuntimeRequest {
             request_id: id.into(),
             tool_use_id: id.into(),
@@ -377,6 +610,7 @@ mod tests {
             let mut state = Notifications::new(start);
             state.panes.push(PaneSnapshot {
                 id: 1,
+                _attention: None,
                 pane: pane.downgrade(),
                 repo_title: "fixture-repo".into(),
                 front: false,
@@ -479,7 +713,7 @@ mod tests {
                 .is_empty()
         );
         attention.event(&completed(TurnStatus::Completed), false);
-        assert_eq!(attention.reason, Some("Ready to review"));
+        assert_eq!(attention.reason, Some(AttentionReason::CompletedUnread));
         assert!(
             notifier
                 .observe(start + Duration::from_secs(71), true, [observe(&attention)])
@@ -515,7 +749,7 @@ mod tests {
             },
             true,
         );
-        assert_eq!(attention.reason, Some(INPUT));
+        assert_eq!(attention.reason, Some(AttentionReason::HumanInputRequired));
         attention.event(
             &HarnessEvent::RuntimeRequestResolved {
                 request_id: "question".into(),
@@ -523,10 +757,319 @@ mod tests {
             false,
         );
         assert_eq!(attention.reason, None);
-        attention.reason = Some(BLOCKED);
+        attention.reason = Some(AttentionReason::DelegationBlocked(
+            DelegationKind::Implement,
+        ));
         attention.working();
-        assert_eq!(attention.reason, Some(BLOCKED)); // Iced clears only HumanInputRequired
+        assert_eq!(
+            attention.reason,
+            Some(AttentionReason::DelegationBlocked(
+                DelegationKind::Implement
+            ))
+        ); // Iced clears only HumanInputRequired
         attention.visit();
         assert_eq!(attention.reason, None);
+    }
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use super::*;
+    use crate::{
+        chat::{ChatPane, SavedChat},
+        data::SessionKind,
+    };
+    use gitterm_core::chat::{runtime::RuntimeEvent, types::TurnStatus};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+
+    fn fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<Shell>,
+        Entity<ChatPane>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(crate::install_app_menus);
+        let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+        let chat = cx.update(|window, cx| {
+            let shutdown = shell.read(cx).owner.read(cx).chat_shutdown.clone();
+            cx.new(|cx| {
+                ChatPane::history(
+                    shutdown,
+                    SavedChat {
+                        uid: "fixture-attention".into(),
+                        cwd: root.path().into(),
+                        provider: root.path().join("provider"),
+                        session_id: Some("fixture-chat".into()),
+                        records: vec![],
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        shell.update(cx, |shell, cx| {
+            let owner = shell.owner.clone();
+            owner.update(cx, |owner, _| {
+                owner.notifications = Some(Notifications::new(Instant::now()))
+            });
+            let state = &mut shell.workspaces[1];
+            let session = &mut state.sessions[1];
+            session.kind = SessionKind::Chat;
+            state.panes[&crate::session_pane_id(session.id)].update(cx, |pane, _| {
+                pane.content = PaneContent::PreviewChat(chat.clone());
+            });
+            shell.sync_notification_panes(cx);
+        });
+        (root, shell, chat, cx)
+    }
+    fn event(chat: &Entity<ChatPane>, event: HarnessEvent, cx: &mut VisualTestContext) {
+        chat.update(cx, |chat, cx| {
+            let source = chat.runtime_source();
+            chat.receive_runtime_event(&source, RuntimeEvent::Harness(event), cx);
+        });
+    }
+    fn completed(status: TurnStatus) -> HarnessEvent {
+        HarnessEvent::TurnCompleted {
+            status,
+            usage: serde_json::Value::Null,
+            cost_usd: None,
+            rate_limit: None,
+        }
+    }
+
+    #[gpui::test]
+    fn tru274_pending_native_chat_lights_tab_chip_dot_and_ctrl_backtick(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (_root, shell, chat, cx) = fixture(cx);
+        for question in [false, true] {
+            event(&chat, super::tests::request("request", question), cx);
+            cx.read(|cx| {
+                let shell = shell.read(cx);
+                let bar = shell.bar_input(cx);
+                let chip = bar
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == shell.workspaces[1].workspace.id)
+                    .unwrap();
+                assert_eq!(chip.attention.as_ref().unwrap().count, 1);
+                assert_eq!(
+                    chip.attention.as_ref().unwrap().kind,
+                    AttentionKind::NeedsYou
+                );
+                let dot = shell
+                    .spine_input(cx)
+                    .dots(crate::workspace_bar::Colors::new(true))
+                    .into_iter()
+                    .find(|d| d.workspace == chip.id)
+                    .unwrap();
+                assert_eq!(dot.urgency, Some(crate::spine::Urgency::NeedsYou));
+            });
+            cx.update(|window, cx| {
+                let focus = shell.read(cx).focus.clone();
+                focus.focus(window, cx);
+            });
+            cx.simulate_keystrokes("ctrl-`");
+            cx.run_until_parked();
+            cx.read(|cx| {
+                let shell = shell.read(cx);
+                assert_eq!(
+                    shell.active_workspace(cx),
+                    Some(shell.workspaces[1].workspace.id)
+                );
+                let strip = shell.strip_input(cx);
+                let tab = strip
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == strip.active.unwrap())
+                    .unwrap();
+                assert_eq!(tab.pending_requests, 1);
+                assert_eq!(tab.attention, Some(AttentionKind::NeedsYou));
+                assert_eq!(
+                    tab.icon(true, true, crate::workspace_bar::Colors::new(true))
+                        .0,
+                    "● "
+                );
+            });
+            event(
+                &chat,
+                HarnessEvent::RuntimeRequestResolved {
+                    request_id: "request".into(),
+                },
+                cx,
+            );
+            shell.update_in(cx, |shell, window, cx| {
+                shell.select_workspace_id(shell.workspaces[0].workspace.id, window, cx)
+            });
+        }
+        for (status, expected) in [
+            (TurnStatus::Completed, AttentionKind::Review),
+            (TurnStatus::Failed("fixture".into()), AttentionKind::Failed),
+        ] {
+            event(&chat, completed(status), cx);
+            cx.read(|cx| {
+                assert_eq!(
+                    shell.read(cx).chrome_workspaces(cx)[1]
+                        .attention
+                        .as_ref()
+                        .unwrap()
+                        .kind,
+                    expected
+                )
+            });
+            shell.update_in(cx, |s, window, cx| s.attention_jump(window, cx));
+            cx.read(|cx| {
+                assert_eq!(
+                    shell.read(cx).strip_input(cx).active,
+                    Some(shell.read(cx).workspaces[1].sessions[1].id)
+                )
+            });
+            shell.update_in(cx, |s, window, cx| {
+                s.select_workspace_id(s.workspaces[0].workspace.id, window, cx)
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn tru274_pulse_toggles_on_iced_500ms_interval(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (_root, shell, chat, cx) = fixture(cx);
+        event(&chat, super::tests::request("request", false), cx);
+        let owner = cx.read(|cx| shell.read(cx).owner.clone());
+        let _task = owner.update(cx, |_, cx| start(cx));
+        cx.run_until_parked();
+        let bright = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let s = shell.read(cx);
+                let values = [
+                    s.strip_input(cx).pulse_bright,
+                    s.bar_input(cx).pulse_bright,
+                    s.spine_input(cx).pulse_bright,
+                ];
+                assert!(values.iter().all(|v| *v == values[0]));
+                values[0]
+            })
+        };
+        assert!(!bright(cx));
+        cx.executor().advance_clock(Duration::from_millis(499));
+        cx.run_until_parked();
+        assert!(!bright(cx));
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(bright(cx));
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(!bright(cx));
+        event(
+            &chat,
+            HarnessEvent::RuntimeRequestResolved {
+                request_id: "request".into(),
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        event(&chat, super::tests::request("next", true), cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(499));
+        cx.run_until_parked();
+        assert!(!bright(cx));
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert!(bright(cx), "new input restarts the full Iced interval");
+        event(&chat, completed(TurnStatus::Failed("fixture".into())), cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        assert!(
+            bright(cx),
+            "failed indicators leave the phase static like Iced"
+        );
+    }
+
+    #[gpui::test]
+    fn tru274_parked_chat_wakes_with_iced_reason_badge(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (_root, shell, chat, cx) = fixture(cx);
+        for (event_value, expected) in [
+            (
+                super::tests::request("request", false),
+                WakeReason::NeedsYou,
+            ),
+            (completed(TurnStatus::Completed), WakeReason::Finished),
+            (
+                completed(TurnStatus::Failed("fixture".into())),
+                WakeReason::Failed,
+            ),
+            (HarnessEvent::Error("fixture".into()), WakeReason::Failed),
+        ] {
+            shell.update(cx, |shell, _| {
+                shell.workspaces[1].parked = Some(crate::park::Parked {
+                    info: gitterm_core::park::Info::new("fixture", "fixture".into()),
+                    running: true,
+                    done: false,
+                });
+            });
+            event(&chat, event_value, cx);
+            cx.run_until_parked();
+            shell.update_in(cx, |shell, window, cx| {
+                assert!(shell.workspaces[1].on_bar());
+                assert_eq!(shell.chrome_workspaces(cx)[1].woke, Some(expected));
+                assert_eq!(
+                    shell.active_workspace(cx),
+                    Some(shell.workspaces[0].workspace.id),
+                    "wake never steals focus"
+                );
+                shell.select_workspace_id(shell.workspaces[1].workspace.id, window, cx);
+                shell.sync_notification_panes(cx);
+                assert_eq!(shell.chrome_workspaces(cx)[1].woke, None);
+                shell.select_workspace_id(shell.workspaces[0].workspace.id, window, cx);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn tru274_cli_title_attention_reaches_same_chrome_and_jump(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (_root, shell, _chat, cx) = fixture(cx);
+        shell.update_in(cx, |shell, window, cx| {
+            let state = &shell.workspaces[1];
+            let id = state.sessions[0].id;
+            let pane = state.panes[&crate::session_pane_id(id)].clone();
+            // A deferred terminal has no PTY and no process.
+            pane.update(cx, |pane, cx| {
+                pane.content = PaneContent::Terminal(cx.new(|cx| {
+                    gitterm_terminal::TerminalView::new_deferred(
+                        Default::default(),
+                        Default::default(),
+                        cx,
+                    )
+                }));
+                pane.terminal_title = Some("✳ Fixture".into());
+            });
+            assert_eq!(
+                shell.session_attention(&shell.workspaces[1], id, cx).kind,
+                Some(AttentionKind::NeedsYou)
+            );
+            assert_eq!(
+                shell.chrome_workspaces(cx)[1]
+                    .attention
+                    .as_ref()
+                    .unwrap()
+                    .count,
+                1
+            );
+            shell.attention_jump(window, cx);
+            assert_eq!(shell.strip_input(cx).active, Some(id));
+            pane.update(cx, |pane, _| pane.terminal_title = Some("◐ Fixture".into()));
+            assert!(
+                shell
+                    .session_attention(&shell.workspaces[1], id, cx)
+                    .kind
+                    .is_none()
+            );
+        });
     }
 }
