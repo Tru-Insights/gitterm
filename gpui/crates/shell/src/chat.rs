@@ -8,10 +8,13 @@ mod managed;
 mod navigation;
 pub(crate) mod policy;
 mod provider;
+pub(crate) mod remote;
 pub(crate) mod resume;
 pub(crate) use navigation::{Navigation, navigation, worker_tab_target};
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod remote_tests;
 #[cfg(test)]
 mod tests;
 use anyhow::{Context as _, Result};
@@ -64,6 +67,7 @@ struct Controller {
     runtime: Option<OwnedRuntime>,
     ready: bool,
     live: bool,
+    remote: bool,
     message: u64,
     correlations: HashMap<CommandCorrelation, AttemptId>,
     config: gitterm_core::chat::types::AgentBackendConfig,
@@ -98,6 +102,7 @@ impl Controller {
             runtime: None,
             ready: false,
             live: false,
+            remote: false,
             message: 0,
             correlations: HashMap::new(),
             config: resume::default_config(),
@@ -131,13 +136,15 @@ impl Controller {
             ChatIntent::Answer { answer, .. } => answer.as_ref(),
             intent => intent,
         };
-        if matches!(
-            answer,
-            ChatIntent::Permission {
-                decision: gitterm_gpui_chat::PermissionDecision::AllowAlways { .. },
-                ..
-            }
-        ) {
+        if !self.remote
+            && matches!(
+                answer,
+                ChatIntent::Permission {
+                    decision: gitterm_gpui_chat::PermissionDecision::AllowAlways { .. },
+                    ..
+                }
+            )
+        {
             return (
                 Receipt::rejected("Allow and remember · not saved in preview"),
                 Update::default(),
@@ -161,14 +168,24 @@ impl Controller {
             Err(receipt) => return (receipt, Update::default()),
         };
         let correlation = CommandCorrelation(self.message);
-        self.correlations.insert(correlation, prepared.id());
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|r| r.supports_correlation())
+        {
+            self.correlations.insert(correlation, prepared.id());
+        }
         let runtime = self.runtime.as_ref();
+        let remote = self.remote;
         let result = self
             .adapter
             .execute(prepared, &self.target, now_ms(), |command| {
-                runtime
-                    .ok_or_else(|| "No preview runtime".to_string())?
-                    .send_correlated(command, correlation)
+                let runtime = runtime.ok_or_else(|| "No preview runtime".to_string())?;
+                if remote {
+                    runtime.send(command)
+                } else {
+                    runtime.send_correlated(command, correlation)
+                }
             });
         if !matches!(
             result.0.state,
@@ -353,6 +370,7 @@ pub(crate) struct ChatPane {
     controller: Controller,
     pub(crate) notification_attention: crate::notifications::ChatAttention,
     deferred_live: Option<DeferredLive>,
+    remote: Option<remote::Binding>,
     guidelines_status: Option<std::sync::mpsc::Receiver<bool>>,
     live_claim: Option<Arc<provider::ConversationClaim>>,
     live_tab: Option<resume::LiveTab>,
@@ -480,6 +498,7 @@ impl ChatPane {
         let mut pane = Self {
             controller,
             deferred_live,
+            remote: None,
             notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
@@ -497,7 +516,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
-            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
+            _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
@@ -638,7 +657,9 @@ impl ChatPane {
                 let error = format!("Claude unavailable: {error:#}");
                 let view = self.view.clone();
                 let status = error.clone();
-                let missing_cwd = self.saved.session_id.is_some() && !self.saved.cwd.is_dir();
+                let missing_cwd = self.remote.is_none()
+                    && self.saved.session_id.is_some()
+                    && !self.saved.cwd.is_dir();
                 if missing_cwd {
                     self.resume_error = Some(error.clone());
                     cx.notify();
@@ -664,6 +685,9 @@ impl ChatPane {
         receipt
     }
     fn launch_live(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        if self.remote.is_some() {
+            return self.launch_remote(None, cx);
+        }
         let launch = self
             .deferred_live
             .as_ref()
@@ -786,6 +810,7 @@ impl ChatPane {
         Self {
             controller,
             deferred_live: None,
+            remote: None,
             notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
@@ -803,7 +828,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
-            _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
+            _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
@@ -842,6 +867,9 @@ impl ChatPane {
     /// main thread, for the cards' "branch has moved" banner. Read-only git;
     /// nothing runs without cards. A failed read is logged, as Iced does.
     fn refresh_checkout_head(&mut self, cx: &mut Context<Self>) {
+        if self.remote.is_some() {
+            return;
+        }
         if self.cards.is_empty() {
             return;
         }
@@ -869,6 +897,12 @@ impl ChatPane {
         &self.held
     }
 
+    pub(crate) fn config(&self) -> &gitterm_core::chat::types::AgentBackendConfig {
+        &self.controller.config
+    }
+    pub(crate) fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
     pub(crate) fn cwd(&self) -> &std::path::Path {
         &self.saved.cwd
     }
@@ -902,8 +936,14 @@ impl ChatPane {
         self.controller.target.task_session_id = Some(task_session_id.into());
     }
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.stop_restoring_remote() {
+            eprintln!("Stop restoring remote chat: {error:#}");
+            self.show_notice(format!("Stop restoring remote chat: {error:#}"), cx);
+            return;
+        }
         self.deferred_live = None;
         self._history_load = None;
+        self.history_loading = false;
         self.live_claim = None;
         self.controller.ready = false;
         self.shutdown_runtime(cx);
@@ -912,17 +952,39 @@ impl ChatPane {
         });
         cx.notify();
     }
+    pub(crate) fn quit_runtime(&mut self, cx: &gpui::App) {
+        self._history_load = None;
+        self.history_loading = false;
+        self.deferred_live = None;
+        self.detach_remote_runtime();
+        self.shutdown_runtime(cx);
+    }
+    fn detach_remote_runtime(&mut self) {
+        if self.controller.remote
+            && let Some(runtime) = self.controller.runtime.as_mut()
+        {
+            runtime.request_shutdown(); // Closing this port makes the queued Shutdown a no-op.
+        }
+    }
     pub(crate) fn shutdown_runtime(&mut self, cx: &gpui::App) {
         crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
         self.enqueue_shutdown();
     }
     fn enqueue_shutdown(&mut self) {
         self.controller.ready = false;
-        if let Some(runtime) = self.controller.runtime.take()
-            && let Err(runtime) = self.shutdown.enqueue(runtime)
-        {
-            self.controller.runtime = Some(runtime);
-            eprintln!("Close preview Claude: shutdown queue stopped; retaining runtime ownership");
+        if let Some(mut runtime) = self.controller.runtime.take() {
+            if self.controller.remote {
+                // Iced sends Stop then drops the handle. Closing the port lets
+                // core bound delivery on a lost connection instead of reaping forever.
+                let _ = runtime.send(gitterm_core::chat::types::HarnessCommand::Shutdown);
+                runtime.request_shutdown();
+            }
+            if let Err(runtime) = self.shutdown.enqueue(runtime) {
+                self.controller.runtime = Some(runtime);
+                eprintln!(
+                    "Close preview Claude: shutdown queue stopped; retaining runtime ownership"
+                );
+            }
         }
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
@@ -989,6 +1051,13 @@ impl ChatPane {
         {
             return;
         }
+        let history_gap = matches!(
+            &event,
+            RuntimeEvent::Harness(HarnessEvent::RemoteReconnected {
+                history_gap: true,
+                ..
+            })
+        );
         let exited = matches!(
             &event,
             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
@@ -1092,13 +1161,16 @@ impl ChatPane {
                 view.set_status_error(format!("Save Claude settings: {error:#}"), cx)
             });
         }
+        if history_gap {
+            self.reload_remote_history(false, cx);
+        }
         if turn_ended {
             self.refresh_checkout_head(cx);
             cx.emit(TurnEnded(rate_limit));
         }
         if exited {
             self.shutdown_runtime(cx);
-            if self.awaiting_resume {
+            if self.awaiting_resume && self.remote.is_none() {
                 self.resume_failed(
                     "Cannot resume saved Claude session: process exited before the turn started"
                         .into(),
@@ -1111,8 +1183,9 @@ impl ChatPane {
             } else {
                 "Claude preview stopped"
             };
-            self.view
-                .update(cx, |view, cx| view.set_read_only(Some(stopped.into()), cx));
+            self.view.update(cx, |view, cx| {
+                view.set_read_only(self.remote.is_none().then(|| stopped.into()), cx)
+            });
         }
     }
     #[cfg(test)]
@@ -1132,6 +1205,13 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) {
         self.controller.runtime = Some(runtime);
+        if self.controller.remote {
+            self.controller.source = self
+                .controller
+                .adapter
+                .begin_runtime(self.controller.target.clone());
+            self.controller.correlations.clear();
+        }
         let source = self.controller.source.clone();
         self.awaiting_resume = self.controller.live && self.saved.session_id.is_some();
         cx.spawn(async move |pane, cx| {
@@ -1234,6 +1314,9 @@ mod history_projection_tests {
 }
 impl Drop for ChatPane {
     fn drop(&mut self) {
+        // GPUI releases the last window's panes before its deferred quit callback.
+        // Only explicit close/Stop/Done sends a remote Shutdown.
+        self.detach_remote_runtime();
         self.enqueue_shutdown();
     }
 }
@@ -1280,6 +1363,7 @@ pub(crate) struct RuntimeShutdown {
 }
 enum ShutdownCommand {
     Session(OwnedRuntime),
+    StopRemote(Box<remote::PendingStop>),
     Persist(
         Box<resume::LiveTab>,
         gitterm_core::desktop_store::DesktopStore,
@@ -1299,6 +1383,13 @@ impl RuntimeShutdown {
                 let mut errors = Vec::new();
                 while let Ok(command) = receiver.recv() {
                     match command {
+                        ShutdownCommand::StopRemote(stop) => {
+                            if let Err(error) = stop.run(&executor) {
+                                let error = format!("Stop restoring remote chat: {error:#}");
+                                eprintln!("{error}");
+                                errors.push(error);
+                            }
+                        }
                         ShutdownCommand::Session(mut session) => {
                             if let Err(error) = executor.block_on(session.completed()) {
                                 eprintln!("Reap preview Claude: {error}");
@@ -1337,7 +1428,9 @@ impl RuntimeShutdown {
             .send(ShutdownCommand::Session(session))
             .map_err(|error| match error.0 {
                 ShutdownCommand::Session(session) => session,
-                ShutdownCommand::Drain(_) | ShutdownCommand::Persist(..) => unreachable!(),
+                ShutdownCommand::Drain(_)
+                | ShutdownCommand::Persist(..)
+                | ShutdownCommand::StopRemote(_) => unreachable!(),
             })
     }
     pub(crate) fn drain(&self) -> Result<()> {
@@ -1366,6 +1459,14 @@ impl Render for ChatPane {
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
         });
+        if let Some(remote) = &self.remote {
+            self.view.update(cx, |view, _| {
+                view.set_remote_checkout(
+                    remote.agent.name.clone(),
+                    self.saved.cwd.display().to_string(),
+                )
+            });
+        }
         for update in std::mem::take(&mut self.pending) {
             self.view.update(cx, |view, cx| {
                 view.present(
