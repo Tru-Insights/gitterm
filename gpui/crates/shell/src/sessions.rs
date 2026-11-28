@@ -889,7 +889,13 @@ impl crate::Shell {
                 continue;
             }
             conversations.extend(saved.chats.iter().cloned());
-            for (session, tab) in crate::data::iced_sessions(saved).iter().zip(&saved.tabs) {
+            for (session, tab) in self
+                .owner
+                .read(cx)
+                .iced_sessions(saved)
+                .iter()
+                .zip(&saved.tabs)
+            {
                 if tab.tab_kind.as_deref() != Some("agent") {
                     continue;
                 }
@@ -1486,7 +1492,10 @@ impl crate::Shell {
             .find(|tab| tab.chat_session_id.as_deref() == Some(id))
             .cloned()
         {
-            let existing = crate::data::iced_sessions(&saved)
+            let existing = self
+                .owner
+                .read(cx)
+                .iced_sessions(&saved)
                 .iter()
                 .zip(&saved.tabs)
                 .find(|(_, tab)| tab.chat_session_id.as_deref() == Some(id))
@@ -1780,7 +1789,7 @@ impl crate::Shell {
         let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
             return;
         };
-        let imported = crate::data::iced_sessions(&saved);
+        let imported = self.owner.read(cx).iced_sessions(&saved);
         let bottom = crate::bottom_pane_ids(self.workspace(workspace), cx);
         let active = self.workspace(workspace).active_session;
         let sessions = self.workspace(workspace).sessions.clone();
@@ -1958,7 +1967,7 @@ impl crate::Shell {
         let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id) else {
             return vec![];
         };
-        let imported = crate::data::iced_sessions(saved);
+        let imported = self.owner.read(cx).iced_sessions(saved);
         let bottom = crate::bottom_pane_ids(state, cx);
         state
             .sessions

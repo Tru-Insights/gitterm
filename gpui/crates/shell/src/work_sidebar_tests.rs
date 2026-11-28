@@ -3728,7 +3728,7 @@ fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
     let store = gitterm_core::desktop_store::DesktopStore::open(root.path()).unwrap();
-    cx.update(|cx| cx.set_global(LiveRepoStore(store)));
+    cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(store)));
     let mut fixture = fixture(false);
     fixture.open.insert(Fold::Repo("/repos/tools".into()));
     let (sidebar, cx) = cx.add_window_view(|_, _| fixture);

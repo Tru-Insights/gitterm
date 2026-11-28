@@ -254,7 +254,7 @@ impl WorkspaceSettingsSheet {
                 let draft = input.read(cx).value().to_string();
                 this.rename = None;
                 if cx
-                    .try_global::<crate::work_sidebar::LiveRepoStore>()
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
                     .is_some()
                 {
                     cx.emit(Outcome::Rename(draft));

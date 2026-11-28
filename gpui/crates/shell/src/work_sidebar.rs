@@ -492,6 +492,11 @@ impl WorkSidebar {
         let config = source.config.clone();
         let tasks = crate::data::TaskSource::resolve(&source.config, cx);
         let previous = self.previous_data.clone();
+        let join_target = gitterm_core::workspace_config::WorkspaceTarget::of(&saved);
+        let desktop = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned();
+        let owner = source.owner.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
             let plans = gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(
@@ -512,7 +517,59 @@ impl WorkSidebar {
             _ = sender.send((result, plans, accounts));
         });
         cx.spawn(async move |view, cx| {
-            while let Some((result, plans, accounts)) = receiver.recv().await {
+            while let Some((mut result, plans, accounts)) = receiver.recv().await {
+                if let (Some(desktop), Ok(data)) = (&desktop, &result)
+                    && !data.facts.auto_added.is_empty()
+                {
+                    let desktop = desktop.clone();
+                    let root = desktop.0.root().to_path_buf();
+                    let target = join_target.clone();
+                    let dirs = data.facts.auto_added.clone();
+                    let saved = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::workspace_config::persist_auto_repo_joins(
+                                &desktop.0, target, dirs,
+                            )
+                        })
+                        .await;
+                    match saved {
+                        Ok(file) => {
+                            if let Ok(data) = &mut result
+                                && let Ok(index) = join_target.index(&file)
+                            {
+                                let saved = &file.workspaces[index];
+                                data.facts.repos.retain(|repo| {
+                                    saved.repos.iter().any(|dir| {
+                                        gitterm_core::workspace_config::RepoKey::local(
+                                            std::path::Path::new(dir),
+                                        ) == gitterm_core::workspace_config::RepoKey::local(
+                                            &repo.dir,
+                                        )
+                                    })
+                                });
+                                for repo in &mut data.facts.repos {
+                                    repo.run_command = file
+                                        .repos
+                                        .iter()
+                                        .find(|saved| {
+                                            saved.key()
+                                                == gitterm_core::workspace_config::RepoKey::local(
+                                                    &repo.dir,
+                                                )
+                                        })
+                                        .and_then(|saved| saved.run_command.clone());
+                                }
+                            }
+                            let _ = owner.update(cx, |owner, cx| {
+                                owner.apply_desktop_document(&root, file, cx)
+                            });
+                        }
+                        Err(error) => {
+                            result = Err(anyhow::anyhow!("Save discovered repos: {error}"));
+                        }
+                    }
+                }
                 let updated = view.update(cx, |this, cx| {
                     if this.focus != requested_focus
                         || this.catalog_generation != catalog_generation
@@ -615,7 +672,11 @@ impl WorkSidebar {
     }
 
     fn emit(&mut self, outcome: WorkSidebarOutcome, cx: &mut Context<Self>) {
-        let error = (if cx.try_global::<LiveRepoStore>().is_some() && outcome.is_repo_edit() {
+        let error = (if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+            && outcome.is_repo_edit()
+        {
             None
         } else {
             outcome.preview_error()
@@ -1950,7 +2011,9 @@ impl WorkSidebar {
                     }
                     _ => false,
                 };
-                let live = cx.try_global::<LiveRepoStore>().is_some()
+                let live = cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some()
                     && match &control.action {
                         Action::Rename | Action::Edit(_) | Action::DismissAuto => true,
                         Action::Emit(outcome) => outcome.is_repo_edit(),
@@ -2543,11 +2606,6 @@ pub(crate) mod tests;
 #[path = "work_sidebar_login_tests.rs"]
 mod work_sidebar_login_tests;
 
-/// Present only after Live admission; Preview never has a write handle.
-#[derive(Clone)]
-pub(crate) struct LiveRepoStore(pub gitterm_core::desktop_store::DesktopStore);
-impl gpui::Global for LiveRepoStore {}
-
 impl crate::Shell {
     fn repo_error(&self, error: String, cx: &mut Context<Self>) {
         self.owner.update(cx, |owner, cx| {
@@ -2563,7 +2621,10 @@ impl crate::Shell {
         cx: &mut Context<Self>,
     ) {
         use gitterm_core::workspace_config::RepoEdit;
-        if cx.try_global::<LiveRepoStore>().is_none() {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_none()
+        {
             return;
         }
         let workspace = match outcome {
@@ -2612,38 +2673,59 @@ impl crate::Shell {
         edit: gitterm_core::workspace_config::RepoEdit,
         cx: &mut Context<Self>,
     ) {
-        let Some(store) = cx.try_global::<LiveRepoStore>().cloned() else {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned()
+        else {
             return;
         };
-        let root = store.0.root().to_path_buf();
-        let receipt = store
-            .0
-            .try_edit_workspaces(move |file| file.edit_repo(&target, edit));
-        let work = cx.background_executor().spawn(async move {
-            match receipt.wait() {
-                Ok(file) => (Some(file), None),
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        let alias = if let gitterm_core::workspace_config::RepoEdit::Rename(draft) = &edit {
+            match self.owner.read(cx).prepare_rename_alias(&target, draft) {
+                Ok(alias) => alias,
                 Err(error) => {
-                    // Like Iced's runtime, keep a failed save's dirty edit visible
-                    // and addressable. The owner retains it for a retry.
-                    let current =
-                        store.0.snapshot().wait().ok().and_then(|snapshot| {
-                            match snapshot.workspaces.loaded {
-                                gitterm_core::desktop_store::LoadState::Valid(file) => Some(file),
-                                _ => None,
-                            }
-                        });
-                    (current, Some(error))
+                    self.repo_error(format!("Save workspace identity: {error:#}"), cx);
+                    return;
                 }
             }
+        } else {
+            None
+        };
+        self.owner.update(cx, |owner, cx| {
+            owner.workspace_save_pending = true;
+            cx.notify();
+        });
+        let root = store.0.root().to_path_buf();
+        let work = cx.background_executor().spawn(async move {
+            let aliases = if let Some((aliases, receipt)) = alias {
+                if let Err(error) = crate::preview::finish(Ok(receipt)).await {
+                    return (Err(format!("Save workspace identity: {error:#}")), None);
+                }
+                Some(aliases)
+            } else {
+                None
+            };
+            let result = store
+                .0
+                .try_edit_workspaces(move |file| file.edit_repo(&target, edit))
+                .wait();
+            (result, aliases)
         });
         cx.spawn(async move |shell, cx| {
-            let (file, error) = work.await;
+            let (result, aliases) = work.await;
             _ = shell.update(cx, |shell, cx| {
-                if let Some(file) = file {
-                    shell.repo_document_saved(&root, file, cx);
-                }
-                if let Some(error) = error {
-                    shell.repo_error(error, cx);
+                shell.owner.update(cx, |owner, cx| {
+                    owner.workspace_save_pending = false;
+                    if let Some(aliases) = aliases {
+                        owner.install_aliases(aliases);
+                    }
+                    cx.notify();
+                });
+                match result {
+                    Ok(file) => shell.repo_document_saved(&root, file, cx),
+                    Err(error) => shell.repo_error(error, cx),
                 }
             });
         })

@@ -145,35 +145,14 @@ impl DesktopStore {
         })
     }
 
-    /// Validate a candidate before replacing the document. A refusal leaves the
-    /// owner's state and bytes intact; IO failures retain the dirty candidate.
+    /// Repo actions publish only after the atomic replacement is acknowledged.
     pub fn try_edit_workspaces(
         &self,
         edit: impl FnOnce(&mut WorkspacesFile) -> Result<(), String> + Send + 'static,
     ) -> Receipt<WorkspacesFile> {
-        self.submit(move |state, root| {
-            let mut candidate = match &state.workspaces.loaded {
-                LoadState::Valid(file) => file.clone(),
-                LoadState::Missing => WorkspacesFile::default(),
-                LoadState::Refused(error) => return Err(error.clone()),
-            };
-            edit(&mut candidate)?;
-            let unchanged = match &state.workspaces.loaded {
-                LoadState::Valid(previous) => serde_json::to_value(previous)
-                    .and_then(|previous| {
-                        serde_json::to_value(&candidate).map(|next| previous == next)
-                    })
-                    .map_err(|error| format!("compare workspace edit: {error}"))?,
-                _ => false,
-            };
-            if unchanged {
-                save(&mut state.workspaces, &root.join("workspaces.json"))?;
-                return Ok(candidate);
-            }
-            state.workspaces.loaded = LoadState::Valid(candidate.clone());
-            state.workspaces.dirty = true;
-            save(&mut state.workspaces, &root.join("workspaces.json"))?;
-            Ok(candidate)
+        self.transact_workspaces(move |file| {
+            edit(file)?;
+            Ok(file.clone())
         })
     }
 
@@ -190,6 +169,18 @@ impl DesktopStore {
                 LoadState::Refused(error) => return Err(error.clone()),
             };
             let result = edit(&mut candidate)?;
+            let unchanged = match &state.workspaces.loaded {
+                LoadState::Valid(previous) => serde_json::to_value(previous)
+                    .and_then(|previous| {
+                        serde_json::to_value(&candidate).map(|next| previous == next)
+                    })
+                    .map_err(|error| format!("compare workspace edit: {error}"))?,
+                _ => false,
+            };
+            // No-op controls must preserve the original serialized bytes too.
+            if unchanged && !state.workspaces.dirty {
+                return Ok(result);
+            }
             let mut pending = FileState {
                 loaded: LoadState::Valid(candidate),
                 dirty: true,

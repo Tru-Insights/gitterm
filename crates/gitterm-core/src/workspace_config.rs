@@ -722,6 +722,39 @@ impl<C> WorkspacesFile<C> {
         Ok(())
     }
 
+    /// Chat facts join repos automatically; unlike an explicit Add these do
+    /// not become manual pins and never override a manual removal.
+    pub fn join_discovered_repos(
+        &mut self,
+        target: &WorkspaceTarget,
+        dirs: Vec<PathBuf>,
+    ) -> Result<(), String> {
+        let index = target.index(self)?;
+        let manual = self.workspaces[index].repos_added.clone();
+        for dir in dirs {
+            let key = RepoKey::local(&dir);
+            let workspace = &self.workspaces[index];
+            if workspace
+                .repos_removed
+                .iter()
+                .chain(&workspace.repos)
+                .any(|known| RepoKey::local(Path::new(known)) == key)
+            {
+                continue;
+            }
+            let detected_command = detect_run_command(&dir);
+            self.edit_repo(
+                target,
+                RepoEdit::Add {
+                    dir,
+                    detected_command,
+                },
+            )?;
+            self.workspaces[index].repos_added = manual.clone();
+        }
+        Ok(())
+    }
+
     /// Iced OpenWorktree focuses an existing tab by repo OR current directory.
     pub fn open_worktree_tab(
         &mut self,
@@ -742,6 +775,7 @@ impl<C> WorkspacesFile<C> {
             })
             .unwrap_or_else(|| {
                 ws.tabs.push(WorkspaceTabConfig {
+                    extra: Default::default(),
                     dir: path.to_string_lossy().into_owned(),
                     repo_dir: Some(path.to_string_lossy().into_owned()),
                     startup_command: None,

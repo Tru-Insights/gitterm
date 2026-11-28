@@ -1141,11 +1141,13 @@ impl Shell {
         // A Live action may have just added this tab to the V6 document.
         // Use its imported identity so the local layout cannot restore it twice.
         let imported = cx
-            .try_global::<work_sidebar::LiveRepoStore>()
+            .try_global::<workspace_config::LiveWorkspaces>()
             .and_then(|_| {
                 let owner = self.owner.read(cx);
                 let saved = owner.iced_workspace(state.workspace.id)?;
-                data::iced_sessions(saved)
+                self.owner
+                    .read(cx)
+                    .iced_sessions(saved)
                     .into_iter()
                     .zip(&saved.tabs)
                     .find(|(session, tab)| {
@@ -2306,7 +2308,9 @@ impl Shell {
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
                 .map(|s| {
                     let tab = saved.and_then(|saved| {
-                        data::iced_sessions(saved)
+                        self.owner
+                            .read(cx)
+                            .iced_sessions(saved)
                             .iter()
                             .position(|session| session.id == s.id)
                             .and_then(|index| saved.tabs.get(index))
@@ -5104,7 +5108,12 @@ impl Shell {
             .iter()
             .find(|w| w.sessions.iter().any(|s| s.id == id))?;
         let saved = self.owner.read(cx).iced_workspace(state.workspace.id)?;
-        let index = data::iced_sessions(saved).iter().position(|s| s.id == id)?;
+        let index = self
+            .owner
+            .read(cx)
+            .iced_sessions(saved)
+            .iter()
+            .position(|s| s.id == id)?;
         saved.tabs.get(index)
     }
 

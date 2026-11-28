@@ -1003,6 +1003,53 @@ struct WorktreeOperation {
     error: Option<String>,
 }
 
+/// Shared by every Git view. Keep the lease through persistence acknowledgement.
+#[derive(Clone, Default)]
+pub(crate) struct WorktreeOperations(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+);
+pub(crate) struct WorktreeLease {
+    operations: WorktreeOperations,
+    path: PathBuf,
+}
+impl WorktreeOperations {
+    pub(crate) fn begin(&self, path: &std::path::Path) -> Result<WorktreeLease, String> {
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !self.0.lock().unwrap().insert(path.clone()) {
+            return Err("Worktree operation is already running".into());
+        }
+        Ok(WorktreeLease {
+            operations: self.clone(),
+            path,
+        })
+    }
+}
+impl Drop for WorktreeLease {
+    fn drop(&mut self) {
+        self.operations.0.lock().unwrap().remove(&self.path);
+    }
+}
+
+fn recheck_removal_ownership(
+    root: &std::path::Path,
+    repository: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let tasks =
+        gitterm_core::tasks::TaskStore::load(root.join("tasks.json")).map_err(|e| e.to_string())?;
+    let managed = tasks.tasks().iter().find(|task| {
+        task.worktree.path.as_deref().is_some_and(|owned| {
+            gitterm_core::workspace_config::RepoKey::local(owned)
+                == gitterm_core::workspace_config::RepoKey::local(path)
+        })
+    });
+    gitterm_core::task_worktree::check_unmanaged_removal(
+        Some(repository),
+        path,
+        managed.map(|task| task.title.as_str()),
+    )
+}
+
 fn managed_task(path: &std::path::Path, cx: &App) -> Option<gitterm_core::tasks::TaskRecord> {
     cx.try_global::<crate::task_host::GpuiTaskHost>()?
         .0
@@ -1034,7 +1081,7 @@ impl crate::Shell {
             workspace_config::{RepoKey, WorkspaceTarget},
         };
         let Some(desktop) = cx
-            .try_global::<crate::work_sidebar::LiveRepoStore>()
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
             .cloned()
         else {
             self.owner.update(cx, |owner, cx| {
@@ -1092,6 +1139,29 @@ impl crate::Shell {
                 return;
             }
         }
+        let lease = match self.owner.read(cx).worktree_operations.begin(&path) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(error);
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let selected_before = self
+            .owner
+            .read(cx)
+            .iced_sessions(&saved)
+            .iter()
+            .zip(&saved.tabs)
+            .find(|(_, tab)| {
+                RepoKey::local(std::path::Path::new(&tab.dir)) == RepoKey::local(&path)
+                    || tab.repo_dir.as_deref().is_some_and(|dir| {
+                        RepoKey::local(std::path::Path::new(dir)) == RepoKey::local(&path)
+                    })
+            })
+            .map(|(session, _)| session.id);
         let previous = match view.update(cx, |v, cx| v.begin_operation(&path, force, cx)) {
             Ok(previous) => previous,
             Err(error) => {
@@ -1131,6 +1201,7 @@ impl crate::Shell {
                 }
                 GitAction::RemoveWorktree { .. } => {
                     let force = rules::removal_force(force, previous.as_deref())?;
+                    recheck_removal_ownership(store.root(), &repository_for_job, &path_for_job)?;
                     rules::remove_unmanaged_worktree_blocking(
                         &repository_for_job,
                         &path_for_job,
@@ -1142,7 +1213,27 @@ impl crate::Shell {
             }
         });
         cx.spawn_in(window, async move |shell, cx| {
+            let _lease = lease;
             let result = work.await;
+            let result = match result {
+                Ok(WorktreeResult::Adopt(resolution)) => {
+                    let save = shell.update(cx, |shell, cx| {
+                        shell.adopt_worktree(&resolution, &saved.name, &path, cx)
+                    });
+                    match save {
+                        Ok(Ok(save)) => {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async move { save.wait().await })
+                                .await;
+                            result.map(WorktreeResult::Adopted)
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(error.to_string()),
+                    }
+                }
+                result => result,
+            };
             _ = shell.update_in(cx, |shell, window, cx| {
                 let result = match result {
                     Ok(WorktreeResult::Open(file)) => {
@@ -1153,6 +1244,18 @@ impl crate::Shell {
                                 .map(|tab| tab.session_identity())
                         });
                         shell.repo_document_saved(desktop.0.root(), file, cx);
+                        let selected_imported = shell
+                            .owner
+                            .read(cx)
+                            .iced_workspace(workspace)
+                            .and_then(|saved| {
+                                shell
+                                    .owner
+                                    .read(cx)
+                                    .iced_sessions(saved)
+                                    .get(saved.active_tab?)
+                                    .map(|session| session.id)
+                            });
                         shell.select_workspace_id(workspace, window, cx);
                         let existing = shell
                             .workspaces
@@ -1162,12 +1265,25 @@ impl crate::Shell {
                                 w.sessions
                                     .iter()
                                     .find(|s| {
-                                        w.panes
-                                            .get(&crate::session_pane_id(s.id))
-                                            .and_then(|p| p.read(cx).task_folder(cx))
-                                            .is_some_and(|cwd| {
-                                                RepoKey::local(&cwd) == RepoKey::local(&path)
-                                            })
+                                        Some(s.id) == selected_before
+                                            || Some(s.id) == selected_imported
+                                            || w.panes
+                                                .get(&crate::session_pane_id(s.id))
+                                                .is_some_and(|pane| {
+                                                    pane.read(cx).session.as_ref().is_some_and(
+                                                        |target| {
+                                                            identity.as_ref().and_then(|saved| {
+                                                                saved.session_uid.as_deref()
+                                                            }) == Some(target.session_uid.as_str())
+                                                        },
+                                                    )
+                                                })
+                                            || w.panes
+                                                .get(&crate::session_pane_id(s.id))
+                                                .and_then(|p| p.read(cx).task_folder(cx))
+                                                .is_some_and(|cwd| {
+                                                    RepoKey::local(&cwd) == RepoKey::local(&path)
+                                                })
                                             || w.store.terminals.as_ref().is_some_and(|tabs| {
                                                 tabs.iter().any(|tab| {
                                                     tab.id == s.id.0
@@ -1195,10 +1311,10 @@ impl crate::Shell {
                                 .and_then(|id| state.panes.get(&crate::session_pane_id(id)))
                             {
                                 pane.update(cx, |pane, cx| {
-                                    if let (Some(target), Some(uid)) =
-                                        (&mut pane.session, identity.session_uid)
-                                    {
-                                        target.session_uid = uid;
+                                    if let Some(uid) = identity.session_uid {
+                                        pane.session
+                                            .get_or_insert_with(crate::sessions::fresh_target)
+                                            .session_uid = uid;
                                     }
                                     cx.notify();
                                 });
@@ -1220,9 +1336,11 @@ impl crate::Shell {
                         }
                         Ok(())
                     }
-                    Ok(WorktreeResult::Adopt(resolution)) => {
-                        shell.adopt_worktree(&resolution, &saved.name, &path, cx)
+                    Ok(WorktreeResult::Adopted(file)) => {
+                        shell.repo_document_saved(desktop.0.root(), file, cx);
+                        Ok(())
                     }
+                    Ok(WorktreeResult::Adopt(_)) => unreachable!(),
                     Ok(WorktreeResult::Removed) => Ok(()),
                     Err(error) => Err(error),
                 };
@@ -1239,15 +1357,111 @@ impl crate::Shell {
         name: &str,
         path: &std::path::Path,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<AdoptionSave, String> {
         use gitterm_core::{task_worktree as rules, tasks::*};
         let host = cx
             .try_global::<crate::task_host::GpuiTaskHost>()
             .map(|h| h.0.clone())
             .ok_or("The task store is unavailable")?;
+        let desktop = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned()
+            .ok_or("The workspace store is unavailable")?;
         let task_id = format!("task-{}", &TaskRecord::fresh_id()[..8]);
         let timestamp = chrono::Utc::now().to_rfc3339();
         let mut anchors = Vec::new();
+        for state in &self.workspaces {
+            let saved = self.owner.read(cx).iced_workspace(state.workspace.id);
+            let imported = saved
+                .map(|saved| self.owner.read(cx).iced_sessions(saved))
+                .unwrap_or_default();
+            for session in &state.sessions {
+                let Some(pane) = state.panes.get(&crate::session_pane_id(session.id)) else {
+                    continue;
+                };
+                let document = saved.and_then(|saved| {
+                    let uid = pane
+                        .read(cx)
+                        .session
+                        .as_ref()
+                        .map(|target| target.session_uid.as_str());
+                    uid.and_then(|uid| {
+                        saved
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.session_uid.as_deref() == Some(uid))
+                    })
+                    .or_else(|| imported.iter().position(|s| s.id == session.id))
+                    .and_then(|index| saved.tabs.get(index).map(|tab| (saved, index, tab)))
+                });
+                let cwd = pane.read(cx).task_folder(cx).or_else(|| {
+                    document
+                        .map(|(_, _, tab)| PathBuf::from(tab.repo_dir.as_ref().unwrap_or(&tab.dir)))
+                });
+                let Some(cwd) = cwd.filter(|cwd| cwd.starts_with(path)) else {
+                    continue;
+                };
+                if pane
+                    .read(cx)
+                    .session
+                    .as_ref()
+                    .is_some_and(|target| target.task_id.is_some())
+                    || document.is_some_and(|(_, _, tab)| tab.task_id.is_some())
+                {
+                    continue;
+                }
+                let terminal = state
+                    .store
+                    .terminals
+                    .as_ref()
+                    .and_then(|tabs| tabs.iter().find(|tab| tab.id == session.id.0));
+                if terminal.is_some_and(|tab| tab.task_id.is_some()) {
+                    continue;
+                }
+                let source = if terminal.is_some() {
+                    AnchorSource::Terminal {
+                        workspace: state.workspace.id,
+                        session: session.id,
+                    }
+                } else if let Some((saved, index, tab)) = document {
+                    AnchorSource::Document {
+                        target: Box::new(gitterm_core::workspace_config::WorkspaceTarget::of(
+                            saved,
+                        )),
+                        index,
+                        expected_uid: tab.session_uid.clone(),
+                        cwd: cwd.clone(),
+                    }
+                } else {
+                    return Err(format!(
+                        "No persisted anchor for session {} in {}",
+                        session.id.0,
+                        cwd.display()
+                    ));
+                };
+                let uid = pane
+                    .read(cx)
+                    .session
+                    .as_ref()
+                    .map(|target| target.session_uid.clone())
+                    .or_else(|| document.and_then(|(_, _, tab)| tab.session_uid.clone()))
+                    .unwrap_or_else(TaskRecord::fresh_id);
+                anchors.push(AdoptionAnchor {
+                    source,
+                    pane: pane.clone(),
+                    uid,
+                    session_id: TaskRecord::fresh_id(),
+                    label: if matches!(
+                        pane.read(cx).content,
+                        crate::pane::PaneContent::PreviewChat(_)
+                    ) {
+                        "Agent"
+                    } else {
+                        "Terminal"
+                    },
+                });
+            }
+        }
         host.update(cx, |host, cx| {
             let store = host
                 .host_mut()
@@ -1271,36 +1485,13 @@ impl crate::Shell {
                 &timestamp,
             )
             .map_err(|e| e.to_string())?;
-            // Existing sessions keep their backend; adoption only gives them ownership.
-            for pane in self.workspaces.iter().flat_map(|w| w.panes.values()) {
-                let inside = pane
-                    .read(cx)
-                    .task_folder(cx)
-                    .is_some_and(|p| p.starts_with(path));
-                if !inside
-                    || pane
-                        .read(cx)
-                        .session
-                        .as_ref()
-                        .is_none_or(|s| s.task_id.is_some())
-                {
-                    continue;
-                }
-                let session_id = TaskRecord::fresh_id();
-                let label = if matches!(
-                    pane.read(cx).content,
-                    crate::pane::PaneContent::PreviewChat(_)
-                ) {
-                    "Agent"
-                } else {
-                    "Terminal"
-                };
+            for anchor in &anchors {
                 store
                     .upsert_session(
                         &task_id,
                         TaskSessionRecord {
-                            task_session_id: session_id.clone(),
-                            label: label.into(),
+                            task_session_id: anchor.session_id.clone(),
+                            label: anchor.label.into(),
                             harness: None,
                             conversation: None,
                             objective_delivery: ObjectiveDeliveryState::NotDelivered,
@@ -1311,75 +1502,154 @@ impl crate::Shell {
                         &timestamp,
                     )
                     .map_err(|e| e.to_string())?;
-                if let Some(cwd) = pane.read(cx).task_folder(cx) {
-                    anchors.push((
-                        cwd,
-                        pane.read(cx).session.as_ref().unwrap().session_uid.clone(),
-                        session_id.clone(),
-                    ));
-                }
-                pane.update(cx, |pane, cx| {
-                    if let Some(session) = &mut pane.session {
-                        session.task_id = Some(task_id.clone());
-                        session.task_session_id = Some(session_id);
-                    }
-                    cx.notify();
-                });
             }
             cx.notify();
             Ok::<(), String>(())
         })?;
-        if !anchors.is_empty() {
-            let desktop = cx.global::<crate::work_sidebar::LiveRepoStore>().clone();
-            let root = desktop.0.root().to_path_buf();
-            let work = cx.background_executor().spawn(async move {
-                desktop
-                    .0
-                    .try_edit_workspaces(move |file| {
-                        for ws in &mut file.workspaces {
-                            for tab in &mut ws.tabs {
-                                if tab.task_id.is_some() {
-                                    continue;
-                                }
-                                let matching = anchors.iter().position(|(cwd, uid, _)| {
-                                    tab.session_uid.as_ref() == Some(uid)
-                                        || (tab.session_uid.is_none()
-                                            && (std::path::Path::new(&tab.dir) == cwd
-                                                || tab.repo_dir.as_deref().is_some_and(|dir| {
-                                                    std::path::Path::new(dir) == cwd
-                                                })))
-                                });
-                                if let Some(index) = matching {
-                                    let (_, uid, session_id) = anchors.remove(index);
-                                    tab.session_uid = Some(uid);
-                                    tab.task_id = Some(task_id.clone());
-                                    tab.task_session_id = Some(session_id);
-                                }
-                            }
-                        }
-                        Ok(())
-                    })
-                    .wait()
-            });
-            cx.spawn(async move |shell, cx| {
-                let result = work.await;
-                _ = shell.update(cx, |shell, cx| match result {
-                    Ok(file) => shell.repo_document_saved(&root, file, cx),
-                    Err(error) => shell.owner.update(cx, |owner, cx| {
-                        owner.error = Some(error);
-                        cx.notify();
-                    }),
-                });
+        let documents: Vec<_> = anchors
+            .iter()
+            .filter_map(|anchor| match &anchor.source {
+                AnchorSource::Document {
+                    target,
+                    index,
+                    expected_uid,
+                    cwd,
+                } => Some((
+                    target.clone(),
+                    *index,
+                    expected_uid.clone(),
+                    cwd.clone(),
+                    anchor.uid.clone(),
+                    anchor.session_id.clone(),
+                )),
+                _ => None,
             })
-            .detach();
+            .collect();
+        let document_task = task_id.clone();
+        let workspaces = desktop.0.try_edit_workspaces(move |file| {
+            for (target, index, expected_uid, cwd, uid, session_id) in documents {
+                let workspace = target.index(file)?;
+                let tabs = &mut file.workspaces[workspace].tabs;
+                let index = if let Some(expected) = &expected_uid {
+                    tabs.iter()
+                        .position(|tab| tab.session_uid.as_ref() == Some(expected))
+                        .ok_or("Adoption tab no longer exists")?
+                } else {
+                    index
+                };
+                let tab = tabs.get_mut(index).ok_or("Adoption tab no longer exists")?;
+                if tab.session_uid != expected_uid {
+                    return Err("Adoption tab identity changed".into());
+                }
+                if tab.task_id.is_some()
+                    || !(std::path::Path::new(&tab.dir) == cwd
+                        || tab
+                            .repo_dir
+                            .as_deref()
+                            .is_some_and(|dir| std::path::Path::new(dir) == cwd))
+                {
+                    return Err("Adoption tab identity changed".into());
+                }
+                tab.session_uid = Some(uid);
+                tab.task_id = Some(document_task.clone());
+                tab.task_session_id = Some(session_id);
+            }
+            Ok(())
+        });
+        let mut layouts = Vec::new();
+        for state in &mut self.workspaces {
+            let mut changed = false;
+            for anchor in &anchors {
+                if let AnchorSource::Terminal { workspace, session } = anchor.source
+                    && workspace == state.workspace.id
+                {
+                    let terminal = state
+                        .store
+                        .terminals
+                        .as_mut()
+                        .and_then(|tabs| tabs.iter_mut().find(|tab| tab.id == session.0))
+                        .ok_or("Adoption terminal anchor no longer exists")?;
+                    terminal.task_id = Some(task_id.clone());
+                    terminal.task_session_id = Some(anchor.session_id.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                layouts.push(
+                    state
+                        .store
+                        .save_async(&state.dock.read(cx).dump(cx))
+                        .map_err(|e| format!("Save adopted terminal: {e:#}"))?,
+                );
+            }
         }
-        Ok(())
+        for anchor in anchors {
+            anchor.pane.update(cx, |pane, cx| {
+                let target = pane
+                    .session
+                    .get_or_insert_with(crate::sessions::fresh_target);
+                target.session_uid = anchor.uid;
+                target.task_id = Some(task_id.clone());
+                target.task_session_id = Some(anchor.session_id);
+                cx.notify();
+            });
+        }
+        Ok(AdoptionSave {
+            workspaces,
+            layouts,
+        })
+    }
+}
+
+enum AnchorSource {
+    Document {
+        target: Box<gitterm_core::workspace_config::WorkspaceTarget>,
+        index: usize,
+        expected_uid: Option<String>,
+        cwd: PathBuf,
+    },
+    Terminal {
+        workspace: WorkspaceId,
+        session: crate::data::SessionId,
+    },
+}
+struct AdoptionAnchor {
+    source: AnchorSource,
+    pane: Entity<crate::pane::Pane>,
+    uid: String,
+    session_id: String,
+    label: &'static str,
+}
+struct AdoptionSave {
+    workspaces:
+        gitterm_core::desktop_store::Receipt<gitterm_core::workspace_config::WorkspacesFile>,
+    layouts: Vec<crate::preview::SaveResult>,
+}
+impl AdoptionSave {
+    async fn wait(self) -> Result<gitterm_core::workspace_config::WorkspacesFile, String> {
+        // Drain every submitted save, even if another part of the adoption fails.
+        let document = self.workspaces.wait();
+        let mut errors = Vec::new();
+        for layout in self.layouts {
+            if let Err(error) = crate::preview::finish(Ok(layout)).await {
+                errors.push(format!("Save adopted terminal: {error:#}"));
+            }
+        }
+        match document {
+            Ok(file) if errors.is_empty() => Ok(file),
+            Ok(_) => Err(errors.join("; ")),
+            Err(error) => {
+                errors.push(error);
+                Err(errors.join("; "))
+            }
+        }
     }
 }
 
 enum WorktreeResult {
     Open(gitterm_core::workspace_config::WorkspacesFile),
     Adopt(gitterm_core::task_worktree::AdoptedWorktreeResolution),
+    Adopted(gitterm_core::workspace_config::WorkspacesFile),
     Removed,
 }
 
@@ -1433,7 +1703,7 @@ mod action_tests {
         ]);
         let desktop =
             gitterm_core::desktop_store::DesktopStore::open(&root.path().join("iced")).unwrap();
-        cx.update(|_, cx| cx.set_global(crate::work_sidebar::LiveRepoStore(desktop)));
+        cx.update(|_, cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
         let id = cx.read(|cx| shell.read(cx).active_workspace(cx).unwrap());
         for _ in 0..2 {
             cx.update(|window, cx| {
@@ -1501,6 +1771,299 @@ mod action_tests {
             assert_eq!(disk.workspaces[0].tabs.len(), 1);
             assert_eq!(disk.workspaces[0].tabs[0].dir, linked.to_string_lossy());
         });
+    }
+
+    #[test]
+    fn review_regression_f3_shared_canonical_guard_and_background_ownership_recheck() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let path = root.path().join("linked");
+        std::fs::create_dir(&path).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let shared = WorktreeOperations::default();
+        let other_workspace = shared.clone();
+        let adopting = shared.begin(&path).unwrap();
+        assert!(other_workspace.begin(&alias).is_err());
+        drop(adopting);
+        let _removing = other_workspace.begin(&alias).unwrap();
+        recheck_removal_ownership(root.path(), root.path(), &path).unwrap();
+        let mut tasks =
+            gitterm_core::tasks::TaskStore::load(root.path().join("tasks.json")).unwrap();
+        let mut task = crate::tasks::fixture_task("owned", "Placeholder", "task/placeholder");
+        task.worktree.path = Some(path.clone());
+        task.worktree.state = gitterm_core::tasks::TaskWorktreeState::Ready;
+        tasks.insert(task).unwrap();
+        assert!(
+            recheck_removal_ownership(root.path(), root.path(), &path)
+                .unwrap_err()
+                .contains("belongs to task")
+        );
+        assert!(path.is_dir());
+    }
+
+    fn saved_worktree_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let main = root.path().join("main");
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+            vec![
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task/placeholder",
+                linked.to_str().unwrap(),
+            ],
+        ] {
+            let output = gitterm_core::git_status::git_command()
+                .current_dir(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let source = root.path().join("iced");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("workspaces.json"), serde_json::json!({"active_workspace":0,"workspaces":[{
+            "name":"Placeholder", "abbrev":"P", "color":"blue", "dir":main, "repos":[main], "tabs":[
+                {"dir":main, "session_uid":"main-shell"},
+                {"dir":linked, "repo_dir":linked, "session_uid":"linked-shell"}
+            ]
+        }]}).to_string()).unwrap();
+        (root, main, linked)
+    }
+
+    #[gpui::test]
+    fn review_regression_f5_open_after_restart_focuses_imported_worktree_tab(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let (root, _, linked) = saved_worktree_fixture();
+        let source = root.path().join("iced");
+        let desktop = gitterm_core::desktop_store::DesktopStore::open(&source).unwrap();
+        cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
+        let mut store = crate::preview::tests::guarded_store(&root.path().join("preview"));
+        let model = crate::workspace_config::load_iced_workspaces_from(&mut store, &source);
+        let layout = store.guard.as_ref().unwrap().preview().layout();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                &layout,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        });
+        let imported = cx.read(|cx| shell.read(cx).active(cx).sessions[1].id);
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert!(
+                shell.active(cx).panes[&crate::session_pane_id(imported)]
+                    .read(cx)
+                    .task_folder(cx)
+                    .is_none()
+            );
+        });
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.live_worktree_action(
+                        WorkspaceId(1),
+                        &GitAction::OpenWorktree(linked.clone()),
+                        window,
+                        cx,
+                    )
+                })
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                cx.run_until_parked();
+                if cx.read(|cx| shell.read(cx).active(cx).active_session == Some(imported)) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "saved tab did not focus"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(shell.active(cx).sessions.len(), 2);
+            assert!(matches!(
+                shell.active(cx).panes[&crate::session_pane_id(imported)]
+                    .read(cx)
+                    .content,
+                crate::pane::PaneContent::IcedSession(_)
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn review_regression_f6_adoption_persists_document_and_gpui_terminal_anchors(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::task_host::{GpuiTaskHost, HostConfig, Ingress, TaskHostOwner};
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let (root, main, linked) = saved_worktree_fixture();
+        let source = root.path().join("iced");
+        let desktop = gitterm_core::desktop_store::DesktopStore::open(&source).unwrap();
+        cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
+        let mut store = crate::preview::tests::guarded_store(&root.path().join("preview"));
+        let model = crate::workspace_config::load_iced_workspaces_from(&mut store, &source);
+        let roots = store.guard.as_ref().unwrap().preview().clone();
+        let layout = roots.layout();
+        let (sender, receiver) = gitterm_core::task_commands::runtime::command_channel();
+        let host = cx
+            .update(|cx| {
+                TaskHostOwner::start(
+                    HostConfig {
+                        roots,
+                        iced_config: source.clone(),
+                        ingress: Ingress::Channel(sender, receiver),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.update(|cx| cx.set_global(GpuiTaskHost(host.clone())));
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            crate::Shell::with_owner(
+                Rc::new(crate::data::LocalData(owner.clone())),
+                owner,
+                &layout,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        });
+        let resolution = gitterm_core::task_worktree::resolve_worktree_adoption_blocking(
+            &gitterm_core::task_worktree::AdoptWorktreeRequest {
+                repository_path: main,
+                worktree_path: linked.clone(),
+            },
+        )
+        .unwrap();
+        let save = cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                let state = &mut shell.workspaces[0];
+                let imported = state.sessions[1].id;
+                let pane = state
+                    .panes
+                    .remove(&crate::session_pane_id(imported))
+                    .unwrap();
+                let runtime = crate::data::SessionId(888);
+                pane.update(cx, |pane, _| {
+                    let mut target = crate::sessions::fresh_target();
+                    target.session_uid = "linked-shell".into();
+                    pane.session = Some(target);
+                    pane.id = crate::session_pane_id(runtime);
+                });
+                state.sessions[1].id = runtime;
+                state.panes.insert(crate::session_pane_id(runtime), pane);
+                let id = crate::data::SessionId(777);
+                let pane_id = crate::session_pane_id(id);
+                let pane = cx.new(|cx| {
+                    crate::pane::Pane::new(
+                        pane_id.clone(),
+                        "Extra".into(),
+                        crate::pane::PaneKind::StoppedTerminal(linked.clone(), true),
+                        WorkspaceId(1),
+                        shell.data.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                let state = &mut shell.workspaces[0];
+                state.sessions.push(crate::data::Session {
+                    id,
+                    title: "Extra".into(),
+                    kind: crate::data::SessionKind::Terminal,
+                });
+                state.panes.insert(pane_id, pane);
+                // A runtime session without either durable source is refused.
+                assert!(
+                    shell
+                        .adopt_worktree(&resolution, "Placeholder", &linked, cx)
+                        .err()
+                        .unwrap()
+                        .contains("No persisted anchor")
+                );
+                shell.workspaces[0].store.terminals.as_mut().unwrap().push(
+                    crate::layout::TerminalSession {
+                        id: 777,
+                        cwd: linked.clone(),
+                        startup_command: None,
+                        task_id: None,
+                        task_session_id: None,
+                    },
+                );
+                shell
+                    .adopt_worktree(&resolution, "Placeholder", &linked, cx)
+                    .unwrap()
+            })
+        });
+        let file = save.wait().await.unwrap();
+        let document = &file.workspaces[0].tabs[1];
+        let task_id = document.task_id.as_deref().unwrap();
+        let layout_path = cx.read(|cx| shell.read(cx).workspaces[0].store.path.clone());
+        let mut restored = crate::layout::LayoutStore::new(layout_path);
+        let terminal = restored
+            .load_terminals()
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|tab| tab.id == 777)
+            .unwrap();
+        assert_eq!(terminal.task_id.as_deref(), Some(task_id));
+        let task = cx.read(|cx| {
+            host.read(cx)
+                .host()
+                .store()
+                .as_ref()
+                .unwrap()
+                .get(task_id)
+                .unwrap()
+                .clone()
+        });
+        assert!(
+            task.sessions
+                .iter()
+                .any(|session| Some(&session.task_session_id) == terminal.task_session_id.as_ref())
+        );
+        assert!(
+            task.sessions
+                .iter()
+                .any(|session| Some(&session.task_session_id) == document.task_session_id.as_ref())
+        );
     }
 
     #[gpui::test]
