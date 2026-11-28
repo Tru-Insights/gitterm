@@ -382,3 +382,24 @@ fn viewed_pruning_and_errors_keep_the_single_marks_authority() {
         [Effect::OpenFile(_)]
     ));
 }
+
+#[test]
+fn noise_filter_is_presentation_only_and_preserves_the_loaded_generation() {
+    let mut state = State::default();
+    assert!(state.reduce(Intent::SetHideNoise(false)).is_empty());
+    let stamp = open(&mut state, "/tmp/checkout", "page");
+    state.reduce(Intent::CollectFinished {
+        stamp: stamp.clone(),
+        result: Box::new(Ok(load(&stamp))),
+    });
+    assert!(matches!(
+        state.reduce(Intent::SetHideNoise(false)).as_slice(),
+        [Effect::Render]
+    ));
+    let pane = state.pane().unwrap();
+    assert!(!pane.hide_noise);
+    assert_eq!(pane.generation, stamp.generation);
+    assert!(pane.loaded.is_some());
+    assert_eq!(pane.token, "page");
+    assert_eq!(pane.focus.as_deref(), Some("a.rs"));
+}
