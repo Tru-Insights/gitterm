@@ -297,6 +297,72 @@ fn live_delivery_busy_closed_and_restart_preserve_undelivered_results(cx: &mut T
 }
 
 #[gpui::test]
+fn live_delivery_restores_background_parent_without_selecting_it(cx: &mut TestAppContext) {
+    if child("live_delivery_restores_background_parent_without_selecting_it") {
+        return;
+    }
+    let mut d = LiveDelivery::new(cx);
+    d.result("background-restart", cx);
+    // Persist two open chats, with a different chat selected in another workspace.
+    let tab = |uid: &str| crate::chat::resume::tab(&d.git.repo, uid.into(), None);
+    std::fs::write(
+        d.fixture.iced.join("workspaces.json"),
+        serde_json::to_vec(&json!({"active_workspace": 0, "workspaces": [
+            {"name":"Selected", "abbrev":"S", "dir":d.git.repo, "color":"blue",
+             "active_tab":0, "tabs":[tab("selected-caller")]},
+            {"name":"Background", "abbrev":"B", "dir":d.git.repo, "color":"green",
+             "active_tab":0, "tabs":[tab(&d.parent)]}
+        ]})).unwrap(),
+    ).unwrap();
+    d.stop(cx);
+    wait_until(cx, |_| HostLock::acquire(&d.fixture.iced).is_ok());
+    let (restarted, _) = start(&d.fixture, cx);
+    d.owner = restarted;
+    let services = d.owner.read_with(cx, |owner, _| owner.host().services().clone());
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::chat::policy::install_live(services, cx).unwrap();
+        cx.set_global(crate::task_host::GpuiTaskHost(d.owner.clone()));
+    });
+    let mut store = crate::preview::tests::guarded_store(&d.fixture.roots.root().join("shell"));
+    let model = crate::workspace_config::load_iced_workspaces_from(&mut store, &d.fixture.iced);
+    let layout = store.guard.as_ref().unwrap().preview().layout();
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+        crate::Shell::with_owner(
+            Rc::new(crate::data::LocalData(owner.clone())), owner, &layout, true, window, cx,
+        ).unwrap()
+    });
+    let selected = shell.read_with(cx, |shell, cx| {
+        (shell.active_workspace(cx), shell.active(cx).active_session)
+    });
+    let pane = shell.read_with(cx, |shell, cx| {
+        shell.owner.read(cx).chats.get(&d.parent).cloned()
+    }).expect("restored background parent must be registered before any selection");
+    // Exercise the actual chat send path, with only a synthetic provider process.
+    let program = super::delivery_tests::fake_claude(d.fixture.iced.parent().unwrap());
+    pane.update_in(cx, |pane, window, cx| {
+        pane.start_fake_runtime(d.fixture.roots.clone(), &program, window, cx)
+    }).unwrap();
+    d.owner.update(cx, |owner, _| owner.submit_hook = None);
+    wait_until(cx, |cx| pane.read_with(cx, |pane, _| pane.runtime_ready()));
+    for _ in 0..3 {
+        d.tick(cx);
+    }
+    wait_until(cx, |_| d.git.repo.join("prompts.jsonl").exists());
+    assert!(d.record("background-restart", cx).is_delivered());
+    assert_eq!(pane.read_with(cx, |pane, _| pane.user_prompts().len()), 1);
+    assert_eq!(std::fs::read_to_string(d.git.repo.join("prompts.jsonl")).unwrap().lines().count(), 1);
+    assert_eq!(shell.read_with(cx, |shell, cx| {
+        (shell.active_workspace(cx), shell.active(cx).active_session)
+    }), selected);
+    assert!(TaskStore::load(d.fixture.source()).unwrap()
+        .delegation("background-restart").unwrap().is_delivered());
+    pane.update(cx, |pane, cx| pane.close(cx));
+    d.stop(cx);
+}
+
+#[gpui::test]
 fn live_card_manual_send_waits_when_auto_tell_is_off(cx: &mut TestAppContext) {
     if child("live_card_manual_send_waits_when_auto_tell_is_off") {
         return;
