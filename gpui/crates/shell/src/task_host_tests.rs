@@ -3109,6 +3109,8 @@ mod live_writes {
         fixture: &Fixture,
         cx: &mut TestAppContext,
     ) -> (Entity<TaskHostOwner>, TaskControlSender) {
+        // The shared terminal adapter reads the application's component theme.
+        cx.update(gpui_component::init);
         let (config, sender) = fixture.config();
         let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
         let services = Arc::new(
@@ -3615,10 +3617,10 @@ mod live_writes {
     }
 
     #[gpui::test]
-    fn only_task_writes_open(cx: &mut TestAppContext) {
+    fn live_writes_keep_caller_and_runner_guards(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
-        use gitterm_core::preview::service::{RunnerEffect, preview_notice};
-        if child("only_task_writes_open") {
+        use gitterm_core::preview::service::RunnerEffect;
+        if child("live_writes_keep_caller_and_runner_guards") {
             return;
         }
         cx.background_executor.allow_parking();
@@ -3633,8 +3635,9 @@ mod live_writes {
                 &sender,
                 TaskControlOperation::MergePlanSet(req(json!({"entries": []})))
             ),
-            Err(preview_notice("merge_plan_set"))
+            Err("merge_plan_set: no GitTerm tab on this Mac has session caller; merge plans are for this Mac's chats".into())
         );
+        assert!(!gitterm_core::merge_plan::plans_dir(&fixture.iced).exists());
         owner.read_with(cx, |owner, _| {
             for effect in [RunnerEffect::RestoreSession, RunnerEffect::NotifyIngress] {
                 assert!(owner.host().services().runner(effect, None).is_err());
@@ -3683,6 +3686,7 @@ mod live_writes {
     include!("task_host_live_delivery_tests.rs");
     include!("task_host_live_terminal_tests.rs");
     include!("sidebar_resume_tests.rs");
+    include!("task_panel_live_tests.rs");
     include!("remote_terminal_tests.rs");
 }
 

@@ -163,7 +163,6 @@ fn golive19_live_ssh_routes_deduplicate_and_restore_saved_bytes(cx: &mut TestApp
     shell.update_in(vcx, |shell, window, cx| {
         shell.close_target(&closed, window, cx)
     });
-    // Live commits Iced's tab removal before discarding the runtime pane.
     wait_until(vcx, |cx| {
         !shell.read_with(cx, |shell, cx| shell.owner.read(cx).workspace_save_pending)
     });

@@ -124,6 +124,7 @@ fn inputs(open: &[&str]) -> Inputs {
         titles: Default::default(),
         presets: vec![],
         open_chats: vec![],
+        conversations: vec![],
     }
 }
 

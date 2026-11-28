@@ -75,6 +75,15 @@ impl GitView {
     }
     fn root(&self, cx: &App) -> Option<PathBuf> {
         if let Some(owner) = self.data.local_owner() {
+            if let Some(local) = owner
+                .read(cx)
+                .model
+                .workspaces
+                .iter()
+                .find(|w| w.id == self.workspace)
+            {
+                return Some(local.root.clone());
+            }
             if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
                 return Some(saved.dir.clone().into());
             }
@@ -88,6 +97,15 @@ impl GitView {
         }
         self.data.terminal_cwd(self.workspace, cx)
     }
+    pub(crate) fn show_changes(&mut self, cx: &mut Context<Self>) {
+        self.set_mode(Mode::Changes, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changes_selected(&self) -> bool {
+        self.mode == Mode::Changes
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;

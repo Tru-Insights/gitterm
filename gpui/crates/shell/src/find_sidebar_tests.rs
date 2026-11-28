@@ -2185,7 +2185,11 @@ fn find_sidebar_resume_recorded_acp_without_claude_index(cx: &mut TestAppContext
         .unwrap();
         shell.update(cx, |shell, cx| {
             // Keep the recorded DTO while simulating a tab that is not mounted.
-            let state = shell.workspace_mut(crate::WorkspaceId(2));
+            let state = shell
+                .workspaces
+                .iter_mut()
+                .find(|state| state.workspace.id == crate::WorkspaceId(2))
+                .unwrap();
             let session = state.sessions.remove(1);
             state.panes.remove(&crate::session_pane_id(session.id));
             let owner = shell.find_owner(cx);

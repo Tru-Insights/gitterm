@@ -1075,6 +1075,7 @@ impl Shell {
         if let Some(task) = &self.selected_task {
             self.task_last_session.insert(task.clone(), id);
         }
+        self.sync_task_git_changes(cx);
         self.show_pane(&session_pane_id(id), window, cx);
         self.load_active_iced_history(window, cx);
     }
