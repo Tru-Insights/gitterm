@@ -1289,13 +1289,14 @@ impl Shell {
         launched: &task_host::TerminalLaunched,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
-            return;
+    ) -> Option<Entity<Pane>> {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| state.on_bar())
+        {
+            return None;
         }
-        let Some(view) = host.update(cx, |host, _| host.take_terminal(&launched.session_id)) else {
-            return;
-        };
+        let view = host.update(cx, |host, _| host.take_terminal(&launched.session_id))?;
         let target = launched.target.clone();
         self.new_terminal_launch(
             DockPlacement::Center,
@@ -1308,20 +1309,19 @@ impl Shell {
             window,
             cx,
         );
-        if let Some(id) = self
+        let pane = self
             .active(cx)
-            .sessions
-            .last()
-            .map(|session| session_pane_id(session.id))
-        {
-            let title = launched.title.clone();
-            self.active(cx).panes[&id].update(cx, |pane, cx| {
-                pane.startup_command = launched.startup_command.clone();
-                pane.chat_session_id = launched.chat_session_id.clone();
-                pane.title = title;
-                cx.notify();
-            });
-        }
+            .panes
+            .values()
+            .find(|pane| pane.read(cx).session.as_ref() == Some(&launched.target))?
+            .clone();
+        pane.update(cx, |pane, cx| {
+            pane.startup_command = launched.startup_command.clone();
+            pane.chat_session_id = launched.chat_session_id.clone();
+            pane.title = launched.title.clone();
+            cx.notify();
+        });
+        Some(pane)
     }
     /// The pane holding an adopted task terminal whose child exited shows
     /// it exited, as a pane's own terminal does.
@@ -1773,19 +1773,25 @@ fn build_workspace(
         // fixture restore, and ordinary bottom shells start without a caller.
         let restored = match (&saved, &host) {
             (Some(saved), Some(host)) if !stopped && !(host.read(cx).is_live() && saved.bottom) => {
-                host.update(cx, |host, cx| {
+                Some(host.update(cx, |host, cx| {
                     host.restore_terminal(&workspace.name, saved, cx)
-                })
+                }))
             }
             _ => None,
         };
+        let restore_error = host
+            .as_ref()
+            .filter(|h| h.read(cx).is_live())
+            .and_then(|_| restored.as_ref()?.as_ref().err())
+            .cloned();
+        let restored = restored.and_then(Result::ok);
         let kind = if let Some(text) = imported {
             PaneKind::IcedSession(text)
         } else if let Some(restored) = &restored {
             // Its placeholder until the host's terminal is adopted below.
             PaneKind::StoppedTerminal(restored.cwd.clone(), true)
         } else if let Some(saved) = &saved {
-            if stopped {
+            if stopped || restore_error.is_some() {
                 PaneKind::StoppedTerminal(saved.cwd.clone(), true)
             } else if saved.bottom && host.as_ref().is_some_and(|h| h.read(cx).is_live()) {
                 PaneKind::BottomTerminal(saved.cwd.clone())
@@ -1806,6 +1812,28 @@ fn build_workspace(
                 cx,
             )
         });
+        if let Some(saved) = &saved
+            && restore_error.is_some()
+        {
+            pane.update(cx, |pane, _| {
+                pane.session = Some(gitterm_core::session::Target {
+                    session_uid: saved
+                        .session_uid
+                        .clone()
+                        .or_else(|| saved.task_session_id.clone())
+                        .unwrap_or_else(|| sessions::fresh_target().session_uid),
+                    task_id: saved.task_id.clone(),
+                    task_session_id: saved.task_session_id.clone(),
+                    ..sessions::fresh_target()
+                });
+                pane.startup_command = saved.startup_command.clone();
+                pane.chat_session_id = saved.chat_session_id.clone();
+                pane.exited = true;
+                if let Some(error) = &restore_error {
+                    pane.content = pane::PaneContent::Error(format!("Restore terminal: {error}"));
+                }
+            });
+        }
         if let (Some(restored), Some(host)) = (restored, &host)
             && let Some(view) = host.update(cx, |host, _| host.take_terminal(&restored.session_id))
         {

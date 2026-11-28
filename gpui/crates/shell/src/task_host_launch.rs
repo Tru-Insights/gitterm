@@ -98,6 +98,24 @@ pub(crate) struct FinalWorkerClose {
 }
 impl gpui::EventEmitter<FinalWorkerClose> for TaskHostOwner {}
 
+/// Saved commands without chat_session_id still select an explicit conversation.
+fn terminal_conversation_id(command: &str) -> Option<String> {
+    let words = shell_words::split(command).ok()?;
+    let program = Path::new(words.first()?).file_name()?.to_str()?;
+    if program == "claude" {
+        return gitterm_core::workers::claude_preset_session_id(command)
+            .ok()
+            .flatten();
+    }
+    let flag = match program {
+        "codex" => "resume",
+        "pi" => "--session",
+        _ => return None,
+    };
+    let at = words.iter().position(|word| word == flag)?;
+    words.get(at + 1).filter(|id| !id.starts_with('-')).cloned()
+}
+
 /// A launched terminal the host still owns. Dropping it kills the child's
 /// process group (the PTY child leads one); the entity's release then
 /// reaps the killed child.
@@ -207,18 +225,17 @@ impl TaskHostOwner {
     /// Live mode, or the guarded fixture route in Preview. A saved task
     /// runs the command rebuilt as a launch builds it, as the same task
     /// session, in a terminal this host owns until the shell adopts it
-    /// ([`Self::take_terminal`]). None restores a plain shell and keeps the
-    /// saved fields in Preview: no command or task, a task this host did not create
-    /// (always so in plain preview), neither folder there, or a refusal.
+    /// ([`Self::take_terminal`]). A refusal retains a stopped pane and its
+    /// saved identity in Live; Preview may fall back to its plain shell.
     pub(crate) fn restore_terminal(
         &mut self,
         workspace: &str,
         saved: &crate::layout::TerminalSession,
         cx: &mut Context<Self>,
-    ) -> Option<TerminalLaunched> {
+    ) -> Result<TerminalLaunched, String> {
         if self.is_live() {
             if saved.bottom {
-                return None;
+                return Err("Bottom terminals restore separately".into());
             }
             let tab = gitterm_core::workspace_config::WorkspaceTabConfig {
                 dir: saved.cwd.to_string_lossy().into_owned(),
@@ -240,17 +257,14 @@ impl TaskHostOwner {
                 .open_live_terminal(workspace, &tab, true, cx)
                 .inspect_err(|e| {
                     eprintln!("[tasks] restore terminal: {e}");
-                })
-                .ok();
+                });
         }
         let (Some(_), Some(task_id)) = (&saved.startup_command, &saved.task_id) else {
-            return None;
+            return Err("No saved task command".into());
         };
-        self.try_restore(saved, task_id, cx)
-            .inspect_err(|error| {
-                eprintln!("[tasks] {task_id}: restored a plain shell, not its command: {error}");
-            })
-            .ok()
+        self.try_restore(saved, task_id, cx).inspect_err(|error| {
+            eprintln!("[tasks] {task_id}: restored a plain shell, not its command: {error}");
+        })
     }
 
     fn try_restore(
@@ -1233,6 +1247,24 @@ impl TaskHostOwner {
         if !self.is_live() {
             return Err(preview_notice("Terminal"));
         }
+        // Iced's restore_task_tab: final worker sessions stay closed unless
+        // their shutdown was refused, and missing worktrees never launch.
+        if restore && let Some(task_id) = tab.task_id.as_deref() {
+            let store = self.host.store().as_ref();
+            if !tab.worker_shutdown_refused
+                && store.is_some_and(|store| {
+                    store.worker_session_is_final(task_id, tab.task_session_id.as_deref())
+                })
+            {
+                return Err("Saved worker session is completed or failed".into());
+            }
+            let launch_dir = Path::new(tab.repo_dir.as_deref().unwrap_or(&tab.dir));
+            if store.is_some_and(|store| store.task_worktree_missing(task_id))
+                || !launch_dir.is_dir()
+            {
+                return Err(format!("Task {task_id} worktree is missing"));
+            }
+        }
         let mut task = tab
             .task_id
             .as_deref()
@@ -1318,6 +1350,22 @@ impl TaskHostOwner {
             }
         };
         let command = restored.startup_command;
+        // Iced filters conversations open elsewhere when reopening workspaces.
+        // Startup duplicates also need a reservation before either PTY starts.
+        let conversation = command
+            .as_deref()
+            .and_then(terminal_conversation_id)
+            .or_else(|| restored.chat_session_id.clone());
+        if let Some(id) = &conversation
+            && self
+                .terminal_conversations
+                .get(id)
+                .is_some_and(|view| view.upgrade().is_some())
+        {
+            return Err(format!(
+                "Conversation {id} is already open in another terminal"
+            ));
+        }
         let mut targets = vec![cwd.clone()];
         if let Some(worktree) = task.as_ref().and_then(|t| t.worktree.path.clone()) {
             targets.push(worktree);
@@ -1352,6 +1400,10 @@ impl TaskHostOwner {
         let needs_input = Arc::new(AtomicBool::new(false));
         let terminal =
             self.spawn_live_terminal(&cwd, runtime.as_deref(), env, &session_id, &needs_input, cx)?;
+        if let Some(id) = conversation {
+            self.terminal_conversations
+                .insert(id, terminal.view.downgrade());
+        }
         self.host.issue_caller(&target.session_uid);
         if let Some(task) = &task {
             self.host.issue_caller(&session_id);

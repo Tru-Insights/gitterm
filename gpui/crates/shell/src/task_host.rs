@@ -326,6 +326,9 @@ pub(crate) struct TaskHostOwner {
     pub(crate) delegation_waiting_counts: std::collections::HashMap<String, usize>,
     /// Launched terminals no pane has adopted yet, by task session.
     terminals: std::collections::HashMap<String, launch::HostTerminal>,
+    /// Conversation ownership includes terminals already adopted by a pane.
+    terminal_conversations:
+        std::collections::HashMap<String, gpui::WeakEntity<gitterm_terminal::TerminalView>>,
     /// Every launched task session, adopted or not.
     launched: std::collections::HashMap<String, launch::Launched>,
     /// Runs on a prepared worktree path before its post-preparation recheck.
@@ -678,6 +681,7 @@ impl TaskHostOwner {
                 own_tasks,
                 delegation_waiting_counts: Default::default(),
                 terminals: Default::default(),
+                terminal_conversations: Default::default(),
                 launched: Default::default(),
                 #[cfg(test)]
                 before_recheck: None,

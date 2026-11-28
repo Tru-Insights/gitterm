@@ -251,6 +251,65 @@ impl WorkspaceOwner {
     pub(crate) fn iced_catalog(&self) -> Option<&crate::workspace_config::IcedCatalog> {
         self.store.as_ref()?.iced.as_ref()
     }
+    /// Iced removes a closed tab from its saved workspace. Commit that
+    /// removal before the shell discards its runtime pane.
+    pub(crate) fn close_live_tab(
+        &self,
+        workspace: crate::data::WorkspaceId,
+        id: crate::data::SessionId,
+        target: &gitterm_core::session::Target,
+        cx: &App,
+    ) -> Result<
+        Option<gitterm_core::desktop_store::Receipt<crate::workspace_config::LiveWorkspaceSaved>>,
+        String,
+    > {
+        let Some(saved) = self.iced_workspace(workspace) else {
+            return Ok(None);
+        };
+        let at = saved
+            .tabs
+            .iter()
+            .position(|tab| tab.session_uid.as_deref() == Some(&target.session_uid))
+            .or_else(|| {
+                crate::data::iced_sessions(saved)
+                    .iter()
+                    .position(|session| session.id == id)
+                    .filter(|&at| at < saved.tabs.len())
+            });
+        let Some(at) = at else { return Ok(None) };
+        let desktop = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .ok_or("Live workspace store is unavailable; terminal was kept open")?
+            .0
+            .clone();
+        let key = gitterm_core::park::Key {
+            name: saved.name.clone(),
+            dir: saved.dir.clone(),
+        };
+        let expected = serde_json::to_value(&saved.tabs[at]).map_err(|e| e.to_string())?;
+        let uid = saved.tabs[at].session_uid.clone();
+        Ok(Some(desktop.transact_workspaces(move |file| {
+            let mut matches = file.workspaces.iter_mut().filter(|w| key.matches(w));
+            let workspace = matches.next().ok_or("Terminal workspace no longer exists")?;
+            if matches.next().is_some() {
+                return Err("Several saved workspaces have the same name and folder; terminal was kept open".into());
+            }
+            let index = if let Some(uid) = &uid {
+                workspace.tabs.iter().position(|tab| tab.session_uid.as_ref() == Some(uid))
+            } else {
+                workspace.tabs.get(at).filter(|tab| serde_json::to_value(tab).ok().as_ref() == Some(&expected)).map(|_| at)
+            }.ok_or("Saved terminal changed before close; terminal was kept open")?;
+            workspace.tabs.remove(index);
+            // Iced selects the right sibling, or the last tab when closing it.
+            workspace.active_tab = workspace.active_tab.and_then(|active| {
+                (!workspace.tabs.is_empty()).then(|| if active > index { active - 1 } else { active.min(workspace.tabs.len() - 1) })
+            });
+            Ok(crate::workspace_config::LiveWorkspaceSaved {
+                workspace: workspace.clone(), repos: file.repos.clone(),
+                closed: file.workspaces.iter().filter(|w| !w.active).cloned().collect(),
+            })
+        })))
+    }
     pub(crate) fn chat_history(
         &self,
         cwd: Option<&std::path::Path>,

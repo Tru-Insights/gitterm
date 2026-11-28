@@ -79,9 +79,21 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.close_target_saved(requested, confirmed, false, window, cx);
+    }
+
+    fn close_target_saved(
+        &mut self,
+        requested: &Target,
+        confirmed: bool,
+        persisted: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if self.owner.read(cx).workspace_save_pending {
             return;
         }
+        let live = self.live_chat_enabled(cx);
         let Some(state) = self.workspaces.iter_mut().find(|state| {
             state
                 .panes
@@ -126,6 +138,55 @@ impl crate::Shell {
             let workspace = state.workspace.id;
             self.show_session(workspace, id, window, cx);
             return;
+        }
+        if !persisted && live {
+            let workspace = state.workspace.id;
+            let save = self
+                .owner
+                .read(cx)
+                .close_live_tab(state.workspace.id, id, requested, cx);
+            match save {
+                Err(error) => {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some(format!("Close terminal: {error}"));
+                        cx.notify();
+                    });
+                    self.show_session(workspace, id, window, cx);
+                    return;
+                }
+                Ok(Some(save)) => {
+                    self.owner
+                        .update(cx, |owner, _| owner.workspace_save_pending = true);
+                    let work = cx.background_executor().spawn(async move { save.wait() });
+                    let requested = requested.clone();
+                    cx.spawn_in(window, async move |shell, cx| {
+                        let result = work.await;
+                        _ = shell.update_in(cx, |shell, window, cx| {
+                            shell
+                                .owner
+                                .update(cx, |owner, _| owner.workspace_save_pending = false);
+                            match result {
+                                Ok(saved) => {
+                                    shell.owner.update(cx, |owner, cx| {
+                                        owner.publish_workspace(saved, false, cx);
+                                    });
+                                    shell.close_target_saved(&requested, true, true, window, cx);
+                                }
+                                Err(error) => {
+                                    shell.owner.update(cx, |owner, cx| {
+                                        owner.error = Some(format!("Close terminal: {error}"));
+                                        cx.notify();
+                                    });
+                                    shell.show_session(workspace, id, window, cx);
+                                }
+                            }
+                        });
+                    })
+                    .detach();
+                    return;
+                }
+                Ok(None) => {}
+            }
         }
         // Iced's `close_task_tab`: a launched task session's close folds into
         // its task, then dropping the PTY hangs up its child and reaps it.
@@ -1957,6 +2018,20 @@ impl crate::Shell {
                             }
                         }
                         Err(error) => pane.update(cx, |pane, cx| {
+                            let identity = tab
+                                .session_identity()
+                                .open(|| fresh_target().session_uid)
+                                .identity;
+                            pane.session = Some(Target {
+                                session_uid: identity.session_uid,
+                                task_id: tab.task_id.clone(),
+                                task_session_id: tab.task_session_id.clone(),
+                                ..fresh_target()
+                            });
+                            pane.startup_command = tab.startup_command.clone();
+                            pane.chat_session_id = tab.chat_session_id.clone();
+                            pane.terminal_cwd = Some(tab.dir.clone().into());
+                            pane.exited = true;
                             pane.content = crate::pane::PaneContent::Error(format!(
                                 "Restore terminal: {error}"
                             ));
@@ -1990,6 +2065,12 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| state.on_bar())
+        {
+            return;
+        }
         if !self.live_chat_enabled(cx) {
             self.preview_unavailable("Launch agent preset", cx);
             return;
@@ -2042,9 +2123,7 @@ impl crate::Shell {
             host.open_live_terminal(&name, &tab, false, cx)
         }) {
             Ok(launched) => {
-                self.adopt_task_terminal(&host, &launched, window, cx);
-                if let Some(session) = self.active(cx).sessions.last() {
-                    let pane = self.active(cx).panes[&crate::session_pane_id(session.id)].clone();
+                if let Some(pane) = self.adopt_task_terminal(&host, &launched, window, cx) {
                     pane.update(cx, |pane, _| {
                         pane.startup_command = launched.startup_command;
                         pane.chat_session_id = chat_session_id;
