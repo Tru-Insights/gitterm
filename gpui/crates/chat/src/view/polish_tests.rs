@@ -110,6 +110,24 @@ fn u11_uncertain_delivery_is_not_repeated_in_the_footer(cx: &mut TestAppContext)
     );
 }
 
+#[gpui::test]
+fn resume_failure_is_shown_once_as_read_only_reason(cx: &mut TestAppContext) {
+    let (chat, cx) = setup(vec![], cx);
+    let error = "Saved Claude session not found: missing-session";
+    chat.update_in(cx, |view, _, cx| {
+        view.set_read_only(Some(error.into()), cx);
+        // ChatPane uses both APIs for a resume failure; the view keeps the
+        // matching composer notice from repeating the read-only note.
+        view.set_status_error(error.into(), cx);
+    });
+    draw(cx);
+    chat.read_with(cx, |view, _| {
+        assert_eq!(view.read_only_reason.as_deref(), Some(error));
+        assert_eq!(view.composer_state.notice, None);
+    });
+    assert!(cx.debug_bounds("chat-read-only-note").is_some());
+}
+
 /// X13: Escape is the page's only when a layer of it is open (find, a menu,
 /// the request panel); otherwise Iced forwards it to the host.
 #[gpui::test]

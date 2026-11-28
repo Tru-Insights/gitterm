@@ -1308,12 +1308,16 @@ impl Render for ChatPane {
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
-            .children(self.resume_error.clone().map(|error| {
-                div().p_2().child(error).child(
-                    gpui_component::button::Button::new("start-fresh-chat")
-                        .label("Start a fresh chat here")
-                        .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
-                )
+            .children(self.resume_error.as_ref().map(|_| {
+                div()
+                    .id("resume-failure-recovery")
+                    .debug_selector(|| "resume-failure-recovery".into())
+                    .p_2()
+                    .child(
+                        gpui_component::button::Button::new("start-fresh-chat")
+                            .label("Start a fresh chat here")
+                            .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
+                    )
             }))
     }
 }

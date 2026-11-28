@@ -450,6 +450,32 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
     ));
 }
 
+#[gpui::test]
+fn resume_failure_keeps_one_read_only_message_and_fresh_chat_action(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (dir, preview) = fixture();
+    let saved = SavedChat {
+        uid: "missing-session-pane".into(),
+        cwd: dir.path().to_owned(),
+        provider: preview.provider(),
+        session_id: Some("missing-session".into()),
+        records: vec![],
+    };
+    let (pane, cx) = cx
+        .add_window_view(|window, cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
+    let error = "Saved Claude session not found: missing-session";
+    pane.update_in(cx, |pane, cx| pane.resume_failed(error.into(), cx));
+    crate::workspace_bar::tests::draw(cx);
+
+    assert!(cx.debug_bounds("chat-read-only-note").is_some());
+    assert!(cx.debug_bounds("resume-failure-recovery").is_some());
+    assert!(cx.debug_bounds("start-fresh-chat").is_some());
+    pane.read_with(cx, |pane, _| {
+        assert_eq!(pane.resume_error.as_deref(), Some(error))
+    });
+}
+
 #[tokio::test]
 async fn fake_runtime_probe_fresh_launch_send_answers_stop_and_shutdown() {
     let (dir, preview) = fixture();
