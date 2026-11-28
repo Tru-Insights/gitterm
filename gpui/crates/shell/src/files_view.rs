@@ -27,6 +27,8 @@ pub(crate) struct FilesView {
     selected_file: Option<PathBuf>,
     samples: Vec<FileNode>,
 }
+#[cfg(test)]
+impl EventEmitter<crate::content::actions::OpenEditor> for FilesView {}
 impl FilesView {
     pub(crate) fn new(
         workspace: WorkspaceId,
@@ -214,13 +216,11 @@ impl FilesView {
             None => {}
         }
     }
-    fn edit_file(&self, cx: &mut Context<Self>) {
-        if let Some(owner) = &self.owner {
-            owner.update(cx, |owner, cx| {
-                owner.error = Some("Edit file · not available in preview".into());
-                cx.notify();
-            });
-        }
+    fn edit_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let request = crate::content::actions::OpenEditor::terminal(path);
+        #[cfg(test)]
+        cx.emit(request.clone());
+        window.dispatch_action(Box::new(request), cx);
     }
 }
 fn entry_id(entry: &Entry) -> SharedString {
@@ -430,6 +430,7 @@ impl Render for FilesView {
                         .when(entry.is_dir, |row| row.bg(rgb(p.base)))
                         .child(button);
                     if !entry.is_dir {
+                        let edit_path = entry.path.clone();
                         row = row.child(
                             file_button(("files-edit", ix))
                                 .debug_selector(move || format!("files-edit-{ix}"))
@@ -439,7 +440,9 @@ impl Render for FilesView {
                                 .text_color(rgb(p.subtext0))
                                 .aria_label(format!("Edit {}", entry.name))
                                 .child("✎")
-                                .on_click(cx.listener(|this, _, _, cx| this.edit_file(cx))),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_file(edit_path.clone(), window, cx)
+                                })),
                         );
                     }
                     listing = listing.child(row);

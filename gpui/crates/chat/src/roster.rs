@@ -83,6 +83,7 @@ pub enum RosterOutcome {
     OpenFile {
         path: std::path::PathBuf,
         review: bool,
+        line: Option<usize>,
     },
     Dismiss {
         id: String,

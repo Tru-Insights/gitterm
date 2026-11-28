@@ -1,3 +1,10 @@
+/// The host validates the current chat checkout before opening its editor.
+#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[action(namespace = native_chat, no_json)]
+pub struct OpenCheckout {
+    pub path: Option<std::path::PathBuf>,
+}
+
 mod attachments;
 #[path = "copy.rs"]
 mod copy;
@@ -790,14 +797,15 @@ impl ChatView {
         self.focus_composer(window, cx);
         cx.notify();
     }
-    /// Iced posts `open_checkout` to launch the configured editor; the preview
-    /// launches nothing and says so as the other Open in editor controls do.
+    /// Iced posts `open_checkout`; the host validates and opens this checkout.
     pub(crate) fn open_checkout_in_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_state.picker = None;
-        self.composer_state.notice = Some(format!(
-            "Open in editor · {}",
-            crate::composer::NOT_IN_PREVIEW
-        ));
+        window.dispatch_action(
+            Box::new(OpenCheckout {
+                path: self.composer_state.checkout_path.as_ref().map(Into::into),
+            }),
+            cx,
+        );
         self.focus_composer(window, cx);
         cx.notify();
     }
@@ -812,11 +820,10 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         if picker == crate::pickers::Picker::Checkout {
-            if self.read_only_reason.is_some() {
-                return;
-            }
-            // A locked chat's menu lists only Open in editor, as in Iced.
-            if self.composer_state.checkout_locked.is_none()
+            // Opening the current checkout is safe even when this chat cannot send.
+            // Keep checkout changes behind the existing read-only fence.
+            if self.read_only_reason.is_none()
+                && self.composer_state.checkout_locked.is_none()
                 && let Some(source) = &self.checkout_source
             {
                 self.composer_state.checkout_choices = source(cx);
@@ -2770,7 +2777,7 @@ impl Render for RowView {
                                                         action(
                                         crate::interactions::TranscriptAction::OpenFile {
                                             path: path.clone(),
-                                            review: true,
+                                            review: true, line: None,
                                         },
                                         cx,
                                     );
