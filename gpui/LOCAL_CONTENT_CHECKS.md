@@ -21,7 +21,8 @@ the ordinary file viewer. Core's `list_documents` is shared with Iced's routes.
 GPUI supplies inert JSON for the captured source/selection rather than starting
 another HTTP listener. No document is copied or written. The shared asset's
 CDN imports remain unchanged. Workspace changes resolve the saved workspace
-home, independent of a session checkout, and dismissing restores prior focus.
+home, independent of a session checkout. Workspace/tab changes dismiss Plans as
+Iced does; explicit dismissal restores prior focus.
 
 Focused acceptance tests: `scripts/cargo.sh test --manifest-path gpui/Cargo.toml
 -p gitterm-gpui-shell -j 4 plans_viewer`. Page control tests execute the actual

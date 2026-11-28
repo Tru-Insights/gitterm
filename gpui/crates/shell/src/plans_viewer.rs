@@ -20,6 +20,7 @@ document.addEventListener('keydown', e => {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Request {
     workspace: WorkspaceId,
+    session: Option<crate::data::SessionId>,
     home: PathBuf,
     source: DocumentSource,
     name: Option<String>,
@@ -158,6 +159,11 @@ impl Shell {
                     let name = path.strip_prefix(root).ok()?.to_str()?.replace('\\', "/");
                     plans::is_safe_relative_md_path(&name).then(|| Request {
                         workspace,
+                        session: self
+                            .workspaces
+                            .iter()
+                            .find(|state| state.workspace.id == workspace)
+                            .and_then(|state| state.active_session),
                         home: home.clone(),
                         source,
                         name: Some(name),
@@ -209,6 +215,19 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
+        // Iced's WorkspaceSelect/TabSelect presents the new tab's surfaces,
+        // dismissing the standalone Plans viewer rather than carrying it over.
+        let session = self.active(cx).active_session;
+        if self
+            .plans_request
+            .as_ref()
+            .is_some_and(|request| request.workspace != workspace || request.session != session)
+        {
+            self.plans_return_focus = None;
+            self.toggle_plans(window, cx);
+            self.focus_main_terminal(window, cx);
+            return;
+        }
         let Some(home) = self.plans_home(workspace, cx) else {
             return;
         };
@@ -220,6 +239,7 @@ impl Shell {
             }
             _ => Request {
                 workspace,
+                session,
                 home,
                 source: DocumentSource::Plans,
                 name: None,

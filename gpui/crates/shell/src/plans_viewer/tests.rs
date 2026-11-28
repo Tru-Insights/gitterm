@@ -18,6 +18,7 @@ fn data(document: &content::Document) -> serde_json::Value {
 fn request(home: &Path) -> Request {
     Request {
         workspace: WorkspaceId(1),
+        session: None,
         home: home.into(),
         source: DocumentSource::Plans,
         name: Some("guide.md".into()),
@@ -229,6 +230,11 @@ fn plans_viewer_workspace_switch_uses_iced_home_not_session_checkout(cx: &mut Te
         shell.update(cx, |shell, cx| {
             shell.pick_workspace_id(WorkspaceId(2), window, cx);
             shell.sync_plans_viewer(window, cx);
+            assert!(
+                !shell.plans_open,
+                "Iced dismisses Plans on workspace selection"
+            );
+            shell.toggle_plans(window, cx);
         })
     });
     wait_for_document(&shell, cx);
@@ -242,6 +248,22 @@ fn plans_viewer_workspace_switch_uses_iced_home_not_session_checkout(cx: &mut Te
             serde_json::json!([{"name":"guide.md", "title":"second"}])
         );
         assert!(payload["name"].is_null());
+    });
+}
+
+#[gpui::test]
+fn plans_viewer_tab_change_dismisses_as_iced_does(cx: &mut TestAppContext) {
+    let _app = crate::test_app::Cleanup::new(cx);
+    let (_root, shell, cx) = crate::h7_tests::fixture(cx);
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.toggle_plans(window, cx);
+            assert!(shell.plans_open);
+            shell.new_terminal(window, cx);
+            shell.sync_plans_viewer(window, cx);
+            assert!(!shell.plans_open);
+            assert!(shell.plans_content.read(cx).selected.is_none());
+        })
     });
 }
 
