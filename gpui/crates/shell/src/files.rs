@@ -16,6 +16,7 @@ pub struct Request {
     pub path: PathBuf,
     generation: u64,
     limit: usize,
+    show_hidden: bool,
 }
 pub struct Outcome {
     pub request: Request,
@@ -34,11 +35,21 @@ struct Directory {
     loading: bool,
     error: Option<String>,
 }
-#[derive(Default)]
 pub struct FileTree {
     pub root: PathBuf,
     directories: HashMap<PathBuf, Directory>,
     generation: u64,
+    show_hidden: bool,
+}
+impl Default for FileTree {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            directories: HashMap::new(),
+            generation: 0,
+            show_hidden: true,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub enum Row {
@@ -63,6 +74,9 @@ pub enum Row {
     },
 }
 impl FileTree {
+    pub(crate) fn set_show_hidden(&mut self, show_hidden: bool) {
+        self.show_hidden = show_hidden;
+    }
     pub fn refresh(&mut self, workspace: WorkspaceId, root: PathBuf) -> Request {
         self.root = root.clone();
         self.directories.clear();
@@ -104,6 +118,7 @@ impl FileTree {
             path,
             generation: self.generation,
             limit,
+            show_hidden: self.show_hidden,
         }
     }
     pub fn complete(&mut self, outcome: Outcome) {
@@ -176,9 +191,10 @@ pub fn list(request: &Request) -> Result<Listing, String> {
     for entry in std::fs::read_dir(&request.path).map_err(fail)? {
         let entry = entry.map_err(fail)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        // Match Iced's local_list_dir with its default show_hidden=true:
-        // dotfiles (including .git) and gitignored paths remain visible.
         if name == "node_modules" || name == "target" {
+            continue;
+        }
+        if !request.show_hidden && name.starts_with('.') {
             continue;
         }
         let path = entry.path();

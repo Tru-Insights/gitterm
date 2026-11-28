@@ -486,3 +486,109 @@ fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppC
         px(16.)
     );
 }
+
+fn work_document(home: &Path, repos: &[&Path]) -> gitterm_core::workspace_config::WorkspacesFile {
+    serde_json::from_value(serde_json::json!({
+        "workspaces": [{ "name": "Fixture", "abbrev": "F", "color": "blue", "dir": home,
+            "chats": ["owned"], "repos": repos, "tabs": [] }], "active_workspace": 0
+    }))
+    .unwrap()
+}
+
+#[gpui::test]
+fn files_roots_follow_repositories_added_and_removed_during_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    let docs = home.path().join("docs");
+    for dir in [&first, &second, &docs] {
+        fs::create_dir(dir).unwrap();
+    }
+    fs::write(first.join("file.txt"), "snapshot").unwrap();
+    let (view, owner, cx) = setup(cx, home.path(), config.path());
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&first]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), first.clone(), docs.clone()]
+        )
+    });
+    view.update(cx, |view, cx| view.browse_root(first.clone(), cx));
+    wait_for(&view, "file.txt", cx);
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(
+            config.path(),
+            work_document(home.path(), &[&first, &second]),
+            cx,
+        )
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[
+                home.path().to_path_buf(),
+                first.clone(),
+                second.clone(),
+                docs.clone()
+            ]
+        );
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&second]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), second, docs]
+        );
+        // Iced retains panel_repo_root until All folders is clicked.
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    click(cx, "files-all-folders");
+    assert!(cx.debug_bounds("files-root-0").is_some());
+}
+
+#[gpui::test]
+fn files_hidden_entries_follow_saved_show_hidden_setting(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    for name in ["visible.txt", ".hidden"] {
+        fs::write(root.path().join(name), "fixture").unwrap();
+    }
+    fs::create_dir(root.path().join(".hidden-dir")).unwrap();
+    fs::create_dir(root.path().join("target")).unwrap();
+    let (_, owner, cx) = setup(cx, root.path(), config.path());
+    for show_hidden in [false, true] {
+        let settings =
+            serde_json::to_vec(&serde_json::json!({"show_hidden": show_hidden})).unwrap();
+        fs::write(config.path().join("settings.json"), &settings).unwrap();
+        owner.update(cx, |owner, cx| {
+            owner.apply_desktop_document(config.path(), work_document(root.path(), &[]), cx)
+        });
+        let view = cx.new(|cx| {
+            FilesView::new(
+                crate::data::WorkspaceId(1),
+                Rc::new(LocalData(owner.clone())),
+                cx,
+            )
+        });
+        wait_for(&view, "visible.txt", cx);
+        let listed = names(&view, cx);
+        assert_eq!(listed.contains(&".hidden".into()), show_hidden);
+        assert_eq!(listed.contains(&".hidden-dir".into()), show_hidden);
+        assert!(!listed.contains(&"target".into()));
+        assert_eq!(
+            fs::read(config.path().join("settings.json")).unwrap(),
+            settings
+        );
+    }
+}
