@@ -2353,7 +2353,18 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: self.browser.bar(colors),
+            // Preview keeps v6's idle button; its click reports the Iced label.
+            browser: if chat::policy::is_live(cx) {
+                self.browser.bar(colors)
+            } else {
+                workspace_bar::Browser {
+                    color: colors.muted,
+                    driving: false,
+                    hint: "Browser idle".into(),
+                    action: Some(workspace_bar::BrowserAction::Open),
+                    has_evidence: false,
+                }
+            },
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
