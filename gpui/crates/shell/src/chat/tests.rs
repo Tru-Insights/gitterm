@@ -1195,7 +1195,7 @@ fn preview_refuses_forged_bound_remember_before_any_writer() {
     let (receipt, _) = controller.dispatch(intent);
     assert_eq!(
         receipt.state,
-        ReceiptState::Rejected("Allow and remember · not saved in preview".into())
+        ReceiptState::Rejected("Allow and remember · not available in preview".into())
     );
 }
 

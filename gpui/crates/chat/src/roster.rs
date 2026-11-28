@@ -40,10 +40,30 @@ pub struct RosterRow {
 
 /// Preserve the host's roster order; Iced supplies rows in its display order.
 pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
-    input
-        .iter()
+    let mut ordered: Vec<_> = input.iter().collect();
+    if input.iter().any(|row| row.id.starts_with("cx:")) {
+        let mut top: Vec<_> = input
+            .iter()
+            .filter(|row| exec_parent(&row.id).is_none())
+            .collect();
+        top.sort_by_key(|row| std::cmp::Reverse((row.state.is_live(), row.started_at_ms)));
+        ordered = top
+            .into_iter()
+            .flat_map(|row| {
+                std::iter::once(row).chain(
+                    input
+                        .iter()
+                        .filter(move |child| exec_parent(&child.id) == Some(row.id.as_str())),
+                )
+            })
+            .collect();
+    }
+    ordered
+        .into_iter()
         .map(|row| {
-            let what = if row.checkout.is_empty() {
+            let what = if row.id.starts_with("cx:") {
+                row.activity.clone()
+            } else if row.checkout.is_empty() {
                 String::new()
             } else {
                 format!("· in {}", row.checkout)
@@ -68,6 +88,11 @@ pub fn rows(input: &[RosterEntry], now_ms: u64) -> Vec<RosterRow> {
             }
         })
         .collect()
+}
+
+fn exec_parent(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("cx:")?;
+    Some(&id[..3 + rest.find(':')?])
 }
 
 /// Open reveals a card locally. Only explicit worker/file actions navigate the host;
@@ -105,7 +130,10 @@ pub(crate) fn render(
     let palette = appearance.palette();
     let rows: Vec<_> = rows(input, now_ms)
         .into_iter()
-        .filter(|row| !hidden.contains(&row.id))
+        .filter(|row| {
+            !hidden.contains(&row.id)
+                && exec_parent(&row.id).is_none_or(|parent| !hidden.contains(parent))
+        })
         .collect();
     div()
         .id("chat-roster")
@@ -364,5 +392,36 @@ mod tests {
             rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["live", "finished", "waiting-ended"]
         );
+    }
+}
+
+#[cfg(test)]
+mod external_tests {
+    use super::*;
+    #[test]
+    fn live_exec_roster_orders_running_then_newest_and_keeps_children_with_parent() {
+        let row = |id: &str, state, start| RosterEntry {
+            id: id.into(),
+            name: "Synthetic".into(),
+            model: String::new(),
+            checkout: String::new(),
+            activity: "running · in checkout — inspecting".into(),
+            state,
+            started_at_ms: Some(start),
+            ended_at_ms: None,
+        };
+        let entries = [
+            row("done", WorkerState::Done, 9000),
+            row("cx:1-1", WorkerState::Running, 1000),
+            row("cx:1-1:child", WorkerState::Done, 1000),
+            row("cx:2-2", WorkerState::Running, 2000),
+        ];
+        let actual = rows(&entries, 10000);
+        assert_eq!(
+            actual.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["cx:2-2", "cx:1-1", "cx:1-1:child", "done"]
+        );
+        assert_eq!(actual[0].what, "running · in checkout — inspecting");
+        assert_eq!(exec_parent("cx:1-1:child"), Some("cx:1-1"));
     }
 }

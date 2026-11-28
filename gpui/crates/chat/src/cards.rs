@@ -445,7 +445,7 @@ impl Render for CardView {
                         .child(Input::new(&self.deny_reason)),
                 );
                 if self.preview && !offered_options(suggestions).is_empty() {
-                    content = content.child("not saved in preview");
+                    content = content.child("not available in preview");
                 }
                 content = content.child(
                     Button::new("deny")

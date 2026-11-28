@@ -74,6 +74,29 @@ pub(super) fn fixture(owned: bool) -> WorkSidebar {
     fixture_with_branch(owned, "tru-274")
 }
 
+#[test]
+fn chat_review_target_reuses_work_row_and_ignores_gone_checkouts() {
+    let sidebar = fixture(true);
+    let target = sidebar
+        .review_target(std::path::Path::new("/repos/api-tru-274"))
+        .unwrap();
+    assert_eq!(target.checkout, PathBuf::from("/repos/api-tru-274"));
+    assert_eq!(target.repo, "api");
+    assert_eq!(target.branch, "tru-274");
+    assert_eq!(target.owner, "coordinator");
+    assert_eq!(target.base, None);
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/repos/api-old-branch"))
+            .is_none()
+    );
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/unlisted"))
+            .is_none()
+    );
+}
+
 fn fixture_with_branch(owned: bool, first_branch: &str) -> WorkSidebar {
     let now = Instant::now();
     let wall_time = SystemTime::now();
@@ -511,7 +534,7 @@ fn w03_and_w15_index_and_owned_chat_only_notice(cx: &mut gpui::TestAppContext) {
     click_row(&sidebar, cx, "✦ Unindexed chat");
     assert_eq!(
         sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
-        Some("✦ Unindexed chat · not available in preview")
+        Some("Open chat · not available in preview")
     );
     assert!(events.borrow().is_empty());
     assert_eq!(tree_snapshot(root.path()), before);
@@ -1301,7 +1324,13 @@ fn owned_coordinators_open_and_folder_coordinators_focus_with_explicit_open() {
             .find(|row| row.label == "✦ Ship parity")
             .unwrap();
         if owned {
-            assert_eq!(row.action, Some(Action::Preview(row.label.clone())));
+            assert_eq!(
+                row.action,
+                Some(Action::Emit(WorkSidebarOutcome::OpenChat {
+                    workspace: 7,
+                    chat: "recent".into()
+                }))
+            );
         } else {
             assert_eq!(
                 sidebar.activate(row.action.unwrap()),
@@ -3809,7 +3838,7 @@ fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
         matches!(events.borrow().last(), Some(WorkSidebarOutcome::Rename { name, .. }) if name == "Renamed")
     );
     assert!(sidebar.read_with(cx, |s, _| s.error.is_none()));
-    // Unrelated writes retain their existing Preview notice even in this slice.
+    // Make workspace now joins the Live write controls.
     sidebar.update(cx, |s, cx| {
         s.emit(
             WorkSidebarOutcome::MakeWorkspace {
@@ -3818,5 +3847,269 @@ fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
             cx,
         )
     });
-    assert_eq!(events.borrow().len(), 4);
+    assert_eq!(events.borrow().len(), 5);
+    assert_eq!(
+        events.borrow().last(),
+        Some(&WorkSidebarOutcome::MakeWorkspace {
+            chat: "root".into()
+        })
+    );
+}
+
+#[gpui::test]
+fn work_sidebar_live_owned_chat_row_arrow_owner_and_index_dispatch(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let fixture = fixture(true);
+    let mut chat = entry("recent", "Unindexed chat", SystemTime::now());
+    chat.facts = None;
+    replace_entries(&fixture, vec![chat]);
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(640.), px(1300.)));
+    draw_sidebar(cx);
+    // Every newly enabled control still refuses Preview, including an open chat.
+    click_row(&sidebar, cx, "✦ Unindexed chat");
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::GoToChatOwner {
+                chat: "recent".into(),
+            },
+            cx,
+        );
+    });
+    assert!(events.borrow().is_empty());
+    cx.update(|_, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "work-controls",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    click_row(&sidebar, cx, "✦ Unindexed chat");
+    sidebar.update(cx, |s, cx| {
+        s.open.insert(Fold::Chat("recent".into()));
+        cx.notify();
+    });
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "✦ Unindexed chat", "↗");
+    sidebar.update(cx, |s, cx| {
+        s.workspace
+            .chat_owners
+            .insert("recent".into(), "Owner".into());
+        s.workspace.owned_chats.clear();
+        cx.notify();
+    });
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "✦ Unindexed chat", "→ Go to Owner");
+    let label = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .into_iter()
+            .find(|r| r.label.starts_with("No chat facts"))
+            .unwrap()
+            .label
+    });
+    click_control(&sidebar, cx, &label, "Index older chats");
+    assert_eq!(
+        *events.borrow(),
+        [
+            WorkSidebarOutcome::OpenChat {
+                workspace: 7,
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::OpenChat {
+                workspace: 7,
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::GoToChatOwner {
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::IndexOlderChats,
+        ]
+    );
+}
+
+#[gpui::test]
+fn remaining_work_pr_controls_live_save_iced_fields_and_preview_refuses(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gitterm_core::{desktop_store::DesktopStore, merge_plan, prs};
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let mut view = super::pr_confirm_tests::sidebar_with_prs();
+    view.pr_plans.get_mut("root").unwrap().entries[1].hold = Some("wait".into());
+    view.pull_requests[0].prs[1].news.push(prs::NewsItem {
+        key: "notice".into(),
+        kind: prs::NewsKind::ChecksFailed,
+        text: "test failed".into(),
+        at: "2026-11-01T00:00:00Z".into(),
+        dismissed: false,
+        told: true,
+        approvals_only: false,
+    });
+    let mut expected = prs::WatchFile::default();
+    for pr in &view.pull_requests[0].prs {
+        expected.prs.insert(pr.key.id(), pr.clone());
+    }
+    expected
+        .save(&prs::WatchFile::path_in(root.path()))
+        .unwrap();
+    merge_plan::write_plan(&merge_plan::plans_dir(root.path()), &view.pr_plans["root"]).unwrap();
+    let plan_path = merge_plan::plan_path(&merge_plan::plans_dir(root.path()), "root").unwrap();
+    let before = tree_snapshot(root.path());
+    let (sidebar, cx) = cx.add_window_view(|_, _| view);
+    for control in [
+        pr_actions::LocalControl::ClearHold {
+            root: "root".into(),
+            key: merge_plan::PrKey::new("example/gitterm", 2),
+        },
+        pr_actions::LocalControl::DismissNews {
+            pr: "example/gitterm#2".into(),
+            news: "notice".into(),
+        },
+    ] {
+        sidebar.update(cx, |s, cx| s.local_pr_control(control.clone(), cx));
+        assert_eq!(
+            sidebar.read_with(cx, |s, _| s.error.clone()),
+            Some(format!("{} · not available in preview", control.label()))
+        );
+    }
+    assert_eq!(tree_snapshot(root.path()), before);
+    let store = DesktopStore::open(root.path()).unwrap();
+    let live = crate::pr_live::LivePrs::with_client(
+        root.path(),
+        crate::pr_live::Snapshot::default(),
+        std::sync::Arc::new(|| Err("No network in test".into())),
+    );
+    cx.update(|_, cx| {
+        cx.set_global(crate::workspace_config::LiveWorkspaces(store));
+        cx.set_global(live);
+    });
+    sidebar.update(cx, |s, cx| {
+        s.local_pr_control(
+            pr_actions::LocalControl::ClearHold {
+                root: "root".into(),
+                key: merge_plan::PrKey::new("example/gitterm", 2),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let saved: merge_plan::MergePlan =
+        serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+    let mut iced = sidebar.read_with(cx, |s, _| s.pr_plans.clone());
+    // Shared Iced reducer, with exactly the clock saved by the Live dispatch.
+    iced.get_mut("root").unwrap().entries[1].hold = Some("wait".into());
+    pr_actions::clear_hold(
+        &mut iced,
+        &HashSet::new(),
+        "root",
+        &merge_plan::PrKey::new("example/gitterm", 2),
+        &saved.updated_at,
+    )
+    .unwrap();
+    assert_eq!(saved, iced["root"]);
+    sidebar.update(cx, |s, cx| {
+        s.local_pr_control(
+            pr_actions::LocalControl::DismissNews {
+                pr: "example/gitterm#2".into(),
+                news: "notice".into(),
+            },
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    pr_actions::dismiss_news(&mut expected, "example/gitterm#2", "notice");
+    assert_eq!(
+        prs::WatchFile::load(&prs::WatchFile::path_in(root.path())),
+        expected
+    );
+}
+
+#[gpui::test]
+fn remaining_work_make_workspace_moves_retained_chat_and_saves_iced_contract(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][0]["tabs"][0] = serde_json::json!({"dir":"/fixture/folder","tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"orphan","session_uid":"orphan-tab","future_tab":true});
+    });
+    let path = root.path().join("iced/workspaces.json");
+    let before = std::fs::read(&path).unwrap();
+    let original = cx.read(|cx| {
+        shell.read(cx).workspaces[0].panes
+            [&crate::session_pane_id(shell.read(cx).workspaces[0].sessions[0].id)]
+            .clone()
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            s.find_home = Some(root.path().join("home"));
+            super::super::find_sidebar::tests::load_local_fixture(
+                &mut s.find_state.borrow_mut(),
+                "orphan",
+                "Example work",
+            );
+            s.make_chat_workspace("orphan", window, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    cx.update(|window, cx| {
+        let store =
+            gitterm_core::desktop_store::DesktopStore::open(&root.path().join("iced")).unwrap();
+        cx.set_global(crate::workspace_config::LiveWorkspaces(store));
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "remaining-make",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap();
+        shell.update(cx, |s, cx| s.make_chat_workspace("orphan", window, cx));
+    });
+    cx.run_until_parked();
+    let saved: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let made = saved
+        .workspaces
+        .iter()
+        .find(|w| w.chats == ["orphan"])
+        .unwrap();
+    assert_eq!(made.name, "Example work");
+    assert_eq!(
+        made.dir,
+        root.path().join("home/Work/example-work").to_str().unwrap()
+    );
+    assert_eq!(made.tabs.len(), 1);
+    assert_eq!(made.tabs[0].extra["future_tab"], true);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let active = shell.active(cx);
+        assert_eq!(active.workspace.name, "Example work");
+        assert_eq!(active.sessions.len(), 1);
+        assert_eq!(
+            shell.work_sidebars[&active.workspace.id]
+                .read(cx)
+                .workspace
+                .owned_chats,
+            ["orphan"]
+        );
+        assert!(
+            !shell.work_sidebars[&shell.workspaces[0].workspace.id]
+                .read(cx)
+                .workspace
+                .open_chats
+                .contains("orphan")
+        );
+        assert!(!shell.workspaces[0].sessions.is_empty());
+        assert!(active.panes.values().any(|p| p == &original));
+        assert!(shell.workspaces[0].panes.values().all(|p| p != &original));
+    });
 }

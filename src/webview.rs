@@ -433,7 +433,10 @@ pub fn try_create_with_window(
                 // shortcut: wry 0.48.1 conflates iframes and real popups. Keep
                 // opening externally; sign-in iframes may remain incomplete.
                 // Revisit when upstream exposes frame identity.
-                let decision = if browser_url(&url).is_ok() {
+                let decision = if matches!(
+                    gitterm_core::page_navigation::page_new_window_decision(&url),
+                    gitterm_core::page_navigation::PageNavigationDecision::External
+                ) {
                     "External"
                 } else {
                     "Cancel"

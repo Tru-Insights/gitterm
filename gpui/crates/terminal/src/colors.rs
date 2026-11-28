@@ -3,7 +3,7 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use gpui_kit::Hsla;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColorPalette {
     ansi_colors: [Hsla; 16],
 
@@ -14,6 +14,8 @@ pub struct ColorPalette {
     background: Hsla,
 
     cursor: Hsla,
+
+    theme: Option<gitterm_core::terminal::TerminalPalette>,
 }
 
 impl Default for ColorPalette {
@@ -151,11 +153,27 @@ impl Default for ColorPalette {
             foreground,
             background,
             cursor,
+            theme: None,
         }
     }
 }
 
 impl ColorPalette {
+    /// Use the same explicit normal, bright and dim colors as Iced.
+    pub fn for_theme(dark: bool) -> Self {
+        let theme = gitterm_core::terminal::palette(dark);
+        let mut palette = Self {
+            ansi_colors: theme.ansi.map(rgb24_to_hsla),
+            foreground: rgb24_to_hsla(theme.foreground),
+            background: rgb24_to_hsla(theme.background),
+            cursor: rgb24_to_hsla(theme.foreground),
+            theme: Some(theme),
+            ..Default::default()
+        };
+        palette.extended_colors[..16].copy_from_slice(&palette.ansi_colors);
+        palette
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -171,6 +189,25 @@ impl ColorPalette {
                     return rgb_to_hsla(rgb);
                 }
 
+                if let Some(theme) = self.theme {
+                    match named {
+                        NamedColor::DimForeground => return rgb24_to_hsla(theme.dim_foreground),
+                        NamedColor::BrightForeground => return self.foreground,
+                        NamedColor::DimBlack
+                        | NamedColor::DimRed
+                        | NamedColor::DimGreen
+                        | NamedColor::DimYellow
+                        | NamedColor::DimBlue
+                        | NamedColor::DimMagenta
+                        | NamedColor::DimCyan
+                        | NamedColor::DimWhite => {
+                            return rgb24_to_hsla(
+                                theme.dim[named as usize - NamedColor::DimBlack as usize],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 let idx = named as usize;
                 if idx < 16 {
                     self.ansi_colors[idx]
@@ -240,6 +277,14 @@ impl ColorPalette {
     pub fn cursor(&self) -> Hsla {
         self.cursor
     }
+}
+
+fn rgb24_to_hsla(rgb: u32) -> Hsla {
+    rgb_to_hsla(Rgb {
+        r: (rgb >> 16) as u8,
+        g: (rgb >> 8) as u8,
+        b: rgb as u8,
+    })
 }
 
 fn rgb_to_hsla(rgb: Rgb) -> Hsla {
@@ -469,5 +514,110 @@ mod tests {
         };
         let hsla = palette.resolve(Color::Spec(rgb), &colors);
         assert_eq!(hsla.a, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    fn assert_palette(dark: bool, expected: &[u32]) {
+        let palette = ColorPalette::for_theme(dark);
+        let colors = Colors::default();
+        let named = [
+            NamedColor::Background,
+            NamedColor::Foreground,
+            NamedColor::Black,
+            NamedColor::Red,
+            NamedColor::Green,
+            NamedColor::Yellow,
+            NamedColor::Blue,
+            NamedColor::Magenta,
+            NamedColor::Cyan,
+            NamedColor::White,
+            NamedColor::BrightBlack,
+            NamedColor::BrightRed,
+            NamedColor::BrightGreen,
+            NamedColor::BrightYellow,
+            NamedColor::BrightBlue,
+            NamedColor::BrightMagenta,
+            NamedColor::BrightCyan,
+            NamedColor::BrightWhite,
+            NamedColor::BrightForeground,
+            NamedColor::DimForeground,
+            NamedColor::DimBlack,
+            NamedColor::DimRed,
+            NamedColor::DimGreen,
+            NamedColor::DimYellow,
+            NamedColor::DimBlue,
+            NamedColor::DimMagenta,
+            NamedColor::DimCyan,
+            NamedColor::DimWhite,
+        ];
+        for (name, rgb) in named.into_iter().zip(expected) {
+            assert_eq!(
+                palette.resolve(Color::Named(name), &colors),
+                rgb24_to_hsla(*rgb),
+                "{name:?}"
+            );
+        }
+        for index in 0..16 {
+            assert_eq!(
+                palette.resolve(Color::Indexed(index), &colors),
+                rgb24_to_hsla(expected[index as usize + 2])
+            );
+        }
+    }
+    #[test]
+    fn terminal_palette_dark_mocha_matches_iced() {
+        assert_palette(
+            true,
+            &[
+                0x1e1e2e, 0xcdd6f4, 0x45475a, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7,
+                0x94e2d5, 0xbac2de, 0x585b70, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7,
+                0x94e2d5, 0xa6adc8, 0xcdd6f4, 0x7f849c, 0x313244, 0xa65d6d, 0x6e9a6d, 0xa69a74,
+                0x5d78a6, 0xa6849c, 0x649a92, 0x7f849c,
+            ],
+        );
+    }
+
+    #[test]
+    fn explicit_dim_ansi_palette_matches_iced_without_derived_shades() {
+        let names = [
+            NamedColor::DimBlack,
+            NamedColor::DimRed,
+            NamedColor::DimGreen,
+            NamedColor::DimYellow,
+            NamedColor::DimBlue,
+            NamedColor::DimMagenta,
+            NamedColor::DimCyan,
+            NamedColor::DimWhite,
+        ];
+        for dark in [true, false] {
+            let palette = ColorPalette::for_theme(dark);
+            let iced = gitterm_core::terminal::palette(dark);
+            for (index, name) in names.into_iter().enumerate() {
+                let actual = palette.resolve(Color::Named(name), &Colors::default());
+                assert_eq!(actual, rgb24_to_hsla(iced.dim[index]));
+                let mut derived = palette.ansi_colors[index];
+                derived.l *= 0.7;
+                assert_ne!(actual, derived, "{name:?} must use Iced's explicit value");
+            }
+            assert_eq!(
+                palette.resolve(Color::Named(NamedColor::DimForeground), &Colors::default()),
+                rgb24_to_hsla(iced.dim_foreground)
+            );
+        }
+    }
+    #[test]
+    fn terminal_palette_light_latte_matches_iced() {
+        assert_palette(
+            false,
+            &[
+                0xeff1f5, 0x4c4f69, 0x5c5f77, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb,
+                0x179299, 0xacb0be, 0x6c6f85, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb,
+                0x179299, 0xbcc0cc, 0x4c4f69, 0x6c6f85, 0x4c4f69, 0xa10c2d, 0x338022, 0xb27117,
+                0x1852c4, 0xbb5ea2, 0x12747a, 0x8c8fa1,
+            ],
+        );
     }
 }

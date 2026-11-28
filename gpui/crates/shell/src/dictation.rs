@@ -1,4 +1,4 @@
-//! Composer ownership and GPUI scheduling only; capture and Whisper live in core.
+//! Dictation destination ownership and GPUI scheduling only; capture and Whisper live in core.
 use super::*;
 
 #[cfg(feature = "stt")]
@@ -70,7 +70,12 @@ mod enabled {
     #[derive(Clone)]
     struct Origin {
         pane: gpui::WeakEntity<Pane>,
-        view: gpui::WeakEntity<ChatView>,
+        view: Destination,
+    }
+    #[derive(Clone)]
+    enum Destination {
+        Chat(gpui::WeakEntity<ChatView>),
+        Terminal(gpui::WeakEntity<gitterm_terminal::TerminalView>),
     }
     enum Phase {
         Idle,
@@ -127,18 +132,29 @@ mod enabled {
 
     impl Shell {
         fn dictation_origin(&self, cx: &App) -> Option<Origin> {
-            let pane = self.active_chat_pane(cx)?;
+            let state = self
+                .workspaces
+                .iter()
+                .find(|state| Some(state.workspace.id) == self.active_workspace(cx))?;
+            let pane = state.panes.get(&session_pane_id(state.active_session?))?;
             let view = match &pane.read(cx).content {
-                pane::PaneContent::Chat(view) => view.clone(),
-                pane::PaneContent::PreviewChat(chat) => chat.read(cx).dictation_view(),
+                pane::PaneContent::Chat(view) => Destination::Chat(view.downgrade()),
+                pane::PaneContent::PreviewChat(chat) => {
+                    Destination::Chat(chat.read(cx).dictation_view().downgrade())
+                }
+                pane::PaneContent::Terminal(view) => Destination::Terminal(view.downgrade()),
                 _ => return None,
             };
             Some(Origin {
                 pane: pane.downgrade(),
-                view: view.downgrade(),
+                view,
             })
         }
         pub(crate) fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+            if !chat::policy::is_live(cx) {
+                self.preview_unavailable("Dictation", cx);
+                return;
+            }
             let origin = self.dictation_origin(cx);
             let was_recording = self.dictation.recording();
             match self.dictation.toggle(origin) {
@@ -182,13 +198,34 @@ mod enabled {
         ) {
             match self.dictation.finish(result) {
                 Ok(Some((origin, text))) => {
-                    if let Some(view) = self.dictation_target(&origin) {
-                        let focus = self
-                            .active_chat_pane(cx)
-                            .is_some_and(|pane| pane.entity_id() == origin.pane.entity_id());
-                        view.update(cx, |view, cx| {
-                            view.insert_dictation(&text, focus, window, cx);
-                        });
+                    if let Some(view) = self.dictation_target(&origin, cx) {
+                        match view {
+                            Destination::Chat(view) => {
+                                if let Some(view) = view.upgrade() {
+                                    let focus = self.active_chat_pane(cx).is_some_and(|pane| {
+                                        pane.entity_id() == origin.pane.entity_id()
+                                    });
+                                    view.update(cx, |view, cx| {
+                                        view.insert_dictation(&text, focus, window, cx);
+                                    });
+                                }
+                            }
+                            Destination::Terminal(view) => {
+                                // Iced routes completion through Event::Terminal,
+                                // which drops writes behind a capture layer.
+                                if !self.pty_blocked(cx)
+                                    && let Some(view) = view.upgrade()
+                                {
+                                    let bytes =
+                                        gitterm_core::dictation::terminal_transcript_bytes(text);
+                                    if !view.read(cx).write_input_bytes(&bytes) {
+                                        eprintln!(
+                                            "[STT] Failed to write transcript to originating terminal"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -196,19 +233,27 @@ mod enabled {
             }
             cx.notify();
         }
-        fn dictation_target(&self, origin: &Origin) -> Option<Entity<ChatView>> {
+        fn dictation_target(&self, origin: &Origin, cx: &App) -> Option<Destination> {
             // A closed pane can still be retained by docking or a queued event.
-            // Check membership as well as weak identity before touching its draft.
-            self.workspaces
+            // Also reject a restarted/replaced terminal within the same pane.
+            let pane = self
+                .workspaces
                 .iter()
-                .any(|state| {
-                    state
-                        .panes
-                        .values()
-                        .any(|pane| pane.entity_id() == origin.pane.entity_id())
-                })
-                .then(|| origin.view.upgrade())
-                .flatten()
+                .flat_map(|state| state.panes.values())
+                .find(|pane| pane.entity_id() == origin.pane.entity_id())?;
+            let matches = match (&origin.view, &pane.read(cx).content) {
+                (Destination::Chat(view), pane::PaneContent::Chat(current)) => {
+                    view.entity_id() == current.entity_id()
+                }
+                (Destination::Chat(view), pane::PaneContent::PreviewChat(current)) => {
+                    view.entity_id() == current.read(cx).dictation_view().entity_id()
+                }
+                (Destination::Terminal(view), pane::PaneContent::Terminal(current)) => {
+                    view.entity_id() == current.entity_id()
+                }
+                _ => false,
+            };
+            matches.then(|| origin.view.clone())
         }
         pub(crate) fn dictation_enabled(&self) -> bool {
             self.dictation.enabled
@@ -241,7 +286,16 @@ mod enabled {
     mod tests {
         use super::*;
         use gpui::{TestAppContext, VisualTestContext};
-        use std::cell::Cell;
+        use std::{cell::Cell, path::PathBuf};
+
+        impl Origin {
+            fn chat(&self) -> &gpui::WeakEntity<ChatView> {
+                let Destination::Chat(view) = &self.view else {
+                    panic!("expected chat origin")
+                };
+                view
+            }
+        }
 
         struct FakeEngine {
             starts: Rc<Cell<usize>>,
@@ -296,6 +350,209 @@ mod enabled {
                 (origin, job)
             })
         }
+        struct CapturedTerminal {
+            view: Entity<gitterm_terminal::TerminalView>,
+            received: PathBuf,
+            writes: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready() {
+                assert!(std::time::Instant::now() < deadline, "fixture PTY deadline");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        fn terminal_fixture(
+            shell: &Entity<Shell>,
+            root: &Path,
+            bracketed: bool,
+            cx: &mut VisualTestContext,
+        ) -> CapturedTerminal {
+            let received = root.join("received");
+            // An owned raw PTY captures bytes in a temp file; no shell commands,
+            // host startup scripts, microphone, or transcript files are involved.
+            let script = r#"import os, sys, tty
+tty.setraw(0)
+out = open(sys.argv[1], 'wb', buffering=0)
+os.write(1, (b'\x1b[?2004h' if sys.argv[2] == 'yes' else b'') + b'FIXTURE_READY')
+while True:
+    data = os.read(0, 4096)
+    if not data:
+        break
+    out.write(data)
+"#;
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let view = cx.new(|cx| {
+                let backend = gitterm_terminal::Backend::new(gitterm_terminal::BackendSettings {
+                    program: "/usr/bin/python3".into(),
+                    args: vec![
+                        "-u".into(),
+                        "-c".into(),
+                        script.into(),
+                        received.display().to_string(),
+                        if bracketed { "yes" } else { "no" }.into(),
+                    ],
+                    working_directory: Some(root.to_path_buf()),
+                    ..Default::default()
+                })
+                .unwrap();
+                let writes = writes.clone();
+                gitterm_terminal::TerminalView::new(backend, Default::default(), cx)
+                    .with_input_callback(move || {
+                        writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    })
+            });
+            wait_for(|| {
+                view.update(cx, |view, _| {
+                    view.backend_mut().sync();
+                    view.backend()
+                        .get_all_text()
+                        .is_some_and(|text| text.contains("FIXTURE_READY"))
+                })
+            });
+            shell.update_in(cx, |shell, window, cx| {
+                let id = SessionId(shell.active_workspace(cx).unwrap().0 * 10 + 2);
+                shell.select_session_id(id, window, cx);
+                let pane = shell.active(cx).panes[&session_pane_id(id)].clone();
+                pane.update(cx, |pane, _| {
+                    pane.content = pane::PaneContent::Terminal(view.clone())
+                });
+                view.read(cx).focus_handle().clone().focus(window, cx);
+            });
+            CapturedTerminal {
+                view,
+                received,
+                writes,
+            }
+        }
+        #[gpui::test]
+        fn focused_terminal_receives_iced_bytes_with_or_without_bracketed_paste(
+            cx: &mut TestAppContext,
+        ) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
+            let (root, shell, cx) = h6_tests::sample(cx);
+            for bracketed in [false, true] {
+                let capture = tempfile::tempdir_in(root.path()).unwrap();
+                let terminal = terminal_fixture(&shell, capture.path(), bracketed, cx);
+                let text = "  spoken café\r\nnext\n\x1b[201~  ";
+                let starts = install(&shell, Some(Ok(text.into())), cx);
+                cx.update(|_, cx| {
+                    if !chat::policy::is_live(cx) {
+                        let services = gitterm_core::preview::service::ServiceContext::production(
+                            &root.path().join("live"),
+                            "terminal-dictation-test",
+                        )
+                        .unwrap();
+                        chat::policy::install_live(services, cx).unwrap();
+                    }
+                });
+                shell.update_in(cx, |shell, window, cx| shell.toggle_dictation(window, cx));
+                assert_eq!(starts.get(), 1);
+                shell.update_in(cx, |shell, window, cx| shell.toggle_dictation(window, cx));
+                cx.run_until_parked();
+                wait_for(|| std::fs::read(&terminal.received).unwrap().len() >= text.len());
+                assert_eq!(std::fs::read(&terminal.received).unwrap(), text.as_bytes());
+                assert_eq!(terminal.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+            }
+        }
+        #[gpui::test]
+        fn terminal_focus_move_during_recording_keeps_origin(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
+            let (root, shell, cx) = h6_tests::sample(cx);
+            let terminal = terminal_fixture(&shell, root.path(), true, cx);
+            install(&shell, Some(Ok("spoken".into())), cx);
+            shell.update(cx, |shell, cx| {
+                let origin = shell.dictation_origin(cx);
+                assert!(shell.dictation.toggle(origin).unwrap().is_none());
+            });
+            shell.update_in(cx, |shell, window, cx| {
+                shell.select_workspace(1, window, cx)
+            });
+            let other_root = tempfile::tempdir_in(root.path()).unwrap();
+            let other = terminal_fixture(&shell, other_root.path(), true, cx);
+            let job = shell.update(cx, |shell, cx| {
+                let other = shell.dictation_origin(cx);
+                shell.dictation.toggle(other).unwrap().unwrap()
+            });
+            shell.update_in(cx, |shell, window, cx| {
+                shell.finish_dictation(job(), window, cx)
+            });
+            wait_for(|| std::fs::read(&terminal.received).unwrap() == b"spoken");
+            assert_eq!(other.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(std::fs::read(other.received).unwrap().is_empty());
+        }
+        #[gpui::test]
+        fn terminal_closed_mid_recording_does_not_write_elsewhere(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
+            let (root, shell, cx) = h6_tests::sample(cx);
+            let terminal = terminal_fixture(&shell, root.path(), true, cx);
+            install(&shell, Some(Ok("late".into())), cx);
+            let origin = shell.update(cx, |shell, cx| {
+                let origin = shell.dictation_origin(cx).unwrap();
+                assert!(
+                    shell
+                        .dictation
+                        .toggle(Some(origin.clone()))
+                        .unwrap()
+                        .is_none()
+                );
+                origin
+            });
+            // Retain both entities: membership must reject even a still-live pane.
+            let pane = origin.pane.upgrade().unwrap();
+            shell.update_in(cx, |shell, window, cx| {
+                let target = pane.read(cx).session.clone().unwrap();
+                shell.close_target(&target, window, cx);
+                assert!(shell.dictation_target(&origin, cx).is_none());
+                shell.select_workspace(1, window, cx);
+            });
+            let other_root = tempfile::tempdir_in(root.path()).unwrap();
+            let other = terminal_fixture(&shell, other_root.path(), false, cx);
+            let job = shell.update(cx, |shell, cx| {
+                let origin = shell.dictation_origin(cx);
+                shell.dictation.toggle(origin).unwrap().unwrap()
+            });
+            shell.update_in(cx, |shell, window, cx| {
+                shell.finish_dictation(job(), window, cx)
+            });
+            assert_eq!(terminal.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(other.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(std::fs::read(terminal.received).unwrap().is_empty());
+            assert!(std::fs::read(other.received).unwrap().is_empty());
+            drop((pane, terminal.view));
+        }
+        #[gpui::test]
+        fn terminal_dictation_respects_iced_capture_layers(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
+            let (root, shell, cx) = h6_tests::sample(cx);
+            let terminal = terminal_fixture(&shell, root.path(), false, cx);
+            install(&shell, Some(Ok("spoken".into())), cx);
+            let (_, job) = start_stop(&shell, cx);
+            shell.update_in(cx, |shell, window, cx| {
+                shell.open_task_switcher(window, cx);
+                assert!(shell.pty_blocked(cx));
+                shell.finish_dictation(job(), window, cx);
+            });
+            assert_eq!(terminal.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(std::fs::read(terminal.received).unwrap().is_empty());
+        }
+        #[gpui::test]
+        fn preview_dictation_refuses_before_capture(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
+            let (root, shell, cx) = h6_tests::sample(cx);
+            let terminal = terminal_fixture(&shell, root.path(), true, cx);
+            let starts = install(&shell, Some(Ok("never delivered".into())), cx);
+            shell.update_in(cx, |shell, window, cx| {
+                shell.toggle_dictation(window, cx);
+                assert!(matches!(shell.dictation.phase, Phase::Idle));
+                assert_eq!(
+                    shell.owner.read(cx).error.as_deref(),
+                    Some("Dictation is not available in preview")
+                );
+            });
+            assert_eq!(starts.get(), 0);
+            assert_eq!(terminal.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
         #[gpui::test]
         fn switched_or_closed_chat_cannot_redirect_a_transcript(cx: &mut TestAppContext) {
             let _test_app = crate::test_app::Cleanup::new(cx);
@@ -307,12 +564,12 @@ mod enabled {
             });
             cx.run_until_parked();
             let other = shell.update(cx, |shell, cx| shell.dictation_origin(cx).unwrap());
-            assert_ne!(origin.view.entity_id(), other.view.entity_id());
+            assert_ne!(origin.chat().entity_id(), other.chat().entity_id());
             let changed = Rc::new(RefCell::new(Vec::new()));
             let _observers = shell.update(cx, |_, cx| {
                 [
-                    origin.view.upgrade().unwrap(),
-                    other.view.upgrade().unwrap(),
+                    origin.chat().upgrade().unwrap(),
+                    other.chat().upgrade().unwrap(),
                 ]
                 .map(|view| {
                     let changed = changed.clone();
@@ -325,8 +582,8 @@ mod enabled {
                 shell.finish_dictation(job(), window, cx)
             });
             cx.run_until_parked();
-            assert!(changed.borrow().contains(&origin.view.entity_id()));
-            assert!(!changed.borrow().contains(&other.view.entity_id()));
+            assert!(changed.borrow().contains(&origin.chat().entity_id()));
+            assert!(!changed.borrow().contains(&other.chat().entity_id()));
 
             // Hold the original pane alive after removing it, as a queued event
             // or dock can. Completion must not update it or the replacement chat.
@@ -336,7 +593,7 @@ mod enabled {
             install(&shell, Some(Ok("late".into())), cx);
             let (origin, job) = start_stop(&shell, cx);
             let pane = origin.pane.upgrade().unwrap();
-            let closed_view = origin.view.upgrade().unwrap();
+            let closed_view = origin.chat().upgrade().unwrap();
             shell.update_in(cx, |shell, window, cx| {
                 // Sample chats have no runtime target until a host supplies one.
                 let target = sessions::fresh_target();
@@ -376,7 +633,7 @@ mod enabled {
                 let other = shell.dictation_origin(cx);
                 let job = shell.dictation.toggle(other).unwrap().unwrap();
                 let (target, _) = shell.dictation.finish(job()).unwrap().unwrap();
-                assert_eq!(target.view.entity_id(), origin.view.entity_id());
+                assert_eq!(target.chat().entity_id(), origin.chat().entity_id());
             });
         }
         #[gpui::test]
@@ -393,7 +650,7 @@ mod enabled {
                 assert!(shell.dictation.toggle(other).unwrap().is_none());
                 assert_eq!(starts.get(), 1);
                 let (target, _) = shell.dictation.finish(job()).unwrap().unwrap();
-                assert_eq!(target.view.entity_id(), origin.view.entity_id());
+                assert_eq!(target.chat().entity_id(), origin.chat().entity_id());
                 assert!(matches!(shell.dictation.phase, Phase::Idle));
             });
         }
@@ -445,6 +702,14 @@ mod enabled {
             let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             install(&shell, None, cx);
+            cx.update(|_, cx| {
+                let services = gitterm_core::preview::service::ServiceContext::production(
+                    &_root.path().join("live"),
+                    "dictation-test",
+                )
+                .unwrap();
+                chat::policy::install_live(services, cx).unwrap();
+            });
             let mic = |shell: &Entity<Shell>, cx: &VisualTestContext| {
                 cx.read(|cx| shell.read(cx).dictation_indicator(cx).unwrap())
             };

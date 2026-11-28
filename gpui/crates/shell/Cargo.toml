@@ -14,8 +14,6 @@ gitterm-core = { path = "../../../crates/gitterm-core", features = ["runtime", "
 gitterm-browser = { path = "../../../crates/gitterm-browser" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1", default-features = false }
-# The phone list request (`list_phones`); the same tonic core builds its client with.
-tonic = { version = "0.12", default-features = false }
 git2 = "0.19"
 gitterm-terminal = { path = "../terminal" }
 gitterm-gpui-review = { path = "../review" }
@@ -25,6 +23,8 @@ shell-words = "=1.1.1"
 gpui-kit = "=0.11.0"
 gpui-component = "=0.11.0"
 anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false }
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }

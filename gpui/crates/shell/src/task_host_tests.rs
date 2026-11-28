@@ -280,6 +280,89 @@ fn dechunk(mut body: &str) -> String {
     out
 }
 
+/// The native Live chat descriptor and CLI environment both come from the
+/// admitted production host. A browser write reaches MCP without launching
+/// Chrome (disconnecting an owner with no targets is a successful write).
+#[gpui::test]
+fn live_browser_chat_write_and_cli_descriptors_use_the_host_context(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        preview::service::ServiceContext,
+        task_commands::mcp_protocol::{BROWSER_MCP_TOKEN_ENV, BROWSER_MCP_URL_ENV},
+    };
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    let services = Arc::new(
+        ServiceContext::production(&fixture.iced, "fixture-live-browser")
+            .unwrap()
+            .for_gpui_live(),
+    );
+    let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+    let (config, _) = fixture.config();
+    let owner = cx
+        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .unwrap();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner.clone())));
+    let descriptors = owner.read_with(cx, |host, _| host.claude_mcp_servers("fixture-live-chat"));
+    let browser = &descriptors[1];
+    let env = |key: &str| {
+        browser
+            .env
+            .iter()
+            .find(|(name, _)| name == key)
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert!(env(BROWSER_MCP_URL_ENV).ends_with("?caller=fixture-live-chat"));
+    assert!(
+        !browser
+            .config
+            .to_string()
+            .contains(&env(BROWSER_MCP_TOKEN_ENV))
+    );
+    let client = McpClient::connect(&env(BROWSER_MCP_URL_ENV), &env(BROWSER_MCP_TOKEN_ENV));
+    let result = client.call("browser_disconnect", serde_json::json!({}));
+    assert_eq!(result["isError"], false, "{result}");
+    let status = client.call("browser_status", serde_json::json!({}));
+    assert_eq!(
+        status["structuredContent"]["profile_dir"],
+        fixture
+            .iced
+            .join("browser-profile")
+            .to_string_lossy()
+            .as_ref()
+    );
+    cx.update(|cx| {
+        let mut launch = gitterm_terminal::TerminalLaunch {
+            cwd: Some(fixture.iced.clone()),
+            startup_command: Some("claude --fixture".into()),
+            ..Default::default()
+        };
+        crate::browser::terminal_environment(&mut launch, "fixture-live-cli", cx);
+        assert!(
+            launch.env[BROWSER_MCP_URL_ENV]
+                .as_ref()
+                .unwrap()
+                .ends_with("?caller=fixture-live-cli")
+        );
+        assert_eq!(
+            launch.env[BROWSER_MCP_TOKEN_ENV].as_ref().unwrap(),
+            &env(BROWSER_MCP_TOKEN_ENV)
+        );
+        assert!(launch.startup_command.is_none());
+        assert!(
+            launch.env["GITTERM_STARTUP_CMD"]
+                .as_ref()
+                .unwrap()
+                .contains("gitterm_browser")
+        );
+        assert!(!launch.args.join(" ").contains(&env(BROWSER_MCP_TOKEN_ENV)));
+    });
+    owner.update(cx, |host, _| host.shutdown());
+    assert!(!fixture.iced.join("browser-profile").exists());
+}
+
 /// H5b B7: the host's browser server, reached as a chat reaches it (its
 /// descriptor's caller URL and token), serves reads and refuses launches in
 /// its dispatch; its profile is the preview root's.
@@ -3026,6 +3109,8 @@ mod live_writes {
         fixture: &Fixture,
         cx: &mut TestAppContext,
     ) -> (Entity<TaskHostOwner>, TaskControlSender) {
+        // The shared terminal adapter reads the application's component theme.
+        cx.update(gpui_component::init);
         let (config, sender) = fixture.config();
         let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
         let services = Arc::new(
@@ -3532,10 +3617,10 @@ mod live_writes {
     }
 
     #[gpui::test]
-    fn only_task_writes_open(cx: &mut TestAppContext) {
+    fn live_writes_keep_caller_and_runner_guards(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_core::preview::service::RunnerEffect;
-        if child("only_task_writes_open") {
+        if child("live_writes_keep_caller_and_runner_guards") {
             return;
         }
         cx.background_executor.allow_parking();
@@ -3550,10 +3635,9 @@ mod live_writes {
                 &sender,
                 TaskControlOperation::MergePlanSet(req(json!({"entries": []})))
             ),
-            // Go-live 13 opens merge plans in Live: the write reaches its
-            // handler, which refuses a caller with no GitTerm tab on this Mac.
             Err("merge_plan_set: no GitTerm tab on this Mac has session caller; merge plans are for this Mac's chats".into())
         );
+        assert!(!gitterm_core::merge_plan::plans_dir(&fixture.iced).exists());
         owner.read_with(cx, |owner, _| {
             for effect in [RunnerEffect::RestoreSession, RunnerEffect::NotifyIngress] {
                 assert!(owner.host().services().runner(effect, None).is_err());
@@ -3601,6 +3685,8 @@ mod live_writes {
     include!("task_host_live_worker_tests.rs");
     include!("task_host_live_delivery_tests.rs");
     include!("task_host_live_terminal_tests.rs");
+    include!("sidebar_resume_tests.rs");
+    include!("task_panel_live_tests.rs");
     include!("remote_terminal_tests.rs");
 }
 

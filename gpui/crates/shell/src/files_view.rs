@@ -1,7 +1,7 @@
 //! Iced's flat directory browser; filesystem work stays with WorkspaceOwner.
 use crate::{
     WorkspaceOwner,
-    data::{FileNode, ShellData, WorkspaceId},
+    data::{FileNode, SessionId, ShellData, WorkspaceId},
     files::{Entry, Row},
     theme::{LABEL_FONT, LABEL_LINE_HEIGHT, Palette},
 };
@@ -10,11 +10,22 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
+pub(crate) struct FileViewerClosed(pub WorkspaceId);
+impl EventEmitter<FileViewerClosed> for WorkspaceOwner {}
+
 #[derive(Clone)]
 enum EntryAction {
     Directory(PathBuf),
     Open(PathBuf),
 }
+#[derive(Clone)]
+struct Navigation {
+    directory: PathBuf,
+    source_root: PathBuf,
+    browsing_root: Option<PathBuf>,
+    selected_file: Option<PathBuf>,
+}
+
 pub(crate) struct FilesView {
     owner: Option<Entity<WorkspaceOwner>>,
     workspace: WorkspaceId,
@@ -26,10 +37,17 @@ pub(crate) struct FilesView {
     source_root: PathBuf,
     selected_file: Option<PathBuf>,
     samples: Vec<FileNode>,
+    session: Option<SessionId>,
+    navigation: HashMap<Option<SessionId>, Navigation>,
+    chat_observers: HashMap<EntityId, Subscription>,
 }
 #[cfg(test)]
 impl EventEmitter<crate::content::actions::OpenEditor> for FilesView {}
 impl FilesView {
+    #[cfg(test)]
+    pub(crate) fn selected_file(&self) -> Option<&std::path::Path> {
+        self.selected_file.as_deref()
+    }
     pub(crate) fn new(
         workspace: WorkspaceId,
         data: Rc<dyn ShellData>,
@@ -75,6 +93,9 @@ impl FilesView {
             directory,
             selected_file: None,
             samples: vec![],
+            session: None,
+            navigation: HashMap::new(),
+            chat_observers: HashMap::new(),
         };
         if let Some(owner) = this.owner.clone() {
             cx.observe(&owner, |this, _, cx| this.sync(cx)).detach();
@@ -85,7 +106,29 @@ impl FilesView {
                 }
             })
             .detach();
-            this.sync(cx);
+            cx.subscribe(&owner, |this, _, event: &FileViewerClosed, cx| {
+                if event.0 == this.workspace {
+                    this.selected_file = None;
+                    cx.notify();
+                }
+            })
+            .detach();
+            let show_hidden = owner
+                .read(cx)
+                .iced_catalog()
+                .map(|catalog| {
+                    crate::workspace_config::load_iced_settings_from(&catalog.source).show_hidden
+                })
+                .unwrap_or(true);
+            owner.update(cx, |owner, _| {
+                owner
+                    .files
+                    .entry(workspace)
+                    .or_default()
+                    .set_show_hidden(show_hidden)
+            });
+            // Replace any startup listing requested before the saved setting was read.
+            this.navigate(this.directory.clone(), cx);
         } else {
             this.samples = data.files(workspace, cx);
             this.sync(cx);
@@ -95,21 +138,130 @@ impl FilesView {
     fn browse_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.browsing_root = Some(root.clone());
         self.source_root = root.clone();
+        if let Some(owner) = &self.owner {
+            owner.update(cx, |owner, cx| {
+                if let Some(tab) = self
+                    .session
+                    .and_then(|id| owner.model.session_contexts.get_mut(&id))
+                {
+                    tab.panel_repo = Some(root.clone());
+                    let root = tab.panel_root();
+                    owner.dispatch(
+                        crate::workspace_status::Intent::ContextChanged {
+                            workspace: self.workspace,
+                            root,
+                        },
+                        std::time::Instant::now(),
+                        cx,
+                    );
+                }
+            });
+        }
         self.navigate(root, cx);
     }
     fn navigate(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
         self.directory = directory.clone();
         if let Some(owner) = &self.owner {
-            owner.update(cx, |owner, cx| {
+            let changed = owner.update(cx, |owner, cx| {
+                let mut changed = false;
+                if let Some(tab) = self
+                    .session
+                    .and_then(|id| owner.model.session_contexts.get_mut(&id))
+                    && tab.task_root.is_none()
+                    && !tab
+                        .panel_repo
+                        .as_ref()
+                        .is_some_and(|root| directory.starts_with(root))
+                    && !tab
+                        .follow
+                        .panel_root()
+                        .is_some_and(|root| directory.starts_with(root))
+                {
+                    changed = tab.cwd != directory;
+                    tab.cwd = directory.clone();
+                }
                 owner
                     .files
                     .entry(self.workspace)
                     .or_default()
                     .set_root(directory.clone());
-                owner.toggle_directory(self.workspace, directory, cx);
+                owner.toggle_directory(self.workspace, directory.clone(), cx);
+                changed
             });
+            if changed {
+                self.persist_directory(directory, cx);
+            }
         }
         self.sync(cx);
+    }
+    fn persist_directory(&self, directory: PathBuf, cx: &mut Context<Self>) {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|store| store.0.clone())
+        else {
+            return;
+        };
+        let Some(owner) = self.owner.clone() else {
+            return;
+        };
+        let Some((key, tab, index)) = self.session.and_then(|id| {
+            let owner = owner.read(cx);
+            let saved = owner.iced_workspace(self.workspace)?;
+            let index = owner
+                .iced_sessions(saved)
+                .iter()
+                .position(|session| session.id == id)?;
+            Some((
+                gitterm_core::park::Key {
+                    name: saved.name.clone(),
+                    dir: saved.dir.clone(),
+                },
+                saved.tabs.get(index)?.clone(),
+                index,
+            ))
+        }) else {
+            return;
+        };
+        let root = store.root().to_path_buf();
+        let save = store.try_edit_workspaces(move |file| {
+            let mut matches = file
+                .workspaces
+                .iter_mut()
+                .filter(|saved| key.matches(saved));
+            let workspace = matches
+                .next()
+                .ok_or("Browse directory: workspace is no longer saved")?;
+            if matches.next().is_some() {
+                return Err("Browse directory: workspace identity is ambiguous".into());
+            }
+            let saved = if let Some(uid) = &tab.session_uid {
+                workspace
+                    .tabs
+                    .iter_mut()
+                    .find(|saved| saved.session_uid.as_ref() == Some(uid))
+            } else {
+                workspace.tabs.get_mut(index).filter(|saved| {
+                    saved.dir == tab.dir
+                        && saved.repo_dir == tab.repo_dir
+                        && saved.chat_session_id == tab.chat_session_id
+                })
+            }
+            .ok_or("Browse directory: session is no longer saved")?;
+            saved.dir = directory.to_string_lossy().into_owned();
+            Ok(())
+        });
+        let work = cx.background_executor().spawn(async move { save.wait() });
+        cx.spawn(async move |_, cx| {
+            let saved = work.await;
+            owner.update(cx, |owner, cx| match saved {
+                Ok(file) => owner.apply_desktop_document(&root, file, cx),
+                Err(error) => {
+                    owner.error = Some(format!("Save session directory: {error}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
     fn parent(&self) -> Option<PathBuf> {
         self.directory
@@ -118,8 +270,66 @@ impl FilesView {
             .map(|parent| parent.to_path_buf())
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_worktree_chats(cx);
         self.actions.clear();
         if let Some(owner) = self.owner.clone() {
+            let (session, root, initial, overridden) = {
+                let owner = owner.read(cx);
+                let session = owner.model.active_sessions.get(&self.workspace).copied();
+                let tab = session.and_then(|id| owner.model.session_contexts.get(&id));
+                (
+                    session,
+                    tab.map(|tab| tab.panel_root()),
+                    tab.map(|tab| tab.cwd.clone()),
+                    tab.is_some_and(|tab| {
+                        tab.task_root.is_some()
+                            || tab.panel_repo.is_some()
+                            || tab.follow.panel_root().is_some()
+                    }),
+                )
+            };
+            if session != self.session {
+                self.navigation.insert(
+                    self.session,
+                    Navigation {
+                        directory: self.directory.clone(),
+                        source_root: self.source_root.clone(),
+                        browsing_root: self.browsing_root.clone(),
+                        selected_file: self.selected_file.clone(),
+                    },
+                );
+                self.session = session;
+                if let Some(nav) = self.navigation.get(&session) {
+                    self.directory = nav.directory.clone();
+                    self.source_root = nav.source_root.clone();
+                    self.browsing_root = nav.browsing_root.clone();
+                    self.selected_file = nav.selected_file.clone();
+                } else {
+                    self.directory = if overridden { root.clone() } else { initial }
+                        .unwrap_or_else(|| self.directory.clone());
+                    self.source_root = root.clone().unwrap_or_else(|| self.source_root.clone());
+                    self.browsing_root = None;
+                    self.selected_file = None;
+                }
+            }
+            if let Some(root) = root
+                && root != self.source_root
+            {
+                if !self.directory.starts_with(&root)
+                    || self.directory.starts_with(&self.source_root)
+                {
+                    self.directory = root.clone();
+                }
+                self.source_root = root;
+                self.browsing_root = None;
+            }
+            if overridden {
+                self.browsing_root = Some(self.source_root.clone());
+            }
+            if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
+                self.roots = gitterm_core::work::catalog::is_work(&saved.chats, false)
+                    .then(|| work_roots(&saved.repos, PathBuf::from(&saved.dir).join("docs")));
+            }
             if owner
                 .read(cx)
                 .files
@@ -202,6 +412,46 @@ impl FilesView {
             }
         }
         cx.notify();
+    }
+    fn sync_worktree_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.clone() else {
+            return;
+        };
+        let chats: Vec<_> = owner.read(cx).chats.values().cloned().collect();
+        self.chat_observers
+            .retain(|id, _| chats.iter().any(|chat| chat.entity_id() == *id));
+        for chat in chats {
+            self.chat_observers
+                .entry(chat.entity_id())
+                .or_insert_with(|| {
+                    cx.observe(&chat, |this, chat, cx| this.observe_worktree_chat(chat, cx))
+                });
+            // Also catch events received before mounting, or before the tab's
+            // context was installed. The owner consumes each tab's events once.
+            self.observe_worktree_chat(chat, cx);
+        }
+    }
+
+    fn observe_worktree_chat(&self, chat: Entity<crate::chat::ChatPane>, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.clone() else {
+            return;
+        };
+        let Some((workspace, session)) = chat.read(cx).tab_context() else {
+            return;
+        };
+        if workspace != self.workspace {
+            return;
+        }
+        chat.update(cx, |chat, cx| {
+            owner.update(cx, |owner, cx| {
+                owner.observe_session_worktree_events(
+                    self.workspace,
+                    session,
+                    chat.conversation_events(),
+                    cx,
+                )
+            });
+        });
     }
     fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
         match self.actions.get(id).cloned() {
@@ -505,9 +755,8 @@ impl crate::Shell {
     pub(crate) fn files_sidebar(
         &self,
         sidebar: gpui::Stateful<gpui::Div>,
-        cx: &Context<Self>,
+        state: &crate::WorkspaceDock,
     ) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
         sidebar.child(
             div().flex_1().min_h_0().child(
                 state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone(),

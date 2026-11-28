@@ -15,3 +15,5 @@ pub mod pr_live;
 pub mod pr_discovery;
 
 pub mod pr_created;
+
+pub mod worktrees;

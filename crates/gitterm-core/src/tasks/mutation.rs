@@ -176,6 +176,99 @@ impl TaskAuthority {
                 validate_task_transition(task, &archived)?;
                 Ok(Effect::ArchiveTask { task_id })
             }
+            TaskMutation::Stop { task_id } => {
+                self.task(&task_id)?;
+                let mut targets = Vec::new();
+                for state in &facts.sessions {
+                    if state.target.task_id.as_deref() == Some(&task_id)
+                        && !targets.contains(&state.target)
+                    {
+                        targets.push(state.target.clone());
+                    }
+                }
+                Ok(Effect::StopTask { task_id, targets })
+            }
+            TaskMutation::CancelQueue { task_id } => {
+                self.task(&task_id)?;
+                Ok(Effect::CancelQueue { task_id })
+            }
+            TaskMutation::ResumeConversation {
+                task_id,
+                chat_id,
+                timestamp,
+            } => {
+                let task = self.task(&task_id)?;
+                let mut session = task
+                    .sessions
+                    .iter()
+                    .rev()
+                    .find(|s| {
+                        s.conversation
+                            .as_ref()
+                            .is_some_and(|c| c.session_id == chat_id)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("Task {} no longer links conversation {chat_id}", task.title)
+                    })?;
+                if facts.sessions.iter().any(|s| {
+                    s.target.task_id.as_deref() == Some(&task_id)
+                        && self.store.as_ref().is_some_and(|store| {
+                            store.worker_session_is_final(
+                                &task_id,
+                                s.target.task_session_id.as_deref(),
+                            )
+                        })
+                        && s.target.task_session_id.as_deref() == Some(&session.task_session_id)
+                }) {
+                    return Err("This finished worker is closing. Reopen its conversation after its tab closes.".into());
+                }
+                // Iced unlinks a preassigned Claude ID that never got a message.
+                if facts.phantom_conversations.contains(&chat_id) {
+                    session.conversation = None;
+                } else {
+                    let path =
+                        task.worktree.path.as_ref().ok_or_else(|| {
+                            format!("Task {} has no prepared worktree", task.title)
+                        })?;
+                    if !facts.directories.contains(path) {
+                        return Err(format!(
+                            "Task {} worktree is gone at {}",
+                            task.title,
+                            path.display()
+                        ));
+                    }
+                    if let Some(entry) = facts.conversations.iter().find(|c| c.chat_id == chat_id) {
+                        if entry.remote {
+                            return Err("Remote task conversation resume requires the remote-executor slice".into());
+                        }
+                        if entry.cwd != *path {
+                            return Err(format!("Refusing to resume conversation {chat_id}: its recorded directory {} does not match task worktree {}", entry.cwd.display(), path.display()));
+                        }
+                    }
+                    if !matches!(
+                        task.workspace.location,
+                        WorkspaceLocationIdentity::Local { .. }
+                    ) {
+                        return Err(
+                            "Remote task conversation resume requires the remote-executor slice"
+                                .into(),
+                        );
+                    }
+                    if self.store.as_ref().is_some_and(|store| {
+                        store.worker_session_is_final(&task_id, Some(&session.task_session_id))
+                    }) {
+                        session.task_session_id = uuid::Uuid::new_v4().to_string();
+                        session.launch_identity = None;
+                        session.created_at = timestamp.clone();
+                    }
+                }
+                session.updated_at = timestamp;
+                Ok(Effect::ResumeConversation {
+                    task_id,
+                    session: Box::new(session),
+                })
+            }
             TaskMutation::CloseSession { target, confirmed } => Ok(facts
                 .sessions
                 .iter()
@@ -813,6 +906,114 @@ mod tests {
             ..Default::default()
         };
         (dir, Some(store).into(), facts)
+    }
+
+    #[test]
+    fn panel_stop_and_cancel_use_authority_and_capture_every_session_once() {
+        let (_dir, mut state, mut facts) = fixture();
+        let target = session::Target {
+            tab_id: 1,
+            session_uid: "placeholder".into(),
+            task_id: Some("fixture-task".into()),
+            task_session_id: Some("session".into()),
+        };
+        let own = session::State {
+            target: target.clone(),
+            control: session::TurnControl::Terminal,
+            task_live: true,
+            last_tab: false,
+        };
+        facts.sessions = vec![own.clone(), own];
+        let TaskMutationAction::StopTask { targets, .. } = decide(
+            &mut state,
+            TaskMutation::Stop {
+                task_id: "fixture-task".into(),
+            },
+            &facts,
+        )
+        .unwrap() else {
+            panic!("stop effect")
+        };
+        assert_eq!(targets, [target]);
+        assert!(matches!(
+            decide(
+                &mut state,
+                TaskMutation::CancelQueue {
+                    task_id: "fixture-task".into()
+                },
+                &facts
+            )
+            .unwrap(),
+            TaskMutationAction::CancelQueue { .. }
+        ));
+        assert!(decide(
+            &mut state,
+            TaskMutation::Stop {
+                task_id: "gone".into()
+            },
+            &facts
+        )
+        .unwrap_err()
+        .contains("not available"));
+    }
+
+    #[test]
+    fn panel_resume_preserves_link_and_worktree_guards_and_phantom_unlink() {
+        let (_dir, mut state, mut facts) = fixture();
+        let mut task = state.task("fixture-task").unwrap().clone();
+        let session: TaskSessionRecord = serde_json::from_value(serde_json::json!({
+            "task_session_id":"placeholder-session", "label":"Placeholder", "created_at":"t1", "updated_at":"t1",
+            "conversation":{"backend":"codex", "session_id":"placeholder-chat"}
+        })).unwrap();
+        task.sessions.push(session);
+        state.store_mut().as_mut().unwrap().replace(task).unwrap();
+        let resume = || TaskMutation::ResumeConversation {
+            task_id: "fixture-task".into(),
+            chat_id: "placeholder-chat".into(),
+            timestamp: "t3".into(),
+        };
+        let TaskMutationAction::ResumeConversation { session, .. } =
+            decide(&mut state, resume(), &facts).unwrap()
+        else {
+            panic!("resume effect")
+        };
+        assert_eq!(session.task_session_id, "placeholder-session");
+        assert_eq!(session.updated_at, "t3");
+        facts.conversations.push(TaskConversationFact {
+            chat_id: "placeholder-chat".into(),
+            cwd: "/tmp/wrong".into(),
+            remote: true,
+        });
+        assert!(decide(&mut state, resume(), &facts)
+            .unwrap_err()
+            .contains("Remote task conversation"));
+        facts.conversations[0].remote = false;
+        assert!(decide(&mut state, resume(), &facts)
+            .unwrap_err()
+            .contains("does not match task worktree"));
+        facts.conversations.clear();
+        facts.directories.clear();
+        assert!(decide(&mut state, resume(), &facts)
+            .unwrap_err()
+            .contains("worktree is gone"));
+        facts.phantom_conversations.push("placeholder-chat".into());
+        let TaskMutationAction::ResumeConversation { session, .. } =
+            decide(&mut state, resume(), &facts).unwrap()
+        else {
+            panic!("unlink effect")
+        };
+        assert!(session.conversation.is_none());
+        assert!(decide(
+            &mut state,
+            TaskMutation::ResumeConversation {
+                task_id: "fixture-task".into(),
+                chat_id: "unlinked".into(),
+                timestamp: "t3".into()
+            },
+            &facts
+        )
+        .unwrap_err()
+        .contains("no longer links"));
     }
 
     fn expected(state: &TaskAuthority) -> CompletedWorktreePreparation {

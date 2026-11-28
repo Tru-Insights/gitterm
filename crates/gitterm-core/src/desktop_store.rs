@@ -24,6 +24,9 @@ pub struct FileState<T> {
     pub loaded: LoadState<T>,
     pub dirty: bool,
     pub error: Option<String>,
+    // Opaque settings fields newer desktops understand. They are part of the
+    // persisted document, including across a failed save and retry.
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,8 +132,26 @@ impl DesktopStore {
         Receipt(receiver)
     }
 
+    /// Shared routing owner writes through the same serialized V6 store.
+    pub fn save_plan_limits(&self, file: crate::plan_limits::PlanLimitsFile) -> Receipt<()> {
+        self.submit(move |_, root| {
+            let path = crate::plan_limits::PlanLimitsFile::path_in(root);
+            write_plan_limits(&path, &file)
+        })
+    }
+
     pub fn snapshot(&self) -> Receipt<Snapshot> {
         self.submit(|state, _| Ok(state.clone()))
+    }
+
+    /// Local Work controls share the desktop writer queue. The PR owner holds
+    /// its poll lock until this receipt completes, then reloads its projection.
+    pub fn pr_control(
+        &self,
+        control: crate::work::pr_actions::LocalControl,
+        at: String,
+    ) -> Receipt<()> {
+        self.submit(move |_, root| control.save(root, &at))
     }
 
     /// A Missing file gains defaults only through an explicit mutation. A
@@ -185,10 +206,132 @@ impl DesktopStore {
                 loaded: LoadState::Valid(candidate),
                 dirty: true,
                 error: None,
+                unknown: Default::default(),
             };
-            save(&mut pending, &root.join("workspaces.json"))?;
+            let path = root.join("workspaces.json");
+            if matches!(&state.workspaces.loaded, LoadState::Valid(_)) {
+                let original =
+                    std::fs::read(&path).map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let raw: serde_json::Value = serde_json::from_slice(&original)
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let decoded: WorkspacesFile = serde_json::from_value(raw.clone())
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let known = serde_json::to_value(decoded)
+                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                let LoadState::Valid(candidate) = &pending.loaded else {
+                    unreachable!()
+                };
+                let typed = serde_json::to_value(candidate)
+                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                let mut next = typed.clone();
+                preserve_workspace_unknown(&raw, &known, &mut next);
+                if next == typed {
+                    // Nothing unknown to keep: the typed writer keeps Iced's
+                    // field order (a JSON value would sort the keys).
+                    save(&mut pending, &path)?;
+                } else {
+                    let bytes = serde_json::to_vec_pretty(&next)
+                        .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                    crate::atomic_file::write_atomically(&path, &bytes)?;
+                    pending.dirty = false;
+                }
+            } else {
+                save(&mut pending, &path)?;
+            }
             state.workspaces = pending;
             Ok(result)
+        })
+    }
+
+    /// Sheet writes share the serialized V6 owner, including guidelines' sidecar.
+    pub fn edit_workspace_settings(
+        &self,
+        target: crate::workspace_config::WorkspaceTarget,
+        edit: crate::workspace_settings::Edit,
+    ) -> Receipt<WorkspacesFile> {
+        use crate::workspace_settings::Edit;
+        if matches!(
+            edit,
+            Edit::GuidelinesEnabled(_) | Edit::GuidelinesRepo { .. }
+        ) {
+            return self.submit(move |state, root| {
+                let file = match &state.workspaces.loaded {
+                    LoadState::Valid(file) => file,
+                    LoadState::Refused(error) => return Err(error.clone()),
+                    LoadState::Missing => return Err("Workspace is no longer open".into()),
+                };
+                target.index(file)?;
+                let path = root.join(crate::guidelines::SETTINGS_FILE);
+                let previous = match std::fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match std::fs::symlink_metadata(&path) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => None,
+                            _ => return Err(format!("cannot read {}: {error}", path.display())),
+                        }
+                    }
+                    Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+                };
+                let mut wire: serde_json::Value = match &previous {
+                    Some(bytes) => serde_json::from_slice(bytes)
+                        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?,
+                    None => serde_json::json!({}),
+                };
+                if !wire.is_object() {
+                    return Err(format!(
+                        "cannot parse {}: expected an object",
+                        path.display()
+                    ));
+                }
+                let mut settings: crate::guidelines::GuidelinesSettings =
+                    serde_json::from_value(wire.clone())
+                        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+                match edit {
+                    Edit::GuidelinesEnabled(on) => settings.enabled = on,
+                    Edit::GuidelinesRepo { repo, enabled } => {
+                        settings.set_repo_off(&repo, !enabled)
+                    }
+                    _ => unreachable!(),
+                }
+                // Iced's two fields, keeping fields belonging to newer desktops.
+                wire["enabled"] = settings.enabled.into();
+                wire["off_repos"] =
+                    serde_json::to_value(settings.off_repos).map_err(|e| e.to_string())?;
+                if previous.as_ref().is_none_or(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(bytes)
+                        .ok()
+                        .as_ref()
+                        != Some(&wire)
+                }) {
+                    let bytes = serde_json::to_vec_pretty(&wire).map_err(|e| e.to_string())?;
+                    crate::atomic_file::write_atomically(&path, &bytes)?;
+                }
+                Ok(file.clone())
+            });
+        }
+        let root = self.root().to_path_buf();
+        self.try_edit_workspaces(move |file| {
+            let index = target.index(file)?;
+            match edit {
+                Edit::Env(edit) => file.edit_workspace_env(&target, edit)?,
+                Edit::Profile(name) => {
+                    // Like Iced, a profile that vanished between render and click is a no-op.
+                    if let Some(profile) = crate::workspace_settings::load_profiles(&root)
+                        .and_then(|mut profiles| profiles.remove(&name))
+                    {
+                        file.edit_workspace_env(
+                            &target,
+                            crate::workspace_settings::EnvEdit::Profile(profile),
+                        )?;
+                    }
+                }
+                Edit::GuidelinesWorkspace(on) => file.workspaces[index].guidelines_off = !on,
+                Edit::Chrome(on) => file.workspaces[index].claude_in_chrome = on,
+                Edit::Decisions(dir) => file.workspaces[index].decisions_repo = dir,
+                Edit::Color(color) => file.workspaces[index].color = color,
+                _ => unreachable!(),
+            }
+            Ok(())
         })
     }
 
@@ -204,7 +347,7 @@ impl DesktopStore {
                     settings.task_worktree_root.0 = None;
                 }
             }
-            save(&mut state.settings, &root.join("settings.json"))
+            save_settings(&mut state.settings, &root.join("settings.json"))
         })
     }
 
@@ -213,14 +356,14 @@ impl DesktopStore {
     }
 
     pub fn save_settings(&self) -> Receipt<()> {
-        self.submit(|state, root| save(&mut state.settings, &root.join("settings.json")))
+        self.submit(|state, root| save_settings(&mut state.settings, &root.join("settings.json")))
     }
 
     pub fn drain(&self) -> Receipt<()> {
         self.submit(|state, root| {
             // Try both files even if one writer is blocked.
             let workspaces = save(&mut state.workspaces, &root.join("workspaces.json"));
-            let settings = save(&mut state.settings, &root.join("settings.json"));
+            let settings = save_settings(&mut state.settings, &root.join("settings.json"));
             let errors: Vec<_> = [workspaces, settings]
                 .into_iter()
                 .filter_map(Result::err)
@@ -231,6 +374,188 @@ impl DesktopStore {
                 Err(errors.join("; "))
             }
         })
+    }
+}
+
+/// Retain newer fields while using Iced's exact known-field serialization.
+fn write_plan_limits(path: &Path, file: &crate::plan_limits::PlanLimitsFile) -> Result<(), String> {
+    let mut original: serde_json::Value = match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    // Validate before mutating; never turn a malformed file into defaults.
+    let previous: crate::plan_limits::PlanLimitsFile = serde_json::from_value(original.clone())
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let known = serde_json::to_value(previous).map_err(|e| e.to_string())?;
+    let next = serde_json::to_value(file).map_err(|e| e.to_string())?;
+    let object = original
+        .as_object_mut()
+        .ok_or("plan-limits must be an object")?;
+    for key in [
+        "claude",
+        "codex",
+        "pin",
+        "policy",
+        "history",
+        "usage_badge",
+        "pending_notices",
+    ] {
+        let old = object.remove(key);
+        if let Some(value) = next.get(key) {
+            let mut value = value.clone();
+            if let (Some(old), Some(known)) = (old.as_ref(), known.get(key)) {
+                keep_unknown_fields(old, known, &mut value);
+            }
+            object.insert(key.into(), value);
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&original).map_err(|e| e.to_string())?;
+    crate::atomic_file::write_atomically(path, &bytes)
+}
+
+fn keep_unknown_fields(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    use serde_json::Value;
+    match (raw, known, next) {
+        (Value::Object(raw), Value::Object(known), Value::Object(next)) => {
+            for (key, value) in raw {
+                if let Some(previous) = known.get(key) {
+                    if let Some(next) = next.get_mut(key) {
+                        keep_unknown_fields(value, previous, next);
+                    }
+                } else {
+                    next.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        (Value::Array(raw), Value::Array(known), Value::Array(next)) => {
+            for next in next {
+                let previous = known.iter().position(|previous| {
+                    previous == next
+                        || (["provider", "label", "observed_at"]
+                            .iter()
+                            .any(|key| previous.get(key).is_some())
+                            && ["provider", "label", "resets_at", "observed_at"]
+                                .iter()
+                                .all(|key| previous.get(key) == next.get(key)))
+                });
+                if let Some(index) = previous {
+                    if let Some(raw) = raw.get(index) {
+                        keep_unknown_fields(raw, &known[index], next);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+// Reinsert fields this version cannot deserialize, including a moved tab's
+// nested provider config. Known fields always come from the candidate.
+fn preserve_unknown(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    match (raw, known, next) {
+        (
+            serde_json::Value::Object(raw),
+            serde_json::Value::Object(known),
+            serde_json::Value::Object(next),
+        ) => {
+            for (key, value) in raw {
+                if let Some(before) = known.get(key) {
+                    if let Some(after) = next.get_mut(key) {
+                        preserve_unknown(value, before, after);
+                    }
+                } else {
+                    next.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        (
+            serde_json::Value::Array(raw),
+            serde_json::Value::Array(known),
+            serde_json::Value::Array(next),
+        ) => {
+            for after in next {
+                if let Some(index) = known.iter().position(|before| before == after) {
+                    if let Some(original) = raw.get(index) {
+                        preserve_unknown(original, &known[index], after);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+fn preserve_workspace_unknown(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    preserve_unknown(raw, known, next);
+    for section in ["workspaces", "repos"] {
+        let Some(before) = known[section].as_array() else {
+            continue;
+        };
+        let Some(after) = next[section].as_array_mut() else {
+            continue;
+        };
+        for entry in after {
+            let matches: Vec<_> = before
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    b["dir"] == entry["dir"]
+                        && b["location"] == entry["location"]
+                        && (section != "workspaces" || b["name"] == entry["name"])
+                })
+                .collect();
+            if let [(index, before)] = matches.as_slice() {
+                preserve_unknown(&raw[section][*index], before, entry);
+            }
+        }
+    }
+    // A coordinator and its shown child can cross workspace/tab arrays.
+    let before: Vec<_> = known["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(w, workspace)| {
+            workspace["tabs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(move |(t, tab)| (w, t, tab))
+        })
+        .collect();
+    for workspace in next["workspaces"].as_array_mut().into_iter().flatten() {
+        for tab in workspace["tabs"].as_array_mut().into_iter().flatten() {
+            let identity = if tab["session_uid"].is_string() {
+                "session_uid"
+            } else {
+                "chat_session_id"
+            };
+            if !tab[identity].is_string() {
+                continue;
+            }
+            let matches: Vec<_> = before
+                .iter()
+                .filter(|(_, _, b)| b[identity] == tab[identity])
+                .collect();
+            if let [(w, t, before)] = matches.as_slice() {
+                preserve_unknown(&raw["workspaces"][*w]["tabs"][*t], before, tab);
+            }
+        }
     }
 }
 
@@ -255,10 +580,17 @@ impl Drop for Claim {
     }
 }
 
-fn load<T: DeserializeOwned>(path: &Path) -> FileState<T> {
+fn load<T: DeserializeOwned + Serialize>(path: &Path) -> FileState<T> {
+    let mut unknown = serde_json::Map::new();
     let loaded = match std::fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(document) => LoadState::Valid(document),
+        Ok(bytes) => match decode_document(
+            &bytes,
+            path.file_name().is_some_and(|name| name == "settings.json"),
+        ) {
+            Ok((document, fields)) => {
+                unknown = fields;
+                LoadState::Valid(document)
+            }
             Err(error) => LoadState::Refused(format!("parse {}: {error}", path.display())),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -279,6 +611,63 @@ fn load<T: DeserializeOwned>(path: &Path) -> FileState<T> {
         loaded,
         dirty: false,
         error,
+        unknown,
+    }
+}
+
+// Preserve unknown settings without changing Iced's typed serialization for
+// documents that contain only the known schema.
+fn decode_document<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    preserve_unknown: bool,
+) -> Result<(T, serde_json::Map<String, serde_json::Value>), serde_json::Error> {
+    let document: T = serde_json::from_slice(bytes)?;
+    let unknown = if preserve_unknown {
+        unknown_fields(
+            &serde_json::from_slice(bytes)?,
+            &serde_json::to_value(&document)?,
+        )
+    } else {
+        serde_json::Map::new()
+    };
+    Ok((document, unknown))
+}
+fn unknown_fields(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut fields = serde_json::Map::new();
+    if let (Some(raw), Some(known)) = (raw.as_object(), known.as_object()) {
+        for (key, value) in raw {
+            match known.get(key) {
+                None => {
+                    fields.insert(key.clone(), value.clone());
+                }
+                Some(known) => {
+                    let nested = unknown_fields(value, known);
+                    if !nested.is_empty() {
+                        fields.insert(key.clone(), serde_json::Value::Object(nested));
+                    }
+                }
+            }
+        }
+    }
+    fields
+}
+fn merge_unknown(
+    value: &mut serde_json::Value,
+    unknown: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(object) = value.as_object_mut() {
+        for (key, extra) in unknown {
+            if let Some(current) = object.get_mut(key) {
+                if let Some(extra) = extra.as_object() {
+                    merge_unknown(current, extra);
+                }
+            } else {
+                object.insert(key.clone(), extra.clone());
+            }
+        }
     }
 }
 
@@ -297,7 +686,32 @@ fn mutate<T: Default>(state: &mut FileState<T>, edit: impl FnOnce(&mut T)) -> Re
     Ok(())
 }
 
+fn save_settings(state: &mut FileState<DesktopSettings>, path: &Path) -> Result<(), String> {
+    // Iced's writer keeps untouched keys' bytes; nested unknown fields under a
+    // rewritten key are merged back so a newer build's settings survive.
+    let unknown = state.unknown.clone();
+    save_with(state, path, |path, document| {
+        crate::settings::save_desktop_to_keeping(path, document, &|key, value| {
+            if let Some(extra) = unknown.get(key).and_then(|extra| extra.as_object()) {
+                merge_unknown(value, extra);
+            }
+        })
+    })
+}
+
 fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), String> {
+    save_with(state, path, |path, document| {
+        let bytes = serde_json::to_vec_pretty(document)
+            .map_err(|e| format!("encode {}: {e}", path.display()))?;
+        crate::atomic_file::write_atomically(path, &bytes)
+    })
+}
+
+fn save_with<T>(
+    state: &mut FileState<T>,
+    path: &Path,
+    write: impl FnOnce(&Path, &T) -> Result<(), String>,
+) -> Result<(), String> {
     if let LoadState::Refused(error) = &state.loaded {
         return Err(error.clone());
     }
@@ -310,9 +724,7 @@ fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), Strin
         let LoadState::Valid(document) = &state.loaded else {
             return Err(format!("no document loaded for {}", path.display()));
         };
-        let bytes = serde_json::to_vec_pretty(document)
-            .map_err(|e| format!("encode {}: {e}", path.display()))?;
-        crate::atomic_file::write_atomically(path, &bytes)
+        write(path, document)
     })();
     match result {
         Ok(()) => {
@@ -563,6 +975,7 @@ mod tests {
                 }),
                 dirty: true,
                 error: None,
+                unknown: Default::default(),
             };
             super::save(&mut file, &root.join("workspaces.json"))
         });
@@ -612,6 +1025,233 @@ mod transaction_tests {
         assert_eq!(
             std::fs::read(root.path().join("workspaces.json")).unwrap(),
             bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod remaining_unknown_fields_tests {
+    use super::*;
+    use crate::workspace_config::{ChatWorkspaceEdit, WorkspaceTarget};
+    use serde_json::json;
+    #[test]
+    fn remaining_workspace_move_keeps_unknown_nested_provider_repo_and_location_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let raw = json!({"active_workspace":0,"workspaces":[
+            {"name":"Source","abbrev":"S","dir":"/fixture/source","color":"blue","chats":["root"],"tabs":[{"dir":"/fixture/source","chat_session_id":"root","session_uid":"root-tab","tab_kind":"agent","agent_config":{"backend":"claude","model":"default","future_provider":{"version":2}}}]},
+            {"name":"Target","abbrev":"T","dir":"/fixture/target","color":"green","location":{"kind":"local","root":"/fixture/target","future_location":true},"tabs":[]}
+        ],"repos":[{"dir":"/fixture/source","future_repo":"keep"}]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let initial: WorkspacesFile = serde_json::from_value(raw).unwrap();
+        let target = WorkspaceTarget::of(&initial.workspaces[1]);
+        let store = DesktopStore::open(root.path()).unwrap();
+        let saved = store
+            .try_edit_workspaces(move |file| {
+                file.chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "root".into(),
+                    target,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["workspaces"][1]["tabs"][0]["agent_config"]["future_provider"]["version"],
+            2
+        );
+        assert_eq!(raw["workspaces"][1]["location"]["future_location"], true);
+        assert_eq!(raw["repos"][0]["future_repo"], "keep");
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<WorkspacesFile>(raw).unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        let before = std::fs::read(&path).unwrap();
+        let target = WorkspaceTarget::of(&saved.workspaces[1]);
+        store
+            .try_edit_workspaces(move |file| {
+                file.chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "root".into(),
+                    target,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod workspace_settings_tests {
+    use super::*;
+    use crate::{workspace_config::WorkspaceTarget, workspace_settings::Edit};
+
+    #[test]
+    fn workspace_settings_guidelines_preserve_unknown_fields_and_refuse_malformed_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let file: WorkspacesFile = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[{"name":"Work","abbrev":"W","dir":"/tmp/repo","color":"blue","tabs":[]}]})).unwrap();
+        std::fs::write(
+            root.path().join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let store = DesktopStore::open(root.path()).unwrap();
+        let path = root.path().join(crate::guidelines::SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            br#"{"enabled":true,"off_repos":[],"future":{"keep":true}}"#,
+        )
+        .unwrap();
+        store
+            .edit_workspace_settings(target.clone(), Edit::GuidelinesEnabled(false))
+            .wait()
+            .unwrap();
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"enabled":false,"off_repos":[],"future":{"keep":true}})
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        store
+            .edit_workspace_settings(target.clone(), Edit::GuidelinesEnabled(false))
+            .wait()
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, b"{malformed").unwrap();
+        assert!(store
+            .edit_workspace_settings(target, Edit::GuidelinesEnabled(true))
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{malformed");
+    }
+}
+
+#[cfg(test)]
+mod routing_parity_tests {
+    use super::*;
+    use crate::{
+        limits::{PlanLimitsEvent, PlanLimitsState},
+        plan_limits::{PlanLimitsFile, Provider, RoutingPin},
+    };
+
+    #[test]
+    fn parity_routing_save_preserves_unknown_history_by_window_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let path = PlanLimitsFile::path_in(store.root());
+        let original = serde_json::json!({"history":[
+            {"provider":"codex","label":"old","resets_at":100,"samples":[],"future":"old"},
+            {"provider":"codex","label":"kept","resets_at":200,"samples":[],"future":"kept"}
+        ]});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let next: PlanLimitsFile = serde_json::from_value(serde_json::json!({"history":[
+            {"provider":"codex","label":"kept","resets_at":200,"samples":[]},
+            {"provider":"codex","label":"new","resets_at":300,"samples":[]}
+        ]}))
+        .unwrap();
+        store.save_plan_limits(next).wait().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["history"][0]["future"], "kept");
+        assert!(saved["history"][1].get("future").is_none());
+    }
+
+    #[test]
+    fn parity_live_usage_pin_and_clear_save_iced_policy_json() {
+        let root = tempfile::tempdir().unwrap();
+        let path = PlanLimitsFile::path_in(root.path());
+        let mut original = serde_json::to_value(PlanLimitsFile::default()).unwrap();
+        original["future"] = serde_json::json!({"keep":17});
+        original["usage_badge"]["future_nested"] = serde_json::json!([17]);
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let mut iced = PlanLimitsState::default();
+        for pin in [
+            Some(RoutingPin {
+                provider: Provider::Codex,
+                until: 2000,
+            }),
+            None,
+        ] {
+            let now = 1000;
+            iced.complete_event(PlanLimitsEvent::PinChanged(pin.clone()), &path, now);
+            let mut live = PlanLimitsState::load(store.root());
+            live.complete_event(PlanLimitsEvent::PinChanged(pin), &path, now);
+            live.begin_save(path.clone())
+                .unwrap()
+                .submit_to(&store)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(live.file(), iced.file());
+            let mut expected = serde_json::to_value(iced.file()).unwrap();
+            expected["future"] = original["future"].clone();
+            expected["usage_badge"]["future_nested"] =
+                original["usage_badge"]["future_nested"].clone();
+            let disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk, expected);
+        }
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(store
+            .save_plan_limits(PlanLimitsFile::default())
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"broken");
+    }
+}
+
+#[cfg(test)]
+mod chat_settings_tests {
+    use super::*;
+    #[test]
+    fn chat_settings_keep_unknown_fields_and_known_iced_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"future":{"keep":42},"chat":{"default_model":"sonnet","future_chat":true}}"#,
+        )
+        .unwrap();
+        let owner = DesktopStore::open(root.path()).unwrap();
+        owner
+            .edit_settings(|s| {
+                s.chat.remember_model("opus");
+                s.chat.remember_effort(Some("max"));
+            })
+            .wait()
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["future"]["keep"], 42);
+        assert_eq!(saved["chat"]["future_chat"], true);
+        assert_eq!(
+            saved["chat"]["last"],
+            serde_json::json!({"model":"opus","effort":"max"})
+        );
+        owner.drain().wait().unwrap();
+        assert_eq!(
+            saved,
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+        );
+        let other = tempfile::tempdir().unwrap();
+        let owner = DesktopStore::open(other.path()).unwrap();
+        owner
+            .edit_settings(|s| s.chat.remember_model("opus"))
+            .wait()
+            .unwrap();
+        let mut iced = DesktopSettings::default();
+        iced.chat.remember_model("opus");
+        assert_eq!(
+            std::fs::read(other.path().join("settings.json")).unwrap(),
+            serde_json::to_vec_pretty(&iced).unwrap()
         );
     }
 }

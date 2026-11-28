@@ -35,6 +35,8 @@ enum Selection {
     Branch(String),
 }
 
+type TabSelection = (Mode, Option<Selection>, Option<(String, bool)>);
+
 pub(crate) struct GitView {
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
@@ -45,6 +47,8 @@ pub(crate) struct GitView {
     loading: bool,
     generation: u64,
     operations: std::collections::HashMap<PathBuf, WorktreeOperation>,
+    session: Option<crate::data::SessionId>,
+    selections: std::collections::HashMap<Option<crate::data::SessionId>, TabSelection>,
 }
 impl GitView {
     pub(crate) fn new(
@@ -54,6 +58,7 @@ impl GitView {
     ) -> Self {
         if let Some(owner) = data.local_owner() {
             cx.observe(&owner, |this, _, cx| {
+                this.sync_session(cx);
                 if this.mode == Mode::Worktrees {
                     this.load_worktrees(cx);
                 }
@@ -71,13 +76,37 @@ impl GitView {
             loading: false,
             generation: 0,
             operations: Default::default(),
+            session: None,
+            selections: Default::default(),
         }
+    }
+    fn sync_session(&mut self, cx: &mut Context<Self>) {
+        let session = self.data.local_owner().and_then(|owner| {
+            owner
+                .read(cx)
+                .model
+                .active_sessions
+                .get(&self.workspace)
+                .copied()
+        });
+        if session == self.session {
+            return;
+        }
+        self.selections.insert(
+            self.session,
+            (self.mode, self.selected.clone(), self.selected_file.clone()),
+        );
+        self.session = session;
+        let (mode, selected, file) = self.selections.get(&session).cloned().unwrap_or_default();
+        self.mode = mode;
+        self.selected = selected;
+        self.selected_file = file;
+        self.snapshot = None;
+        self.generation += 1;
+        self.loading = false;
     }
     fn root(&self, cx: &App) -> Option<PathBuf> {
         if let Some(owner) = self.data.local_owner() {
-            if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
-                return Some(saved.dir.clone().into());
-            }
             return owner
                 .read(cx)
                 .model
@@ -88,6 +117,16 @@ impl GitView {
         }
         self.data.terminal_cwd(self.workspace, cx)
     }
+    pub(crate) fn show_changes(&mut self, cx: &mut Context<Self>) {
+        self.sync_session(cx);
+        self.set_mode(Mode::Changes, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changes_selected(&self) -> bool {
+        self.mode == Mode::Changes
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;
@@ -2095,6 +2134,99 @@ mod action_tests {
             );
             view.finish_operation(&path, Err("not registered".into()), true, cx);
             assert!(view.begin_operation(&path, true, cx).is_err());
+        });
+    }
+}
+
+#[cfg(test)]
+mod tab_context_tests {
+    use super::*;
+    use crate::{
+        WorkspaceOwner,
+        data::{LocalData, SessionId},
+        workspace_status::WorkspaceStatus,
+    };
+    use ::core::prelude::v1::test;
+
+    #[gpui::test]
+    fn tab_context_gap3_git_mode_and_selection_return_with_the_tab(cx: &mut TestAppContext) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add(root.path().into(), std::time::Instant::now());
+        let first = SessionId(41);
+        let second = SessionId(42);
+        model.active_sessions.insert(workspace, first);
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let view = cx.new(|cx| GitView::new(workspace, Rc::new(LocalData(owner.clone())), cx));
+        view.update(cx, |view, cx| {
+            view.sync_session(cx);
+            view.mode = Mode::Worktrees;
+            view.selected = Some(Selection::Branch("feature".into()));
+            view.selected_file = Some(("file.txt".into(), true));
+        });
+        for (id, expected) in [(second, false), (first, true)] {
+            owner.update(cx, |owner, cx| {
+                owner.model.active_sessions.insert(workspace, id);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.mode == Mode::Worktrees, expected);
+                assert_eq!(
+                    view.selected,
+                    expected.then(|| Selection::Branch("feature".into()))
+                );
+                assert_eq!(
+                    view.selected_file,
+                    expected.then(|| ("file.txt".into(), true))
+                );
+            });
+        }
+    }
+    #[gpui::test]
+    fn tab_context_task_changes_selects_the_new_tab_before_owner_notification(
+        cx: &mut TestAppContext,
+    ) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add(root.path().into(), std::time::Instant::now());
+        let first = SessionId(41);
+        let second = SessionId(42);
+        model.active_sessions.insert(workspace, first);
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let view = cx.new(|cx| GitView::new(workspace, Rc::new(LocalData(owner.clone())), cx));
+        view.update(cx, |view, cx| {
+            view.sync_session(cx);
+            view.mode = Mode::Worktrees;
+        });
+        owner.update(cx, |owner, cx| {
+            owner.model.active_sessions.insert(workspace, second);
+            owner.model.workspaces[0].root = checkout.path().into();
+            cx.notify();
+        });
+        // Task navigation opens Changes synchronously; the owner observer runs later.
+        view.update(cx, |view, cx| view.show_changes(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.changes_selected());
+            assert_eq!(view.root(cx).as_deref(), Some(checkout.path()));
+        });
+        owner.update(cx, |owner, cx| {
+            owner.model.active_sessions.insert(workspace, first);
+            owner.model.workspaces[0].root = root.path().into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.mode, Mode::Worktrees);
+            assert_eq!(view.root(cx).as_deref(), Some(root.path()));
         });
     }
 }

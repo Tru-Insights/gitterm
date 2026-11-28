@@ -734,6 +734,7 @@ fn golive10_task_terminal_restart_resumes_without_objective(cx: &mut TestAppCont
     if child("golive10_task_terminal_restart_resumes_without_objective") {
         return;
     }
+    cx.update(gpui_component::init);
     cx.background_executor.allow_parking();
     let fake = LiveFake::new();
     let (fixture, git) = fixture();

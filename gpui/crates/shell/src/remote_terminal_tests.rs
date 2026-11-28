@@ -163,7 +163,6 @@ fn golive19_live_ssh_routes_deduplicate_and_restore_saved_bytes(cx: &mut TestApp
     shell.update_in(vcx, |shell, window, cx| {
         shell.close_target(&closed, window, cx)
     });
-    // Live commits Iced's tab removal before discarding the runtime pane.
     wait_until(vcx, |cx| {
         !shell.read_with(cx, |shell, cx| shell.owner.read(cx).workspace_save_pending)
     });
@@ -700,4 +699,28 @@ fn review19_f5_legacy_agent_host_infers_launch_source(cx: &mut TestAppContext) {
         golive19_stop(&shell, vcx);
     }
     host.update(vcx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn parity_live_usage_pin_clear_updates_host_and_iced_saved_json(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    if child("parity_live_usage_pin_clear_updates_host_and_iced_saved_json") { return; }
+    cx.background_executor.allow_parking();
+    let (fixture, _) = fixture();
+    // Empty remote browser inventory: no terminal restore or provider launch.
+    std::fs::write(fixture.iced.join("workspaces.json"), serde_json::to_vec(&json!({"active_workspace":0,"workspaces":[{"name":"Example","abbrev":"EX","dir":"/srv/placeholder","color":"blue","location":{"kind":"remote_agent","remote_id":"placeholder","workspace_id":"/srv/placeholder","root":"/srv/placeholder"},"tabs":[]}]})).unwrap()).unwrap();
+    let path = gitterm_core::plan_limits::PlanLimitsFile::path_in(&fixture.iced);
+    let (host, _) = golive19_start(&fixture, cx);
+    let (shell, vcx) = golive19_shell(&fixture, &host, cx);
+    let now = chrono::Utc::now().timestamp();
+    let pin = gitterm_core::plan_limits::RoutingPin { provider: gitterm_core::plan_limits::Provider::Codex, until: now + 3600 };
+    for pin in [Some(pin), None] {
+        shell.update(vcx, |s,cx| s.usage_intent(crate::usage::UsageIntent::PinChanged(pin.clone()), cx));
+        assert_eq!(host.read_with(vcx, |h,_| h.chrome_plan_limits().unwrap().pin.clone()), pin);
+        wait_until(vcx, |_| gitterm_core::plan_limits::PlanLimitsFile::load(&path).pin == pin && path.exists());
+        let expected = host.read_with(vcx, |h,_| serde_json::to_value(h.chrome_plan_limits().unwrap()).unwrap());
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk, expected);
+    }
+    host.update(vcx, |h,cx| h.quit(cx));
 }

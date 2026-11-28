@@ -53,6 +53,8 @@ impl<C> Default for WorkspacesFile<C> {
 /// workspace does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<WorkspaceLocationConfig>,
@@ -188,6 +190,10 @@ pub struct WorkspaceConfig<C = WorkspaceColor> {
     /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Iced keeps a legacy remote's home env in its runtime repo, separate
+    /// from the effective compatibility copy written to `env` on each save.
+    #[serde(skip)]
+    pub legacy_env_base: Option<HashMap<String, String>>,
     /// Whether this workspace is currently open. Closed workspaces are kept in
     /// workspaces.json so their env vars and settings are preserved for reopening.
     #[serde(default = "default_true")]
@@ -283,6 +289,7 @@ impl<C> WorkspaceConfig<C> {
     /// hold them. Its terminals stay the workspace's.
     pub fn own_home_repo(&self) -> RepoConfig {
         RepoConfig {
+            extra: Default::default(),
             dir: self.home_dir().to_string(),
             location: self.location.clone(),
             run_command: self.run_command.clone(),
@@ -573,16 +580,23 @@ impl WorkspaceTarget {
                 .map(|s| s.session_name.clone()),
         }
     }
+    pub fn matches<C>(&self, workspace: &WorkspaceConfig<C>) -> bool {
+        workspace.name == self.name
+            && workspace.dir == self.dir
+            && workspace.chats == self.chats
+            && workspace.location == self.location
+            && workspace
+                .remote_session
+                .as_ref()
+                .map(|s| s.session_name.as_str())
+                == self.legacy_session.as_deref()
+    }
     pub fn index<C>(&self, file: &WorkspacesFile<C>) -> Result<usize, String> {
-        let mut matches = file.workspaces.iter().enumerate().filter(|(_, w)| {
-            w.active
-                && w.name == self.name
-                && w.dir == self.dir
-                && w.chats == self.chats
-                && w.location == self.location
-                && w.remote_session.as_ref().map(|s| s.session_name.as_str())
-                    == self.legacy_session.as_deref()
-        });
+        let mut matches = file
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.active && self.matches(w));
         let index = matches
             .next()
             .map(|(i, _)| i)
@@ -643,6 +657,7 @@ impl<C> WorkspacesFile<C> {
                 }
                 if self.repo(&key).is_none() {
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir,
                         location: None,
                         run_command: detected_command,
@@ -687,6 +702,7 @@ impl<C> WorkspacesFile<C> {
                     // Legacy lists can name an extra repo without a settings
                     // record. Iced's list_repo gives it an empty environment.
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir: dir.to_string_lossy().into_owned(),
                         location: None,
                         run_command: None,
@@ -904,4 +920,419 @@ pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
         }
     }
     unreachable!("u32 suffixes exhausted under {}", base.display())
+}
+
+/// Iced's startup directory, including its fallback if the cwd was removed.
+pub fn initial_directory() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Iced's empty-start workspace: the current directory, Lavender, one terminal.
+/// This only builds a value; Preview may use it without writing Iced's catalog.
+pub fn initial_workspace(cwd: &Path) -> WorkspaceConfig {
+    let name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Home".to_string());
+    let mut workspace = new_work_config(
+        &name,
+        cwd,
+        WorkspaceColor::Lavender,
+        crate::work::catalog::WorkStart::default(),
+    );
+    workspace.run_command = detect_run_command(cwd);
+    workspace.tabs.push(WorkspaceTabConfig {
+        extra: Default::default(),
+        dir: workspace.dir.clone(),
+        repo_dir: Some(workspace.dir.clone()),
+        startup_command: None,
+        tab_kind: None,
+        agent_config: None,
+        chat_session_id: None,
+        task_id: None,
+        task_session_id: None,
+        worker_shutdown_refused: false,
+        session_uid: None,
+    });
+    workspace
+}
+
+pub fn new_work_config(
+    name: &str,
+    dir: &Path,
+    color: crate::settings::WorkspaceColor,
+    start: crate::work::catalog::WorkStart,
+) -> crate::workspace_config::WorkspaceConfig {
+    use crate::workspace_config::WorkspaceConfig;
+    let dir = dir.to_string_lossy().into_owned();
+    let added: Vec<String> = start
+        .repos
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    WorkspaceConfig {
+        extra: Default::default(),
+        collapsed_issue_groups: crate::issues::IssueGroup::default_collapsed(),
+        name: name.into(),
+        abbrev: name.chars().take(2).collect::<String>().to_uppercase(),
+        dir: dir.clone(),
+        color,
+        location: Some(crate::remote::config::WorkspaceLocationConfig::Local { root: dir.clone() }),
+        remote_session: None,
+        active_tab: Some(0),
+        tabs: vec![],
+        run_command: None,
+        bottom_terminals: vec![],
+        env: Default::default(),
+        legacy_env_base: None,
+        active: true,
+        chats: vec![],
+        parked: None,
+        done_at: None,
+        guidelines_off: false,
+        claude_in_chrome: false,
+        decisions_repo: start
+            .decisions_repo
+            .map(|p| p.to_string_lossy().into_owned()),
+        repos: std::iter::once(dir.clone())
+            .chain(added.iter().filter(|r| **r != dir).cloned())
+            .collect(),
+        home: Some(dir),
+        env_overrides: Default::default(),
+        repos_added: added,
+        repos_removed: vec![],
+    }
+}
+
+/// Saved effects of Iced's WorkspaceFromChat / ChatAddToWorkspace handlers.
+#[derive(Clone, Debug)]
+pub enum ChatWorkspaceEdit {
+    Make {
+        entry: Box<crate::chats::ChatIndexEntry>,
+        home: PathBuf,
+    },
+    Add {
+        root: String,
+        chat: String,
+        target: WorkspaceTarget,
+    },
+}
+
+impl WorkspacesFile {
+    pub fn chat_workspace(&mut self, edit: ChatWorkspaceEdit) -> Result<WorkspaceTarget, String> {
+        let (target, root, shown, made) = match edit {
+            ChatWorkspaceEdit::Make { entry, home } => {
+                if entry.root_id.is_some() {
+                    return Err("A child chat folds under its coordinator".into());
+                }
+                if let Some(owner) = self.workspaces.iter().find(|w| w.chats.contains(&entry.id)) {
+                    return Ok(WorkspaceTarget::of(owner));
+                }
+                let name = crate::work::summary::workspace_name_from_title(&entry.title);
+                let dir = create_work_folder(&home.join("Work"), &name).map_err(|e| {
+                    format!(
+                        "cannot create a folder in {}: {e}",
+                        home.join("Work").display()
+                    )
+                })?;
+                use crate::settings::WorkspaceColor as C;
+                let colors = [
+                    C::Lavender,
+                    C::Blue,
+                    C::Green,
+                    C::Peach,
+                    C::Pink,
+                    C::Yellow,
+                    C::Red,
+                    C::Teal,
+                ];
+                let used: Vec<_> = self
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.active)
+                    .map(|w| w.color)
+                    .collect();
+                let color = colors
+                    .iter()
+                    .copied()
+                    .find(|c| !used.contains(c))
+                    .unwrap_or(colors[used.len() % colors.len()]);
+                let mut workspace = new_work_config(&name, &dir, color, Default::default());
+                workspace.chats.push(entry.id.clone());
+                let target = self
+                    .workspaces
+                    .iter()
+                    .position(|w| !w.active)
+                    .unwrap_or(self.workspaces.len());
+                self.workspaces.insert(target, workspace);
+                self.active_workspace = target;
+                self.normalize_repos();
+                (target, entry.id.clone(), entry.id, true)
+            }
+            ChatWorkspaceEdit::Add { root, chat, target } => {
+                let index = target.index(self)?;
+                let workspace = &self.workspaces[index];
+                if !workspace.active || !local_workspace(workspace) {
+                    return Err("Chat target workspace is not open on this Mac".into());
+                }
+                let changed = crate::work::summary::assign_chat(
+                    self.workspaces
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, w)| (i == index, &mut w.chats)),
+                    &root,
+                );
+                if !changed {
+                    return Ok(WorkspaceTarget::of(&self.workspaces[index]));
+                }
+                (index, root, chat, false)
+            }
+        };
+        // Iced moves the coordinator first, then the shown child, retaining
+        // every tab field and its live session identity.
+        let mut ids = vec![root];
+        if ids[0] != shown {
+            ids.push(shown);
+        }
+        let mut moved = false;
+        for id in ids {
+            let source = self
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter(|(i, w)| *i != target && w.active && local_workspace(w))
+                .find_map(|(i, w)| {
+                    w.tabs
+                        .iter()
+                        .position(|t| t.chat_session_id.as_deref() == Some(&id))
+                        .map(|t| (i, t))
+                });
+            if let Some((source, tab)) = source {
+                if self.workspaces[source].tabs.len() == 1 {
+                    let dir = self.workspaces[source].dir.clone();
+                    self.workspaces[source].tabs.push(WorkspaceTabConfig {
+                        extra: Default::default(),
+                        dir: dir.clone(),
+                        repo_dir: Some(dir),
+                        startup_command: None,
+                        tab_kind: None,
+                        agent_config: None,
+                        chat_session_id: None,
+                        task_id: None,
+                        task_session_id: None,
+                        worker_shutdown_refused: false,
+                        session_uid: Some(uuid::Uuid::new_v4().to_string()),
+                    });
+                }
+                let removed = tab;
+                let tab = self.workspaces[source].tabs.remove(removed);
+                let remaining = self.workspaces[source].tabs.len();
+                if let Some(active) = &mut self.workspaces[source].active_tab {
+                    *active = active_tab_after_removal(*active, removed, remaining);
+                }
+                self.workspaces[target].tabs.push(tab);
+                self.workspaces[target].active_tab = Some(self.workspaces[target].tabs.len() - 1);
+                moved = true;
+            }
+        }
+        if made || moved {
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .take(target)
+                .filter(|w| w.active)
+                .count();
+        }
+        Ok(WorkspaceTarget::of(&self.workspaces[target]))
+    }
+}
+
+fn local_workspace<C>(workspace: &WorkspaceConfig<C>) -> bool {
+    workspace.remote_session.is_none()
+        && workspace
+            .location
+            .as_ref()
+            .is_none_or(|l| matches!(l, WorkspaceLocationConfig::Local { .. }))
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod remaining_chat_workspace_tests {
+    use super::*;
+    use crate::desktop_store::DesktopStore;
+    use serde_json::json;
+
+    fn file(dir: &Path) -> WorkspacesFile {
+        let file: WorkspacesFile = serde_json::from_value(json!({"future":true,"active_workspace":0,"workspaces":[
+            {"name":"Source","abbrev":"S","dir":dir,"color":"blue","chats":["root"],"active_tab":0,"future_workspace":42,"tabs":[{"dir":dir,"chat_session_id":"root","session_uid":"root-uid","future_tab":7},{"dir":dir,"chat_session_id":"child","session_uid":"child-uid"}]},
+            {"name":"Target","abbrev":"T","dir":dir,"color":"green","chats":["other"],"tabs":[]},
+            {"name":"Parked","abbrev":"P","dir":dir,"color":"peach","active":false,"chats":["root","parked"],"tabs":[]}
+        ]})).unwrap();
+        file
+    }
+    #[test]
+    fn remaining_add_coordinator_moves_only_iced_ownership_and_hosted_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = file(dir.path());
+        let target = WorkspaceTarget::of(&initial.workspaces[1]);
+        let mut iced = initial.clone();
+        crate::work::summary::assign_chat(
+            iced.workspaces
+                .iter_mut()
+                .enumerate()
+                .map(|(i, w)| (i == 1, &mut w.chats)),
+            "root",
+        );
+        for id in ["root", "child"] {
+            let i = iced.workspaces[0]
+                .tabs
+                .iter()
+                .position(|t| t.chat_session_id.as_deref() == Some(id))
+                .unwrap();
+            let tab = iced.workspaces[0].tabs.remove(i);
+            iced.workspaces[1].tabs.push(tab);
+            iced.workspaces[1].active_tab = Some(iced.workspaces[1].tabs.len() - 1);
+        }
+        iced.workspaces[0].active_tab = Some(0);
+        iced.active_workspace = 1;
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+        let store = DesktopStore::open(dir.path()).unwrap();
+        let saved = store
+            .try_edit_workspaces(move |f| {
+                f.chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "child".into(),
+                    target,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(saved.workspaces[0].tabs.len(), 1);
+        assert!(saved.workspaces[0].tabs[0].chat_session_id.is_none());
+        assert_eq!(
+            saved.workspaces[0].tabs[0].repo_dir,
+            Some(dir.path().to_string_lossy().into_owned())
+        );
+        iced.workspaces[0].tabs = saved.workspaces[0].tabs.clone();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&iced).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            serde_json::to_value(iced).unwrap()
+        );
+        // A fresh stale click fails before touching the document.
+        initial.workspaces[1].active = false;
+        let before = std::fs::read(&path).unwrap();
+        assert!(store
+            .try_edit_workspaces(move |f| f
+                .chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "child".into(),
+                    target: WorkspaceTarget::of(&initial.workspaces[1])
+                })
+                .map(|_| ()))
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn remaining_make_workspace_matches_iced_name_folder_fields_and_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut initial = file(dir.path());
+        for workspace in &mut initial.workspaces {
+            workspace.chats.retain(|c| c != "root");
+        }
+        let path = dir.path().join("workspaces.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+        let entry = crate::chats::ChatIndexEntry {
+            id: "root".into(),
+            title: "  Example   work  ".into(),
+            backend: crate::chats::ChatBackend::Claude,
+            path: dir.path().join("fixture.jsonl"),
+            cwd: dir.path().into(),
+            repo_root: None,
+            is_worktree: false,
+            branch: None,
+            latest: None,
+            mtime: std::time::SystemTime::now(),
+            size: 0,
+            dead_cwd: false,
+            facts: None,
+            root_id: None,
+        };
+        let home = dir.path().join("home");
+        let store = DesktopStore::open(dir.path()).unwrap();
+        let saved = store
+            .try_edit_workspaces(move |f| {
+                f.chat_workspace(ChatWorkspaceEdit::Make {
+                    entry: Box::new(entry),
+                    home,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        let made = &saved.workspaces[2];
+        let expected_dir = dir.path().join("home/Work/example-work");
+        let mut iced = new_work_config(
+            &crate::work::summary::workspace_name_from_title("  Example   work  "),
+            &expected_dir,
+            crate::settings::WorkspaceColor::Lavender,
+            Default::default(),
+        );
+        iced.chats = vec!["root".into()];
+        iced.tabs = vec![initial.workspaces[0].tabs[0].clone()];
+        assert_eq!(
+            serde_json::to_value(made).unwrap(),
+            serde_json::to_value(iced).unwrap()
+        );
+        assert!(expected_dir.is_dir());
+        assert_eq!(saved.active_workspace, 2);
+        assert_eq!(saved.workspaces[0].extra["future_workspace"], 42);
+        assert_eq!(
+            saved.workspaces[0].tabs[0].chat_session_id.as_deref(),
+            Some("child")
+        );
+        assert_eq!(saved.workspaces[3].chats, ["parked"]);
+    }
+}
+
+/// Iced's selection after a hosted tab moves to another workspace.
+pub fn active_tab_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
+    let active = if active > removed { active - 1 } else { active };
+    active.min(remaining.saturating_sub(1))
+}
+
+mod workspace_bar;
+
+#[cfg(test)]
+mod initial_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn empty_start_workspace_matches_iced_cwd_name_color_and_terminal() {
+        let fixture = tempfile::tempdir().unwrap();
+        let cwd = fixture.path().join("example-project");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("Cargo.toml"), "[package]\nname = 'fixture'\n").unwrap();
+        let initial = initial_workspace(&cwd);
+        assert_eq!(initial.name, "example-project");
+        assert_eq!(initial.abbrev, "EX");
+        assert_eq!(initial.color, WorkspaceColor::Lavender);
+        assert_eq!(initial.dir, cwd.to_string_lossy());
+        assert_eq!(initial.run_command, detect_run_command(&cwd));
+        assert_eq!(initial.active_tab, Some(0));
+        assert!(initial.active);
+        assert_eq!(initial.tabs.len(), 1);
+        let tab = &initial.tabs[0];
+        assert_eq!(tab.dir, initial.dir);
+        assert_eq!(tab.repo_dir.as_deref(), Some(initial.dir.as_str()));
+        assert!(tab.tab_kind.is_none() && tab.startup_command.is_none());
+        assert!(!fixture.path().join("workspaces.json").exists());
+        assert_eq!(initial_workspace(Path::new("/")).name, "Home");
+    }
 }

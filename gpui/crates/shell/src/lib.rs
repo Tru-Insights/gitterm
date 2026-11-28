@@ -6,6 +6,7 @@ mod agent_sidebar;
 mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
+mod browser;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -44,6 +45,7 @@ mod layout;
 mod lifetime;
 mod live;
 mod startup_failure;
+mod view_preferences;
 pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
@@ -80,11 +82,13 @@ mod task_host_tests;
 mod task_panel;
 pub mod task_switcher;
 pub mod tasks;
+mod terminal_setup;
 mod theme;
 pub mod usage;
 pub mod work_sidebar;
 pub mod workspace_bar;
 pub mod workspace_config;
+mod workspace_navigation;
 pub mod workspace_settings_sheet;
 pub mod workspace_sheet;
 pub mod workspace_status;
@@ -145,6 +149,7 @@ pub struct Shell {
     bottom: Entity<bottom_panel::BottomPanel>,
     run_tabs: HashMap<String, bottom_panel::RunTab>,
     run_url_poll: Option<gpui::Task<()>>,
+    terminal_mirror: Option<gpui::Task<()>>,
     plans_open: bool,
     plans_return_focus: Option<FocusHandle>,
     usage_open: bool,
@@ -176,6 +181,7 @@ pub struct Shell {
     task_panel: Option<Entity<task_panel::TaskPanel>>,
     /// Iced's configured agent presets, read once with the host settings.
     agent_presets: Vec<gitterm_core::settings::AgentPreset>,
+    chat_defaults: gitterm_core::settings::ChatDefaults,
     /// Background actions the modal guard refused, for the guard's tests.
     #[cfg(test)]
     blocked_actions: Vec<&'static str>,
@@ -199,12 +205,14 @@ pub struct Shell {
     find_views: HashMap<String, find_sidebar::FindViews>,
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
+    chat_backfill_running: bool,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     saved_facts: workspace_bar::SavedFactsCache,
     saved_facts_error: Option<workspace_bar::News>,
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
     bar_menu: Option<workspace_bar::Menu>,
+    browser: browser::State,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
@@ -263,13 +271,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        cx.set_global(terminal_setup::Scrollback(settings.scrollback_lines));
         let client_height = f32::from(window.viewport_size().height);
         owner.update(cx, |owner, _| {
             if let Some(notifications) = &mut owner.notifications {
                 notifications.enabled = settings.notifications.needs_you;
             }
         });
-        let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
                 settings,
@@ -362,7 +370,6 @@ impl Shell {
                 state.store.regions.bottom_visible = settings.console_expanded;
             }
             load_workspace_layout(state, window, cx)?;
-            state.store.regions.resize_sidebar(sidebar_width);
             if !bottom_pane_ids(state, cx).is_empty() {
                 state.store.regions.bottom_opened = true;
             }
@@ -388,6 +395,12 @@ impl Shell {
                 }
             }
         }
+        let sidebar_width = Self::restore_view_preferences(
+            &mut workspaces,
+            settings,
+            bottom.read(cx).input.height,
+            cx,
+        );
         subscriptions
             .push(cx.on_app_quit(|shell: &mut Self, cx| shell.save_remote_tabs_on_quit(cx)));
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
@@ -451,6 +464,8 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
+        subscriptions
+            .push(cx.observe(&owner, |shell, _, cx| shell.sync_settings_sheet_pending(cx)));
         // Panes, their sessions and the active one change with the shell.
         subscriptions.push(cx.observe_self(|shell, cx| shell.sync_task_panes(cx)));
         let mut shell = Self {
@@ -459,6 +474,7 @@ impl Shell {
             bottom,
             run_tabs: HashMap::new(),
             run_url_poll: None,
+            terminal_mirror: None,
             plans_open: false,
             plans_return_focus: None,
             usage_open: false,
@@ -495,6 +511,7 @@ impl Shell {
             #[cfg(feature = "stt")]
             dictation: dictation::Dictation::new(settings.stt_enabled),
             agent_presets: settings.agent_presets.clone(),
+            chat_defaults: settings.chat.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
             task_switcher_subscription: None,
@@ -517,12 +534,14 @@ impl Shell {
             find_views: HashMap::new(),
             #[cfg(test)]
             find_home: None,
+            chat_backfill_running: false,
             work_state: Default::default(),
             saved_facts: workspace_bar::SavedFactsCache::default(),
             saved_facts_error: None,
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
             bar_menu: None,
+            browser: browser::State::new(cx),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             agent_sidebars: HashMap::new(),
@@ -533,6 +552,7 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.start_browser_poll(cx);
         shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
@@ -585,6 +605,7 @@ impl Shell {
         {
             theme::set_chat_width(width, cx);
         }
+        shell.sync_log_mirroring(cx);
         Ok(shell)
     }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
@@ -1057,13 +1078,19 @@ impl Shell {
         else {
             return;
         };
-        state.active_session = Some(id);
+        let workspace = state.workspace.id;
+        self.activate_session_context(workspace, id, cx);
+        self.workspace_mut_for_context(workspace).active_session = Some(id);
         self.selected_task = self.session_task(id, cx);
         self.remember_context(self.selected_task.clone());
         if let Some(task) = &self.selected_task {
             self.task_last_session.insert(task.clone(), id);
         }
+        self.sync_task_git_changes(cx);
         self.show_pane(&session_pane_id(id), window, cx);
+        if let Some(pane) = self.session_viewer_pane(workspace, cx) {
+            self.show_workspace_pane(workspace, &pane, window, cx);
+        }
         self.load_active_iced_history(window, cx);
     }
     fn new_claude_chat(
@@ -1122,8 +1149,9 @@ impl Shell {
         // Iced flushes a chat's held results when its turn ends.
         self._subscriptions
             .push(task_host::forward_turn_ends(&view, cx));
-        self.owner.update(cx, |owner, _| {
+        self.owner.update(cx, |owner, cx| {
             owner.chats.insert(target.session_uid.clone(), view.clone());
+            cx.notify();
         });
         let mut id = layout::stable_path_hash(Path::new(&target.session_uid));
         while self
@@ -1161,7 +1189,8 @@ impl Shell {
             title: "Claude preview".into(),
             kind: data::SessionKind::Chat,
         });
-        state.active_session = Some(SessionId(id));
+        self.activate_session_context(workspace, SessionId(id), cx);
+        self.workspace_mut_for_context(workspace).active_session = Some(SessionId(id));
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1178,13 +1207,10 @@ impl Shell {
                 return;
             }
             // Iced NewPlainTab falls back to a local plain terminal for legacy SSH.
-            let cwd = self
-                .active(cx)
-                .active_session
-                .and_then(|id| self.active(cx).panes.get(&session_pane_id(id)))
-                .and_then(|pane| pane.read(cx).task_folder(cx))
-                .unwrap_or_else(|| saved.dir.clone().into());
             let workspace = self.active(cx).workspace.id;
+            let cwd = self
+                .session_working_directory(workspace, cx)
+                .unwrap_or_else(|| saved.dir.clone().into());
             self.new_terminal_at(DockPlacement::Center, Some(cwd), window, cx);
             self.persist_remote_tabs(workspace, cx);
             return;
@@ -1249,12 +1275,19 @@ impl Shell {
             .iter()
             .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
             .collect();
+        let inherited = (placement == DockPlacement::Center && launch.is_none())
+            .then(|| self.session_working_directory(workspace, cx))
+            .flatten();
+        let previous = self.workspace(workspace).active_session;
         let state = self
             .workspaces
             .iter_mut()
             .find(|w| w.workspace.id == workspace)
             .unwrap();
-        let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
+        let Some(cwd) = cwd
+            .or(inherited)
+            .or_else(|| self.data.terminal_cwd(state.workspace.id, cx))
+        else {
             self.owner.update(cx, |owner, cx| {
                 owner.error =
                     Some("Remote workspace sessions are read-only in this preview".into());
@@ -1383,6 +1416,11 @@ impl Shell {
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
             None => {}
+        }
+        if placement == DockPlacement::Center {
+            self.workspace_mut_for_context(workspace).active_session = previous;
+            self.activate_session_context(workspace, SessionId(id), cx);
+            self.workspace_mut_for_context(workspace).active_session = Some(SessionId(id));
         }
         if self.workspace(workspace).on_bar() {
             self.show_workspace_pane(workspace, &pane_id, window, cx);
@@ -2143,63 +2181,11 @@ impl Shell {
                         .map(|w| format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name))
                         .unwrap_or_else(|| "local".into()),
                 };
-                let mut attention = vec![];
-                if let (Some(saved), Some(sidebar)) =
-                    (saved, self.work_sidebars.get(&state.workspace.id))
-                {
-                    use gitterm_core::tasks::{DelegationStatus, TaskAttentionReason};
-                    let sidebar = sidebar.read(cx);
-                    for tab in &saved.tabs {
-                        let task = tab
-                            .task_id
-                            .as_ref()
-                            .and_then(|id| sidebar.tasks().iter().find(|t| &t.task_id == id));
-                        let mut kind = task.and_then(|task| {
-                            if task.attention.reason.is_none() && !task.attention.unread {
-                                return None;
-                            }
-                            Some(match task.attention.reason {
-                                Some(TaskAttentionReason::ExecutionFailed) => {
-                                    workspace_bar::AttentionKind::Failed
-                                }
-                                Some(
-                                    TaskAttentionReason::CompletedUnread
-                                    | TaskAttentionReason::ReadyForReview,
-                                )
-                                | None => workspace_bar::AttentionKind::Review,
-                                _ => workspace_bar::AttentionKind::NeedsYou,
-                            })
-                        });
-                        for worker in sidebar.workers().iter().filter(|worker| {
-                            worker.dismissed_at.is_none()
-                                && tab.session_uid.as_deref()
-                                    == Some(worker.parent.session_uid.as_str())
-                        }) {
-                            let next = match worker.status {
-                                DelegationStatus::Failed { .. } => {
-                                    Some(workspace_bar::AttentionKind::Failed)
-                                }
-                                DelegationStatus::Blocked | DelegationStatus::Interrupted => {
-                                    Some(workspace_bar::AttentionKind::NeedsYou)
-                                }
-                                DelegationStatus::Completed => {
-                                    Some(workspace_bar::AttentionKind::Review)
-                                }
-                                _ => None,
-                            };
-                            let priority = |kind| match kind {
-                                workspace_bar::AttentionKind::NeedsYou => 0,
-                                workspace_bar::AttentionKind::Failed => 1,
-                                workspace_bar::AttentionKind::Review => 2,
-                            };
-                            kind = kind
-                                .into_iter()
-                                .chain(next)
-                                .min_by_key(|kind| priority(*kind));
-                        }
-                        attention.extend(kind);
-                    }
-                }
+                let attention: Vec<_> = state
+                    .sessions
+                    .iter()
+                    .filter_map(|session| self.session_attention(state, session.id, cx).kind)
+                    .collect();
                 workspace_bar::Workspace {
                     id: state.workspace.id,
                     name: state.workspace.name.clone(),
@@ -2230,7 +2216,13 @@ impl Shell {
                             kind: *kind,
                             reason: "Sessions need attention".into(),
                         }),
-                    woke: None,
+                    woke: self
+                        .owner
+                        .read(cx)
+                        .notifications
+                        .as_ref()
+                        .and_then(|s| s.woke.get(&state.runtime_uid))
+                        .copied(),
                     pr_news: None,
                 }
             })
@@ -2260,39 +2252,6 @@ impl Shell {
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
         let facts = self.connected_facts(self.saved_facts.snapshot(), colors);
-        for workspace in &mut workspaces {
-            // Iced's chip counts each tab with live attention; a launched
-            // task pane needing input is one, and needs-you outranks.
-            let launched = self
-                .workspaces
-                .iter()
-                .find(|state| state.workspace.id == workspace.id)
-                .map_or(0, |state| {
-                    state
-                        .sessions
-                        .iter()
-                        .filter(|session| session_needs_input(state, session.id, cx))
-                        .count()
-                });
-            let count = facts
-                .attention_counts
-                .get(&workspace.id)
-                .copied()
-                .map_or(launched, |count| count + launched);
-            let count = (count > 0).then_some(count);
-            let kind = workspace
-                .attention
-                .as_ref()
-                .filter(|_| launched == 0)
-                .map_or(workspace_bar::AttentionKind::NeedsYou, |attention| {
-                    attention.kind
-                });
-            workspace.attention = count.map(|count| workspace_bar::Attention {
-                count,
-                kind,
-                reason: "Sessions need attention".into(),
-            });
-        }
         let mut machine_news = facts.machines.clone();
         if let Some(error) = &self.saved_facts_error {
             machine_news.push(error.clone());
@@ -2322,7 +2281,7 @@ impl Shell {
             machine_news,
             repo_machines: facts.repo_machines.clone(),
             remote_workspaces: facts.remote_workspaces.clone(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             ready_count: facts.ready,
             ready_news_count: facts.news_count,
             // Iced counts both saved parks and open work hidden in Repos.
@@ -2349,12 +2308,17 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: workspace_bar::Browser {
-                color: colors.muted,
-                driving: false,
-                hint: "Browser idle".into(),
-                action: Some(workspace_bar::BrowserAction::Open),
-                has_evidence: false,
+            // Preview keeps v6's idle button; its click reports the Iced label.
+            browser: if chat::policy::is_live(cx) {
+                self.browser.bar(colors)
+            } else {
+                workspace_bar::Browser {
+                    color: colors.muted,
+                    driving: false,
+                    hint: "Browser idle".into(),
+                    action: Some(workspace_bar::BrowserAction::Open),
+                    has_evidence: false,
+                }
             },
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
@@ -2477,14 +2441,71 @@ impl Shell {
         .detach();
     }
     fn spine_input(&self, cx: &App) -> spine::Input {
+        let tab_attention: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|state| {
+                state.sessions.iter().filter_map(|session| {
+                    let facts = self.session_attention(state, session.id, cx);
+                    let kind = facts.kind?;
+                    Some(spine::AttentionRow {
+                        workspace: state.workspace.id,
+                        target: spine::Target::Tab(session.id.0),
+                        title: state.panes[&session_pane_id(session.id)]
+                            .read(cx)
+                            .tab_title(),
+                        priority: facts.reason.map_or(
+                            match kind {
+                                workspace_bar::AttentionKind::NeedsYou => 0,
+                                workspace_bar::AttentionKind::Failed => 1,
+                                workspace_bar::AttentionKind::Review => 3,
+                            },
+                            |r| r.priority(),
+                        ),
+                        icon: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => "●",
+                                    workspace_bar::AttentionKind::Failed => "!",
+                                    workspace_bar::AttentionKind::Review => "✓",
+                                },
+                                |r| r.icon(),
+                            )
+                            .into(),
+                        label: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => {
+                                        "Input or approval needed"
+                                    }
+                                    workspace_bar::AttentionKind::Failed => "Task failed",
+                                    workspace_bar::AttentionKind::Review => "Ready to review",
+                                },
+                                |r| r.label(),
+                            )
+                            .into(),
+                        waiting: facts.waiting,
+                    })
+                })
+            })
+            .collect();
+        let live_limits = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .and_then(|host| host.0.read(cx).chrome_plan_limits());
+        let (usage_hint, usage_badge) = spine::usage_chrome(
+            live_limits.unwrap_or(&self.usage_input.plan_limits),
+            chrono::Utc::now().timestamp(),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+        );
         spine::Input {
             workspaces: self.chrome_workspaces(cx),
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
-            attention: self
-                .workspaces
-                .iter()
-                .flat_map(|state| {
+            attention: tab_attention
+                .into_iter()
+                .chain(self.workspaces.iter().flat_map(|state| {
                     let root = self.data.terminal_cwd(state.workspace.id, cx);
                     self.work_sidebars
                         .get(&state.workspace.id)
@@ -2492,6 +2513,18 @@ impl Shell {
                             spine::task_rows(
                                 state.workspace.id,
                                 sidebar.read(cx).tasks().iter().filter(|task| {
+                                    if self.workspaces.iter().any(|state| {
+                                        state.sessions.iter().any(|session| {
+                                            self.session_task(session.id, cx).as_deref()
+                                                == Some(&task.task_id)
+                                                && self
+                                                    .session_attention(state, session.id, cx)
+                                                    .kind
+                                                    .is_some()
+                                        })
+                                    }) {
+                                        return false;
+                                    }
                                     match &task.workspace.location {
                                         gitterm_core::tasks::WorkspaceLocationIdentity::Local {
                                             directory,
@@ -2503,7 +2536,7 @@ impl Shell {
                             )
                         })
                         .unwrap_or_default()
-                })
+                }))
                 .collect(),
             frontmost: self
                 .workspaces
@@ -2518,24 +2551,16 @@ impl Shell {
                 .iter()
                 .flat_map(|state| {
                     state.sessions.iter().filter_map(|session| {
-                        state
-                            .panes
-                            .get(&session_pane_id(session.id))
-                            .and_then(|pane| match &pane.read(cx).content {
-                                pane::PaneContent::PreviewChat(view)
-                                    if view.read(cx).is_working() =>
-                                {
-                                    Some((state.workspace.id, spine::Target::Tab(session.id.0)))
-                                }
-                                _ => None,
-                            })
+                        self.session_attention(state, session.id, cx)
+                            .running
+                            .then_some((state.workspace.id, spine::Target::Tab(session.id.0)))
                     })
                 })
                 .collect(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             usage_open: self.usage_open,
-            usage_hint: "Usage".into(),
-            usage_badge: None,
+            usage_hint,
+            usage_badge,
         }
     }
     fn strip_input(&self, cx: &App) -> session_strip::Input {
@@ -2544,8 +2569,6 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
-        let needs_input =
-            |id: SessionId| state.is_some_and(|state| session_needs_input(state, id, cx));
         session_strip::Input {
             workspace: state.map(|w| w.workspace.id),
             workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),
@@ -2583,23 +2606,10 @@ impl Shell {
                                 .map(|facts| facts.tasks.as_slice())
                         })
                         .unwrap_or_default();
-                    let workers = sidebar
-                        .map(|sidebar| sidebar.workers())
-                        .or_else(|| {
-                            self.roster_facts
-                                .as_ref()
-                                .map(|facts| facts.workers.as_slice())
-                        })
-                        .unwrap_or_default();
                     let task = tab
                         .and_then(|tab| tab.task_id.as_ref())
                         .and_then(|id| tasks.iter().find(|task| &task.task_id == id));
-                    let running = state
-                        .and_then(|state| state.panes.get(&session_pane_id(s.id)))
-                        .is_some_and(|pane| {
-                            matches!(&pane.read(cx).content,
-                            pane::PaneContent::PreviewChat(view) if view.read(cx).is_working())
-                        });
+                    let attention = self.session_attention(state.unwrap(), s.id, cx);
                     session_strip::Session {
                         id: s.id,
                         kind: s.kind,
@@ -2621,20 +2631,9 @@ impl Shell {
                                 })
                                 .map(|session| session.label.clone())
                         }),
-                        // Iced's input-needed tab attention on a launched
-                        // task terminal outranks the durable kinds.
-                        attention: needs_input(s.id)
-                            .then_some(workspace_bar::AttentionKind::NeedsYou)
-                            .or_else(|| {
-                                session_strip::attention(
-                                    task.map(|task| &task.attention),
-                                    workers,
-                                    tab.and_then(|tab| tab.session_uid.as_deref()),
-                                )
-                            }),
-                        running,
-                        // ChatPane does not yet expose its pending-request projection.
-                        pending_requests: 0,
+                        attention: attention.kind,
+                        running: attention.running,
+                        pending_requests: attention.pending,
                     }
                 })
                 .collect(),
@@ -2652,9 +2651,9 @@ impl Shell {
             branch: state
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             mic: self.dictation_indicator(cx),
-            worktree_follow: None,
+            worktree_follow: self.session_worktree_follow(cx),
         }
     }
     fn spine(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -2697,12 +2696,6 @@ impl Shell {
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.open_ready_list(window, cx),
                         O::OpenParked => shell.open_parked_list(window, cx),
-                        O::Browser(workspace_bar::BrowserAction::Open) => {
-                            shell.chrome_unavailable("Open browser", cx)
-                        }
-                        O::Browser(workspace_bar::BrowserAction::Focus) => {
-                            shell.chrome_unavailable("Focus browser", cx)
-                        }
                         outcome => shell.bar_outcome(outcome, window, cx),
                     }
                 });
@@ -2732,9 +2725,10 @@ impl Shell {
                     }
                     session_strip::Outcome::TaskOverview => shell.general_context(true, window, cx),
                     session_strip::Outcome::ToggleWorktreeFollow => {
-                        let input = shell.strip_input(cx);
-                        if let Some(follow) = &input.worktree_follow {
-                            shell.chrome_unavailable(&follow.text(&input.branch), cx);
+                        if let Some(workspace) = shell.active_workspace(cx) {
+                            shell.owner.update(cx, |owner, cx| {
+                                owner.toggle_session_worktree_follow(workspace, cx)
+                            });
                         }
                     }
                     outcome => shell.strip_outcome(outcome, window, cx),
@@ -2757,6 +2751,7 @@ impl Shell {
             change(&mut state.store.regions);
             save_layout(state, cx);
         }
+        self.save_global_geometry(cx);
         self.sync_git_visibility(true, cx);
         cx.notify();
     }
@@ -2768,13 +2763,20 @@ impl Shell {
     fn sidebar_chevron(collapsed: bool) -> &'static str {
         if collapsed { "▶" } else { "◀" }
     }
-    fn sidebar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
+    fn sidebar(&self, state: &WorkspaceDock, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let regions = &state.store.regions;
         let p = Palette::current(cx);
+        let id = state.workspace.id;
+        let active = Some(id) == self.active_workspace(cx);
         let mut sidebar = div()
             .id("sidebar")
-            .debug_selector(|| "sidebar".into())
+            .debug_selector(move || {
+                if active {
+                    "sidebar".into()
+                } else {
+                    format!("workspace-sidebar-{}", id.0)
+                }
+            })
             .w(px(regions.sidebar_size()))
             .h_full()
             .flex_shrink_0()
@@ -2855,10 +2857,10 @@ impl Shell {
             sidebar = sidebar.child(modes.child(collapse));
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
-            sidebar = self.files_sidebar(sidebar, cx);
+            sidebar = self.files_sidebar(sidebar, state);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Git {
-            sidebar = self.git_sidebar(sidebar, cx);
+            sidebar = self.git_sidebar(sidebar, state);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Tasks {
             sidebar = sidebar.children(
@@ -2882,7 +2884,7 @@ impl Shell {
             sidebar = sidebar.child(
                 div().flex_1().min_h_0().children(
                     self.find_views
-                        .get(&self.find_owner(cx))
+                        .get(&self.find_owner_for(state, state.active_session, cx))
                         .map(|views| views.sidebar.clone()),
                 ),
             );
@@ -2929,11 +2931,23 @@ impl Shell {
             content.sync_covers(window, cx);
         });
     }
-    fn sidebar_divider(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let collapsed = self.active(cx).store.regions.sidebar_collapsed;
+    fn sidebar_divider(
+        &self,
+        state: &WorkspaceDock,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let collapsed = state.store.regions.sidebar_collapsed;
+        let id = state.workspace.id;
+        let active = Some(id) == self.active_workspace(cx);
         div()
             .id("sidebar-divider")
-            .debug_selector(|| "sidebar-divider".into())
+            .debug_selector(move || {
+                if active {
+                    "sidebar-divider".into()
+                } else {
+                    format!("workspace-divider-{}", id.0)
+                }
+            })
             .w(px(if collapsed { 1. } else { 4. }))
             .h_full()
             .flex_shrink_0()
@@ -2948,102 +2962,75 @@ impl Shell {
                 }),
             )
     }
-    fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
-        if self.selected_task.is_some()
-            && let Some(panel) = &self.task_panel
-            && state
-                .active_session
-                .and_then(|id| self.session_task(id, cx))
-                .is_none()
-        {
-            return div()
-                .id("task-overview-host")
-                .flex_1()
-                .h_full()
-                .child(task_panel::overview_view(panel, self.task_inputs(cx), cx));
-        }
-        #[cfg(test)]
-        if self.dock_fixture {
-            return div()
-                .id("dock-fixture")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(state.dock.clone());
-        }
-        if state.active_session.is_none() {
-            if let Some(home) = self.remote_session_home(cx) {
-                return home;
-            }
-            return div()
-                .id("session-content")
-                .debug_selector(|| "session-content".into())
-                .flex_1()
-                .min_w_0()
-                .h_full();
-        }
-        let selected = self
-            .content
-            .read(cx)
-            .selected
-            .as_ref()
-            .and_then(|id| state.panes.get(id));
-        let bottom = bottom_pane_ids(state, cx);
-        let active = state.active_session.map(session_pane_id);
-        let pane = selected
-            .or_else(|| {
-                active
-                    .as_ref()
-                    .filter(|id| pane_id_visible(state, id, cx) && !bottom.contains(id))
-                    .and_then(|id| state.panes.get(id))
-            })
-            .or_else(|| {
-                state
-                    .panes
-                    .iter()
-                    .find(|(id, _)| {
-                        !id.ends_with("-git")
-                            && !id.ends_with("-files")
-                            && pane_id_visible(state, id, cx)
-                            && !bottom.contains(id)
-                    })
-                    .map(|(_, pane)| pane)
-            });
+    fn workspace_slide(
+        &self,
+        background_work: Vec<(WorkspaceId, Entity<work_sidebar::WorkSidebar>)>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
-            .id("session-content")
-            .debug_selector(|| "session-content".into())
+            .id("workspace-slide-host")
+            .debug_selector(|| "workspace-slide-host".into())
             .flex_1()
             .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .when(
-                pane.is_some_and(|pane| {
-                    matches!(
-                        pane.read(cx).content,
-                        pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
-                    )
-                }),
-                |pane| pane.font_family(".SystemUIFont"),
-            )
-            .when(
-                pane.is_some_and(|p| matches!(p.read(cx).content, pane::PaneContent::Terminal(_))),
-                |host| {
-                    host.capture_any_mouse_down(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
+            .min_h_0()
+            .child(workspace_navigation::WorkspaceSlide {
+                shell: cx.weak_entity(),
+                background_work,
+                panels: self
+                    .workspaces
+                    .iter()
+                    .map(|state| {
+                        let id = state.workspace.id;
+                        let main = if self.usage_open && Some(id) == self.active_workspace(cx) {
+                            div()
+                                .id("usage-host")
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.usage_page.clone())
+                        } else {
+                            self.find_content(state, cx)
+                        };
+                        (
+                            id,
+                            div()
+                                .id("workspace-panel")
+                                .size_full()
+                                .flex()
+                                .child(self.sidebar(state, cx))
+                                .child(self.sidebar_divider(state, cx))
+                                .child(
+                                    div()
+                                        .id("workspace-main")
+                                        .debug_selector(move || format!("workspace-main-{}", id.0))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .flex()
+                                        .child(main),
+                                ),
+                        )
                     })
-                    .capture_any_mouse_up(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
-                    })
-                },
-            )
-            .children(pane.cloned())
+                    .collect(),
+            })
+    }
+    fn session_content(
+        &self,
+        state: &WorkspaceDock,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let active = Some(state.workspace.id) == self.active_workspace(cx);
+        if active
+            && state.active_session.is_none()
+            && let Some(home) = self.remote_session_home(cx)
+        {
+            return home;
+        }
+        self.slide_workspace_content(state, active, cx)
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_global_geometry(f32::from(window.viewport_size().height), cx);
+        self.refresh_view_appearance(cx);
         self.run_tabs.retain(|id, _| {
             self.workspaces
                 .iter()
@@ -3259,7 +3246,7 @@ impl Shell {
                 },
                 cx,
             ),
-            O::ToggleMirroring => self.preview_unavailable("Terminal log mirroring", cx),
+            O::ToggleMirroring => self.toggle_log_mirroring(cx),
             O::AddTerminal { repo } => {
                 let cwd = match repo {
                     None => None,
@@ -3547,21 +3534,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        let launch = {
-            let mut launch = launch;
-            launch.program = "/bin/zsh".into();
-            launch.args = vec!["-d".into(), "-l".into()];
-            launch.env.insert(
-                "HOME".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch.env.insert(
-                "ZDOTDIR".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch
-        };
         let preview = self.owner.read(cx).preview();
         if let Err(error) = preview::executable(
             preview.as_deref(),
@@ -3607,17 +3579,37 @@ impl Shell {
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
+        let mut launch = launch;
+        if let Some(target) = &target {
+            browser::terminal_environment(&mut launch, &target.session_uid, cx);
+        }
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
-            gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
-                .with_exit_callback(move |_, cx| {
+            terminal_setup::launch(launch, terminal_setup::Placement::Main, cx).with_exit_callback(
+                move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
                             pane.mark_exited(cx);
                             cx.notify();
                         }
                     });
-                })
+                },
+            )
         });
         self._subscriptions
             .push(cx.observe_in(&view, window, |_, view, window, cx| {
@@ -3786,6 +3778,25 @@ impl Shell {
             _ => None,
         }
     }
+    /// Terminal menu target: a focused main-area terminal (GPUI can split the
+    /// center), else Iced's active main tab, so a focused bottom shell never is.
+    fn menu_terminal(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<gitterm_terminal::TerminalView>> {
+        let focused_main = self.workspaces.iter().find_map(|state| {
+            let bottom = bottom_pane_ids(state, cx);
+            state.panes.iter().find_map(|(id, pane)| {
+                let pane::PaneContent::Terminal(view) = &pane.read(cx).content else {
+                    return None;
+                };
+                (!bottom.contains(id) && view.read(cx).focus_handle().contains_focused(window, cx))
+                    .then(|| view.clone())
+            })
+        });
+        focused_main.or_else(|| self.active_main_terminal(cx))
+    }
     fn focused_chat(&self, window: &Window, cx: &App) -> Option<gpui::EntityId> {
         self.workspaces
             .iter()
@@ -3822,6 +3833,9 @@ impl Shell {
         let mut context = String::from("GitTermShell");
         if self.dictation_enabled() {
             context.push_str(" IcedStt");
+        }
+        if self.browser.evidence_open {
+            return context;
         }
         if self.usage_open {
             context.push_str(" IcedUsage");
@@ -3901,6 +3915,7 @@ impl Shell {
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
         [
+            (self.browser.evidence_open, Modal::BrowserEvidence),
             (self.task_switcher.is_some(), Modal::TaskSwitcher),
             (self.usage_open, Modal::Usage),
             (Self::has_dialog(window, cx), Modal::Dialog),
@@ -3929,7 +3944,8 @@ impl Shell {
     /// switcher, the new-task form and task prompts, the New Work and Park
     /// sheets (not the Parked and Ready lists) and a PR action confirmation.
     fn pty_blocked(&self, cx: &App) -> bool {
-        self.task_switcher.is_some()
+        self.browser.evidence_open
+            || self.task_switcher.is_some()
             || self.task_panel_modal_open(cx)
             || self.new_work_sheet.is_some()
             || self
@@ -3963,9 +3979,30 @@ impl Shell {
     }
     fn menu_root(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use app_menus::*;
+        let mut menu_context = self
+            .menu_context(window, cx)
+            .replace(" IcedTerminalSearch", "");
+        if self
+            .menu_terminal(window, cx)
+            .is_some_and(|view| view.read(cx).is_find_open())
+        {
+            menu_context.push_str(" IcedTerminalSearch");
+        }
         div()
+            .capture_any_mouse_up(cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                if event.button == gpui::MouseButton::Left {
+                    this.finish_preference_resize(cx);
+                }
+            }))
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // Capture saves an active drag before the finish handler clears it.
+                    this.finish_preference_resize(cx);
+                }),
+            )
             .track_focus(&self.focus)
-            .key_context(self.menu_context(window, cx).as_str())
+            .key_context(menu_context.as_str())
             .capture_key_down(cx.listener(Self::guard_app_shortcut))
             // Iced's key handler closes a modal on Escape before any page-local
             // Escape (the composer's slash menu, an input, find or review).
@@ -4019,9 +4056,7 @@ impl Shell {
             ))
             .on_action(Self::background(
                 cx,
-                |this, _: &DebugSpawnAgentTab, _, cx| {
-                    this.preview_unavailable("Debug agent tab", cx)
-                },
+                |this, _: &DebugSpawnAgentTab, window, cx| this.debug_agent_tab(window, cx),
             ))
             .on_action(Self::background(
                 cx,
@@ -4133,13 +4168,13 @@ impl Shell {
                     this.run_repo(repo, w, cx);
                 }
             }))
-            .on_action(Self::background(cx, |this, _: &ToggleTheme, _, cx| {
-                this.chrome_unavailable("Toggle Light/Dark Theme", cx);
+            .on_action(Self::background(cx, |this, _: &ToggleTheme, w, cx| {
+                this.toggle_view_theme(w, cx);
             }))
             .on_action(Self::background(
                 cx,
                 |this, _: &ToggleTerminalLogMirroring, _, cx| {
-                    this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
+                    this.toggle_log_mirroring(cx);
                 },
             ))
             .on_action(Self::background(
@@ -4148,9 +4183,9 @@ impl Shell {
                     this.chrome_unavailable(&action.label, cx);
                 },
             ))
-            .on_action(Self::background(cx, |this, _: &ClearTerminal, _, cx| {
+            .on_action(Self::background(cx, |this, _: &ClearTerminal, w, cx| {
                 // Iced writes to the active main tab, never the bottom panel.
-                if let Some(view) = this.active_main_terminal(cx) {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     view.update(cx, |v, _| {
                         v.backend_mut()
                             .handle(gitterm_terminal::Command::Write(b"clear\n".to_vec()));
@@ -4158,7 +4193,7 @@ impl Shell {
                 }
             }))
             .on_action(Self::background(cx, |this, _: &ToggleSearch, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     if view.read(cx).is_find_open() {
                         view.update(cx, |v, cx| v.close_find(w, cx));
                     } else {
@@ -4168,12 +4203,22 @@ impl Shell {
                 cx.notify();
             }))
             .on_action(Self::background(cx, |this, _: &SearchNext, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     view.update(cx, |v, cx| {
                         v.navigate_find(false, cx);
                     });
                 }
             }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &view_preferences::SearchPrev, w, cx| {
+                    if let Some(view) = this.menu_terminal(w, cx) {
+                        view.update(cx, |v, cx| {
+                            v.navigate_find(true, cx);
+                        });
+                    }
+                },
+            ))
             .on_action(Self::background(cx, |this, _: &TaskSwitcherOpen, w, cx| {
                 this.open_task_switcher(w, cx)
             }))
@@ -4404,7 +4449,10 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.browser.evidence_open
+                || self.plans_open
+                || self.task_switcher.is_some()
+                || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -4447,8 +4495,22 @@ impl Shell {
             I::ChartTokens(tokens) => self.usage_input.chart_tokens = tokens,
             I::ToggleHeadless => self.usage_input.show_headless = !self.usage_input.show_headless,
             I::PinChanged(pin) => {
-                if self.usage_input.plan_limits.pin != pin {
+                if !crate::chat::policy::is_live(cx) {
                     self.preview_unavailable("Routing pin", cx);
+                } else if let Some(host) = cx
+                    .try_global::<task_host::GpuiTaskHost>()
+                    .map(|host| host.0.clone())
+                {
+                    if let Some(file) =
+                        host.update(cx, |host, cx| host.routing_pin_changed(pin, cx))
+                    {
+                        self.usage_input.plan_limits = file;
+                    }
+                } else {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some("Routing pin: Live routing host unavailable".into());
+                        cx.notify();
+                    });
                 }
             }
         }
@@ -4463,9 +4525,13 @@ impl Shell {
     }
     fn set_chat_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
         theme::set_chat_width(width, cx);
+        self.save_view_preferences(move |settings| settings.chat_width = width, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_width = Some(width);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_width = Some(width);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4556,10 +4622,17 @@ impl Shell {
     }
     fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
+        if size == theme::chat_appearance(cx).font_size {
+            return;
+        }
         theme::set_chat_font_size(size, cx);
+        self.save_view_preferences(move |settings| settings.chat_font_size = size, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_font_size = Some(size);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_font_size = Some(size);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4580,11 +4653,25 @@ impl Shell {
         } else {
             &mut fonts.terminal
         };
-        *value = (*value + delta).clamp(10., 24.);
+        let next = (*value + delta).clamp(10., 24.);
+        if next == *value {
+            return;
+        }
+        *value = next;
         theme::set_font_sizes(fonts, cx);
+        self.save_view_preferences(
+            move |settings| {
+                settings.ui_font_size = fonts.ui;
+                settings.terminal_font_size = fonts.terminal;
+            },
+            cx,
+        );
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.fonts = Some(fonts);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.fonts = Some(fonts);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 if let pane::PaneContent::Terminal(view) = &pane.read(cx).content {
                     theme::sync_terminal_typography(&view.clone(), cx);
@@ -4594,6 +4681,9 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_browser_evidence(window, cx) {
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -4738,6 +4828,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser.evidence_open {
+            if event.keystroke.key == "escape" {
+                self.close_browser_evidence(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
@@ -4883,6 +4980,7 @@ impl Render for Shell {
             ));
         }
         for state in &self.workspaces {
+            terminal_setup::sync_workspace_insets(state, cx);
             for pane in state.panes.values() {
                 if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
                     view.clone()
@@ -4903,7 +5001,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open
+            content.picker = self.browser.evidence_open
+                || self.plans_open
                 || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
@@ -4994,6 +5093,7 @@ impl Render for Shell {
                 )
                 .children(self.new_work_sheet.clone())
                 .children(self.remote_overlays())
+                .children(self.browser_evidence_view(window, cx))
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -5009,9 +5109,8 @@ impl Render for Shell {
                         || state.store.regions.sidebar_collapsed
                         || state.store.regions.sidebar_mode != SidebarMode::Work)
             })
-            .map(|(_, sidebar)| sidebar.clone())
+            .map(|(id, sidebar)| (*id, sidebar.clone()))
             .collect();
-        let sidebar = self.sidebar(cx);
         let mut content = div()
             .flex_1()
             .min_w_0()
@@ -5069,24 +5168,7 @@ impl Render for Shell {
             .child(self.spine(cx))
             .child(
                 content
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .child(sidebar)
-                            .child(self.sidebar_divider(cx))
-                            .child(if self.usage_open {
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h_full()
-                                    .child(self.usage_page.clone())
-                                    .into_any_element()
-                            } else {
-                                self.find_content(cx).into_any_element()
-                            }),
-                    )
+                    .child(self.workspace_slide(background_work, cx))
                     .child(self.bottom.clone())
                     .children(self.owner.read(cx).error.clone().map(|error| {
                         div()
@@ -5114,14 +5196,6 @@ impl Render for Shell {
                     }))
                     .child(self.workspace_bar(cx)),
             )
-            .child(
-                div()
-                    .absolute()
-                    .size(px(0.))
-                    .invisible()
-                    .overflow_hidden()
-                    .children(background_work),
-            )
             .children(self.session_picker.clone())
             .children(self.park_sheet.clone())
             .children(self.new_work_sheet.clone())
@@ -5134,6 +5208,7 @@ impl Render for Shell {
             )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
+            .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
@@ -5225,14 +5300,30 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     let app_shutdown = shutdown.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let (model, startup_save) = if let Some(snapshot) = live_snapshot {
-        let file = match snapshot.workspaces.loaded {
+    let (mut model, startup_save) = if let Some(snapshot) = live_snapshot {
+        let mut file = match snapshot.workspaces.loaded {
             gitterm_core::desktop_store::LoadState::Valid(file) => file,
             gitterm_core::desktop_store::LoadState::Missing => Default::default(),
             gitterm_core::desktop_store::LoadState::Refused(error) => {
                 anyhow::bail!("Live workspaces refused: {error}")
             }
         };
+        if !file.workspaces.iter().any(|workspace| workspace.active) {
+            let initial = gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            );
+            // Live owns V6 persistence. Preview's fallback below is memory only.
+            file = live_desktop
+                .as_ref()
+                .expect("Live desktop owner")
+                .try_edit_workspaces(move |file| {
+                    file.workspaces.push(initial);
+                    file.active_workspace = 0;
+                    Ok(())
+                })
+                .wait()
+                .map_err(anyhow::Error::msg)?;
+        }
         store.load()?;
         store.parked.clear();
         let catalog = workspace_config::IcedCatalog::from_document(host_lock.root(), file);
@@ -5249,6 +5340,21 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         let model = workspace_config::load_iced_workspaces(&mut store);
         (model, None)
     };
+    let empty_preview_start = !sample && model.workspaces.is_empty();
+    if empty_preview_start {
+        let catalog = store.iced.as_mut().expect("loaded Iced catalog");
+        if catalog.source.as_os_str().is_empty() {
+            catalog.source = workspace_config::iced_config_dir();
+        }
+        catalog
+            .workspaces
+            .push(gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            ));
+        catalog.order = vec![0];
+        catalog.active = 0;
+        model = WorkspaceStatus::from_iced(catalog);
+    }
     let (title_workspace, title_tab) = model
         .active()
         .and_then(|active| {
@@ -5360,10 +5466,13 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                             owner.update(cx, |owner, cx| owner.watch_save(save, cx));
                         }
                         let data = Rc::new(data::LocalData(owner.clone()));
-                        let shell = Shell::with_owner_settings(
+                        let mut shell = Shell::with_owner_settings(
                             data, owner, &config, true, &settings, window, cx,
                         )
                         .expect("create local shell");
+                        if empty_preview_start {
+                            terminal_setup::start_initial_terminal(&mut shell, window, cx);
+                        }
                         shell.sync_git_visibility(false, cx);
                         shell
                     }
@@ -5666,8 +5775,9 @@ impl Shell {
             tab,
             |w| self.workspaces[w].sessions.len(),
             |w, t| {
-                self.session_task(self.workspaces[w].sessions[t].id, cx)
-                    .is_some_and(|id| tasks.iter().any(|task| task.task_id == id && needs(task)))
+                self.session_attention(&self.workspaces[w], self.workspaces[w].sessions[t].id, cx)
+                    .kind
+                    .is_some()
             },
         );
         if self.usage_open {
@@ -6609,6 +6719,26 @@ mod tests {
                 );
             }
         });
+        // A new terminal gets its own status context and initial poll. Let that
+        // finish before testing a subsequent maintenance request (as Iced's
+        // per-tab status state rejects another request while one is in flight).
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if cx.read(|cx| {
+                let workspace = &owner.read(cx).model.workspaces[0];
+                workspace.checked
+                    && !workspace.status.git_status_loading
+                    && workspace.status.branch_name == "live-fixture"
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new terminal status did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // A real subsequent maintenance request sees a filesystem change.
         std::fs::write(repo.path().join("later.txt"), "later").unwrap();
         cx.update(|_, cx| {
@@ -6620,6 +6750,7 @@ mod tests {
                 );
             })
         });
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
         loop {
             cx.run_until_parked();
             if cx.read(|cx| {

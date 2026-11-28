@@ -1,7 +1,7 @@
 #[cfg(test)]
 use git2::Status;
 use git2::{DiffOptions, Repository};
-use gitterm::chats::ChatEntryResume;
+use gitterm::chats::{can_resume_as_chat, new_claude_chat_config, ChatEntryResume, ChatMachine};
 #[cfg(test)]
 use gitterm::task_worktree::DEFAULT_TASK_BASE;
 use gitterm::tasks::task_handoff_prompt;
@@ -36,6 +36,9 @@ use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
+use gitterm_core::content::syntax::{
+    syntect_syntax_for_path, syntect_syntax_set, syntect_theme_for, syntect_theme_set,
+};
 use similar::{ChangeTag, TextDiff};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,8 +49,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 #[cfg(feature = "excalidraw")]
@@ -2403,38 +2404,7 @@ impl ParkMode {
     }
 }
 
-/// Why a running parked workspace came back to the bar (TRU-186), shown
-/// on its chip until it is visited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeReason {
-    NeedsYou,
-    Finished,
-    Failed,
-}
-
-impl WakeReason {
-    /// The chat attention marks that wake it: a question or permission
-    /// request, a finished turn, an error. Delegation results are not a
-    /// chat of its own asking.
-    fn for_attention(reason: AttentionReason) -> Option<Self> {
-        match reason {
-            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
-            AttentionReason::CompletedUnread => Some(Self::Finished),
-            AttentionReason::AgentFailed => Some(Self::Failed),
-            AttentionReason::DelegationReady(_)
-            | AttentionReason::DelegationFailed(_)
-            | AttentionReason::DelegationBlocked(_) => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NeedsYou => "needs you",
-            Self::Finished => "finished",
-            Self::Failed => "failed",
-        }
-    }
-}
+use gitterm_core::park::WakeReason;
 
 /// The wake a chat event raises: the attention mark it drives today
 /// (`agent_event_attention_reason`), no detection of its own.
@@ -2488,8 +2458,7 @@ where
 /// tabs left (at least one): a later tab shifts down one; the removed
 /// tab's place goes to the tab after it, else the last.
 fn active_tab_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
-    let active = if active > removed { active - 1 } else { active };
-    active.min(remaining.saturating_sub(1))
+    gitterm_core::workspace_config::active_tab_after_removal(active, removed, remaining)
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -2973,9 +2942,6 @@ const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
 const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
 const LARGE_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
 const LARGE_TEXT_PREVIEW_LINES: usize = 2000;
-const MAX_SYNTAX_HIGHLIGHT_BYTES: usize = 96 * 1024;
-const MAX_SYNTAX_HIGHLIGHT_LINES: usize = 1200;
-const MAX_SYNTAX_HIGHLIGHT_SEGMENTS: usize = 8000;
 const MAX_FILE_VIEW_RENDER_LINES: usize = 1200;
 const MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX: usize = 1200;
 const MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES: usize = 768 * 1024;
@@ -3126,17 +3092,9 @@ pub struct FileVersionSignature {
 }
 
 fn file_version_signature(path: &Path) -> Option<FileVersionSignature> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified_unix_nanos = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-
-    Some(FileVersionSignature {
-        modified_unix_nanos,
-        file_len: metadata.len(),
+    gitterm_core::content::file_version_signature(path).map(|signature| FileVersionSignature {
+        modified_unix_nanos: signature.modified_unix_nanos,
+        file_len: signature.file_len,
     })
 }
 
@@ -3238,41 +3196,6 @@ fn hash_diff_lines(diff_lines: &[DiffLine]) -> u64 {
     hasher.finish()
 }
 
-fn syntect_syntax_set() -> &'static SyntaxSet {
-    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn syntect_theme_set() -> &'static ThemeSet {
-    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
-
-fn syntect_theme_for(is_dark_theme: bool) -> &'static syntect::highlighting::Theme {
-    let theme_set = syntect_theme_set();
-    let preferred = if is_dark_theme {
-        [
-            "base16-eighties.dark",
-            "base16-ocean.dark",
-            "Solarized (dark)",
-        ]
-    } else {
-        ["InspiredGitHub", "base16-ocean.light", "Solarized (light)"]
-    };
-
-    for name in preferred {
-        if let Some(theme) = theme_set.themes.get(name) {
-            return theme;
-        }
-    }
-
-    theme_set
-        .themes
-        .values()
-        .next()
-        .expect("syntect default themes should not be empty")
-}
-
 fn warm_syntect_engine() {
     let started = Instant::now();
     let syntax_set = syntect_syntax_set();
@@ -3312,61 +3235,6 @@ fn warm_syntect_engine() {
     perf_log!("syntect warmup took={}ms", started.elapsed().as_millis());
 }
 
-fn syntect_syntax_for_path(path: &Path) -> &'static SyntaxReference {
-    let syntax_set = syntect_syntax_set();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_ascii_lowercase();
-        if let Some(syntax) = syntax_set.find_syntax_by_extension(&ext) {
-            return syntax;
-        }
-
-        // Some packaged syntax sets do not register TS/TSX extensions.
-        // Fall back to close JavaScript/TypeScript aliases before plain text.
-        let alias_extensions: &[&str] = match ext.as_str() {
-            "ts" => &["tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
-            "tsx" => &["ts", "jsx", "js", "mjs", "cjs"],
-            "mts" | "cts" => &["ts", "js", "mjs", "cjs"],
-            "jsx" => &["js", "tsx", "ts", "mjs", "cjs"],
-            "mjs" | "cjs" => &["js", "jsx", "ts", "tsx"],
-            _ => &[],
-        };
-        for alias in alias_extensions {
-            if let Some(syntax) = syntax_set.find_syntax_by_extension(alias) {
-                return syntax;
-            }
-        }
-
-        let alias_tokens: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &["typescript", "ts", "tsx", "javascript", "js", "jsx"],
-            "js" | "jsx" | "mjs" | "cjs" => &["javascript", "js", "jsx", "typescript", "ts", "tsx"],
-            _ => &[],
-        };
-        for token in alias_tokens {
-            if let Some(syntax) = syntax_set.find_syntax_by_token(token) {
-                return syntax;
-            }
-        }
-
-        let alias_names: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &[
-                "TypeScript",
-                "TypeScript React",
-                "JavaScript",
-                "JavaScript (Babel)",
-            ],
-            "js" | "jsx" | "mjs" | "cjs" => &["JavaScript", "JavaScript (Babel)", "TypeScript"],
-            _ => &[],
-        };
-        for name in alias_names {
-            if let Some(syntax) = syntax_set.find_syntax_by_name(name) {
-                return syntax;
-            }
-        }
-    }
-
-    syntax_set.find_syntax_plain_text()
-}
-
 fn syntect_color_to_iced(color: syntect::highlighting::Color) -> iced::Color {
     // Keep syntax colors fully opaque in the Iced viewer; some themes encode alpha in ways
     // that can make token colors appear washed out or invisible.
@@ -3394,94 +3262,27 @@ fn build_syntax_highlight_lines(
         }
     }
 
-    let total_bytes = content.len();
-
-    let syntax_set = syntect_syntax_set();
-    let syntax = syntect_syntax_for_path(path);
-    let theme = syntect_theme_for(is_dark_theme);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let fallback_color = if is_dark_theme {
-        color!(0xcdd6f4)
-    } else {
-        color!(0x4c4f69)
-    };
-
-    let mut highlighted_lines =
-        Vec::with_capacity(total_line_count.min(MAX_SYNTAX_HIGHLIGHT_LINES));
-    let mut parse_errors = 0usize;
-    let mut highlighted_line_count = 0usize;
-    let mut highlighted_bytes = 0usize;
-    let mut highlighted_segment_count = 0usize;
-    let mut truncation_notice: Option<String> = None;
-
-    for line_with_ending in LinesWithEndings::from(content) {
-        let line_bytes = line_with_ending.len();
-        if highlighted_line_count >= MAX_SYNTAX_HIGHLIGHT_LINES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} lines for performance.",
-                MAX_SYNTAX_HIGHLIGHT_LINES
-            ));
-            break;
-        }
-        if highlighted_bytes + line_bytes > MAX_SYNTAX_HIGHLIGHT_BYTES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first ~{} KB for performance.",
-                MAX_SYNTAX_HIGHLIGHT_BYTES / 1024
-            ));
-            break;
-        }
-
-        let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        let mut segments = Vec::new();
-        if let Ok(ranges) = highlighter.highlight_line(line_with_ending, syntax_set) {
-            for (style, token) in ranges {
-                let token = token.trim_end_matches(['\r', '\n']);
-                if token.is_empty() {
-                    continue;
-                }
-                segments.push(SyntaxHighlightSegment {
-                    text: token.to_string(),
-                    color: syntect_color_to_iced(style.foreground),
-                });
-            }
-        } else {
-            parse_errors += 1;
-        }
-
-        highlighted_segment_count += segments.len();
-        if highlighted_segment_count > MAX_SYNTAX_HIGHLIGHT_SEGMENTS {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} tokens for performance.",
-                MAX_SYNTAX_HIGHLIGHT_SEGMENTS
-            ));
-            break;
-        }
-
-        if segments.is_empty() {
-            let fallback_text = if line.is_empty() { " " } else { line };
-            segments.push(SyntaxHighlightSegment {
-                text: fallback_text.to_string(),
-                color: fallback_color,
-            });
-        }
-
-        highlighted_line_count += 1;
-        highlighted_bytes += line_bytes;
-        highlighted_lines.push(SyntaxHighlightLine { segments });
-    }
-
-    perf_log!(
-        "syntect path={} syntax={} lines={} highlighted_lines={} bytes={} highlighted_bytes={} parse_errors={} truncated={}",
-        path.display(),
-        syntax.name,
-        total_line_count,
-        highlighted_lines.len(),
-        total_bytes,
-        highlighted_bytes,
-        parse_errors,
-        truncation_notice.is_some()
-    );
-    let lines = Some(highlighted_lines);
+    let (lines, truncation_notice) =
+        gitterm_core::content::syntax::build_syntax_highlight_lines(path, content, is_dark_theme);
+    let lines = lines.map(|lines| {
+        lines
+            .into_iter()
+            .map(|line| SyntaxHighlightLine {
+                segments: line
+                    .segments
+                    .into_iter()
+                    .map(|segment| SyntaxHighlightSegment {
+                        text: segment.text,
+                        color: iced::Color::from_rgb8(
+                            segment.color[0],
+                            segment.color[1],
+                            segment.color[2],
+                        ),
+                    })
+                    .collect(),
+            })
+            .collect()
+    });
     if let Some(key) = cache_key {
         if let Ok(mut cache) = syntax_highlight_cache().lock() {
             cache.put(
@@ -3730,58 +3531,7 @@ impl RunOutput {
 
 use gitterm_core::workspace_config::detect_run_command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionReason {
-    HumanInputRequired,
-    AgentFailed,
-    CompletedUnread,
-    /// A Codex review or consult this tab requested has its result (TRU-142).
-    DelegationReady(gitterm::tasks::DelegationKind),
-    /// A Codex review or consult this tab requested failed.
-    DelegationFailed(gitterm::tasks::DelegationKind),
-    /// A worker this tab delegated reported itself blocked (TRU-142 S6):
-    /// it needs the human.
-    DelegationBlocked(gitterm::tasks::DelegationKind),
-}
-
-impl AttentionReason {
-    /// Rank on the shared attention scale: 0 input needed · 1 failed ·
-    /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
-    /// completions by construction.
-    fn priority(self) -> u8 {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => 0,
-            Self::AgentFailed | Self::DelegationFailed(_) => 1,
-            Self::CompletedUnread | Self::DelegationReady(_) => 3,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired => gitterm_core::attention_notifications::INPUT_REQUIRED,
-            Self::AgentFailed => "Agent failed",
-            Self::CompletedUnread => "Ready to review",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Consult) => "Consult ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Implement) => "Worker done",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
-            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => {
-                gitterm_core::attention_notifications::WORKER_BLOCKED
-            }
-            Self::DelegationBlocked(_) => gitterm_core::attention_notifications::DELEGATION_BLOCKED,
-        }
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => "●",
-            Self::AgentFailed | Self::DelegationFailed(_) => "!",
-            Self::CompletedUnread | Self::DelegationReady(_) => "✓",
-        }
-    }
-}
+use gitterm_core::attention::AttentionReason;
 
 #[derive(Debug, Clone, Copy)]
 struct TabAttention {
@@ -4081,9 +3831,7 @@ use gitterm_core::attention_notifications::{
 };
 
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
-    title
-        .starts_with('✳')
-        .then_some(AttentionReason::HumanInputRequired)
+    gitterm_core::attention::terminal_title_attention_reason(title)
 }
 
 /// Row presentation for a task attention reason on the shared priority
@@ -4100,49 +3848,13 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
     }
 }
 
-/// What a chat tab's icon in the session strip says about its live session
-/// (TRU-140). Terminal tabs get this from Claude's own title; a chat tab
-/// has no title, so the strip reads the agent session instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatTabMarker {
-    /// A permission prompt or question waits on the human: the strip's
-    /// "needs you" dot. `pulse` is off on the tab in front, whose page
-    /// already shows the request card.
-    NeedsYou { pulse: bool },
-    /// A turn is running: the strip's ▶ marker.
-    Running,
-}
-
-/// The marker for a chat tab: a pending request outranks a running turn
-/// (the human is the blocker); neither means the tab falls back to its
-/// attention icon or the idle chat glyph. Clears as soon as the requests
-/// are answered and the turn ends, since both inputs are live state.
-fn chat_tab_marker(
-    turn_running: bool,
-    pending_requests: usize,
-    is_active: bool,
-) -> Option<ChatTabMarker> {
-    if pending_requests > 0 {
-        Some(ChatTabMarker::NeedsYou { pulse: !is_active })
-    } else if turn_running {
-        Some(ChatTabMarker::Running)
-    } else {
-        None
-    }
-}
+use gitterm_core::attention::{chat_tab_marker, ChatTabMarker};
 
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
     match event {
-        tab::AgentEvent::Harness(harness_event) => match harness_event {
-            HarnessEvent::RuntimeRequest { .. } => Some(AttentionReason::HumanInputRequired),
-            HarnessEvent::TurnCompleted { status, .. } => match status {
-                TurnStatus::Completed => Some(AttentionReason::CompletedUnread),
-                TurnStatus::Failed(_) => Some(AttentionReason::AgentFailed),
-                TurnStatus::Interrupted => None,
-            },
-            HarnessEvent::Error(_) => Some(AttentionReason::AgentFailed),
-            _ => None,
-        },
+        tab::AgentEvent::Harness(event) => {
+            gitterm_core::attention::harness_event_attention_reason(event)
+        }
         tab::AgentEvent::Result(_) => Some(AttentionReason::CompletedUnread),
         tab::AgentEvent::Other(value) => match value.get("type").and_then(|value| value.as_str()) {
             Some("done") => Some(AttentionReason::CompletedUnread),
@@ -4262,42 +3974,6 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
 /// The handshake capability of an agent that runs native Claude chats
 /// (`ClaudeChat` / `ClaudeChatHistory`, TRU-152).
 const CLAUDE_CHAT_CAPABILITY: &str = "claude_chat";
-
-/// Which machine a Chats-panel entry is on, for "Resume as Chat".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatMachine {
-    Local,
-    /// `claude_chat`: the remote's agent is reachable and advertises it.
-    Remote {
-        claude_chat: bool,
-    },
-}
-
-/// Whether the Chats panel offers "Resume as Chat" for an entry: a Claude
-/// conversation whose recorded directory still exists and that no tab owns
-/// yet (an owned one shows "Go to Session"), on this Mac or on a remote
-/// whose agent runs native Claude chats. Codex and pi chats, chats on
-/// older or unreachable agents and dead-cwd chats keep only their
-/// existing action.
-fn can_resume_as_chat(entry: &chats::ChatIndexEntry, machine: ChatMachine, is_live: bool) -> bool {
-    let machine_ok = match machine {
-        ChatMachine::Local => true,
-        ChatMachine::Remote { claude_chat } => claude_chat,
-    };
-    entry.backend == chats::ChatBackend::Claude && machine_ok && !is_live && !entry.dead_cwd
-}
-
-/// The config a new Claude chat tab starts with: the remembered or configured
-/// model and effort ("default" leaves the model to the user's Claude
-/// settings) and the default permission mode.
-fn new_claude_chat_config(chat_config: &config::ChatDefaults) -> AgentBackendConfig {
-    let selection = chat_config.new_chat_selection();
-    AgentBackendConfig::Claude {
-        model: selection.model,
-        permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
-        effort: selection.effort,
-    }
-}
 
 /// A mode, model or effort value from the chat page that can be handed to
 /// an ACP agent, which validates it against what it offers: one short
@@ -4443,18 +4119,7 @@ fn new_acp_chat_config(
     chat_config: &config::ChatDefaults,
     agent: gitterm::harness::acp::AcpAgent,
 ) -> AgentBackendConfig {
-    use gitterm::harness::acp::AcpAgent;
-    let model = match agent {
-        AcpAgent::Antigravity => chat_config.antigravity_model.trim().to_string(),
-        AcpAgent::Gemini => String::new(),
-        AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
-    };
-    AgentBackendConfig::Acp {
-        agent,
-        model,
-        mode: Some(agent.default_mode().to_string()),
-        effort: None,
-    }
+    gitterm_core::harness::acp_launch::new_chat_config(chat_config, agent)
 }
 
 /// The session of a chat tab resuming Claude session `session_id`: the new
@@ -8170,9 +7835,7 @@ const SPINE_WIDTH: f32 = 36.0;
 /// two must move together or the webview overlaps/undershoots the strip.
 const SESSION_STRIP_HEIGHT: f32 = 36.0;
 
-const SLIDE_DURATION_MS: f32 = 400.0;
-const SWIPE_DEBOUNCE_MS: u64 = 150;
-const EDGE_PEEK_ZONE: f32 = 30.0;
+use gitterm_core::workspace::slide::{SLIDE_DURATION_MS, SWIPE_DEBOUNCE_MS};
 
 fn workspace_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-slide")
@@ -8549,6 +8212,7 @@ fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
         return None;
     }
     Some(RepoConfig {
+        extra: Default::default(),
         dir: repo_config_dir(repo),
         location: workspace_location_config_from_location(&repo.location),
         run_command: repo.run_command.clone(),
@@ -8770,8 +8434,10 @@ type PhonePanel = phone_panel::PhonePanel<iced::widget::image::Handle>;
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
 /// the code (modules) that scanners need.
-const PHONE_QR_SCALE: usize = 6;
-const PHONE_QR_QUIET: usize = 4;
+#[cfg(test)]
+const PHONE_QR_SCALE: usize = phone_panel::PHONE_QR_SCALE;
+#[cfg(test)]
+const PHONE_QR_QUIET: usize = phone_panel::PHONE_QR_QUIET;
 
 /// Run one phone panel call against the remote's agent; the answer comes
 /// back as the event the panel applies.
@@ -8806,29 +8472,9 @@ async fn run_phone_call(call: PhoneCall<RemoteAgentClientConfig>) -> Event {
 
 /// The pairing URL as a QR image (black on white, quiet zone included).
 fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
-    let code = qrcode::QrCode::new(url.as_bytes())
-        .map_err(|err| format!("could not draw the pairing QR code: {err}"))?;
-    let modules = code.width();
-    let side = (modules + 2 * PHONE_QR_QUIET) * PHONE_QR_SCALE;
-    let mut pixels = vec![255u8; side * side * 4];
-    for (index, color) in code.to_colors().iter().enumerate() {
-        if *color != qrcode::Color::Dark {
-            continue;
-        }
-        let (mx, my) = (index % modules, index / modules);
-        for dy in 0..PHONE_QR_SCALE {
-            let y = (my + PHONE_QR_QUIET) * PHONE_QR_SCALE + dy;
-            for dx in 0..PHONE_QR_SCALE {
-                let x = (mx + PHONE_QR_QUIET) * PHONE_QR_SCALE + dx;
-                let at = (y * side + x) * 4;
-                pixels[at..at + 3].fill(0);
-            }
-        }
-    }
+    let qr = phone_panel::pairing_qr(url)?;
     Ok(iced::widget::image::Handle::from_rgba(
-        side as u32,
-        side as u32,
-        pixels,
+        qr.side, qr.side, qr.pixels,
     ))
 }
 
@@ -10333,6 +9979,7 @@ impl App {
                 })
                 .collect(),
             env: self.workspace_repo_env(ws, ws.home),
+            legacy_env_base: None,
             active: true,
             chats: ws.chats.clone(),
             parked: None,
@@ -10473,21 +10120,7 @@ impl App {
     /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
-        let path = config::global_config_dir().join("profiles.json");
-        let contents = std::fs::read_to_string(&path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct Profile {
-            #[allow(dead_code)]
-            description: Option<String>,
-            env: HashMap<String, String>,
-        }
-        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
-        Some(
-            profiles
-                .into_iter()
-                .map(|(name, p)| (name, p.env))
-                .collect(),
-        )
+        gitterm_core::workspace_settings::load_profiles(&config::global_config_dir())
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -15828,35 +15461,21 @@ impl App {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        if let Some(overridden) = ws.env_overrides.get_mut(&key) {
-            match value {
-                Some(value) => *overridden = value,
-                None => {
-                    ws.env_overrides.remove(&key);
-                }
-            }
-            return;
-        }
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            match value {
-                Some(value) => repo.env.insert(key, value),
-                None => repo.env.remove(&key),
-            };
-        }
+        gitterm_core::workspace_settings::EnvEdit::Set { key, value }.apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
-    /// A profile replaces workspace `idx`'s env: its home repo's env
-    /// becomes the profile and its overrides are cleared.
+    /// A profile replaces the home repo's env and clears workspace overrides.
     fn apply_env_profile(&mut self, idx: usize, profile: HashMap<String, String>) {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        ws.env_overrides.clear();
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            repo.env = profile;
-        }
+        gitterm_core::workspace_settings::EnvEdit::Profile(profile).apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
     /// Adds `workspace` to the bar in machine order, makes it active and
@@ -17611,11 +17230,15 @@ impl App {
                     ));
                 }
                 ReviewEffect::SaveMarks => {
-                    if let Some(Ok(marks)) = self.review.marks() {
+                    if let (Some(Ok(marks)), Some(previous)) =
+                        (self.review.marks(), self.review.marks_before_save())
+                    {
                         if let Err(error) =
-                            review_pane::save_viewed_marks(marks, &config::global_config_dir())
+                            marks.save_changes(previous, &config::global_config_dir())
                         {
                             eprintln!("[review] {error}");
+                        } else {
+                            self.review.marks_saved();
                         }
                     }
                 }
@@ -18317,16 +17940,10 @@ impl App {
             );
             return Task::none();
         };
-        let name = root
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("remote")
-            .to_string();
+        let name = gitterm_core::remote::folders::workspace_name(&remote_name, &root);
         let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
         let mut workspace = Workspace::new(
-            format!("{remote_name}:{name}"),
+            name,
             PathBuf::from(&root),
             WorkspaceColor::next_available(&used_colors),
         );
@@ -18380,30 +17997,20 @@ impl App {
     /// "same machine" alone isn't enough to reuse the active workspace.
     fn open_remote_folder_tab(&mut self, remote_id: &str, dir: String) -> Task<Event> {
         let folder = PathBuf::from(&dir);
-        let holds = |ws: &Workspace| match &ws.location {
-            WorkspaceLocation::RemoteAgent {
-                remote_id: rid,
-                root,
-                ..
-            } => rid == remote_id && folder.starts_with(root),
-            _ => false,
-        };
-        let existing = self
-            .active_workspace()
-            .filter(|ws| holds(ws))
-            .map(|_| self.active_workspace_index())
-            .or_else(|| {
-                // Deepest root first, as for chats.
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ws)| holds(ws))
-                    .max_by_key(|(_, ws)| {
-                        remote_agent_root(&ws.location)
-                            .map_or(0, |root| Path::new(root).components().count())
-                    })
-                    .map(|(idx, _)| idx)
-            });
+        let locations: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|ws| workspace_location_config_from_location(&ws.location))
+            .collect();
+        let existing = gitterm_core::remote::folders::folder_workspace(
+            locations
+                .iter()
+                .enumerate()
+                .map(|(i, location)| (i, location.as_ref())),
+            self.active_workspace_index(),
+            remote_id,
+            &folder,
+        );
         let mut tasks = Vec::new();
         match existing {
             Some(ws_idx) => {
@@ -21087,7 +20694,7 @@ impl App {
         // before startup I/O and the first window/menu tasks can receive quit.
         #[cfg(target_os = "macos")]
         native_quit::install();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = gitterm_core::workspace_config::initial_directory();
         let config::LoadedSettings {
             config,
             refused: settings_refused,
@@ -21586,11 +21193,8 @@ impl App {
         // If no workspaces were loaded, create one from the current directory
         if app.workspaces.is_empty() {
             let dir = cwd;
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Home".to_string());
-            let mut workspace = Workspace::new(name, dir.clone(), WorkspaceColor::Lavender);
+            let initial = gitterm_core::workspace_config::initial_workspace(&dir);
+            let mut workspace = Workspace::new(initial.name, dir.clone(), initial.color.into());
             app.add_tab_to_workspace(&mut workspace, dir);
             app.open_workspace(workspace);
         }
@@ -24055,7 +23659,8 @@ impl App {
         let stt_recording = false;
         if self.any_tab_requires_attention_pulse() || stt_recording {
             subs.push(
-                iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
+                iced::time::every(gitterm_core::attention::PULSE_INTERVAL)
+                    .map(|_| Event::AttentionPulseTick),
             );
         }
 
@@ -27372,32 +26977,23 @@ impl App {
                 // Step 3-only: spawn a pi-backed agent tab in the active workspace
                 // and submit a hardcoded prompt so we can verify the subprocess
                 // pipeline end-to-end. Removed before Step 4 lands.
-                let model = std::env::var("PI_MODEL")
-                    .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
-                let session_path =
-                    format!("/tmp/gitterm-v6-agent-debug-{}.jsonl", std::process::id());
-                let config = tab::AgentBackendConfig::Pi {
-                    model,
-                    session_path: Some(session_path),
-                    thinking: Some(true),
+                let Some(ws) = self.active_workspace() else {
+                    return Task::none();
                 };
-                let (repo_path, current_dir) = match self.active_workspace() {
-                    Some(ws) => {
-                        let cd = ws
-                            .active_tab()
-                            .map(|t| t.current_dir.clone())
-                            .unwrap_or_else(|| ws.dir.clone());
-                        (ws.dir.clone(), Some(cd))
-                    }
-                    None => return Task::none(),
-                };
+                let repo_path = ws.dir.clone();
+                let launch = gitterm_core::harness::pi::runtime::debug_launch(
+                    &repo_path,
+                    ws.active_tab().map(|tab| tab.current_dir.as_path()),
+                    std::env::var("PI_MODEL"),
+                    std::process::id(),
+                );
 
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
                 if let Some(ws) = self.active_workspace_mut() {
                     let mut tab = TabState::new(id, repo_path.clone());
-                    tab.kind = TabKind::Agent(AgentSession::new(config));
-                    tab.set_local_dir(current_dir.unwrap_or(repo_path));
+                    tab.kind = TabKind::Agent(AgentSession::new(launch.config));
+                    tab.set_local_dir(launch.cwd);
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
                 }
@@ -29923,13 +29519,12 @@ impl App {
                         .iter()
                         .position(|&idx| idx == self.active_workspace_index())
                         .unwrap_or(0);
-                    let has_left = position > 0;
-                    let has_right = position + 1 < order.len();
-
-                    let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
-                    let near_right = has_right
-                        && content_x > content_width - EDGE_PEEK_ZONE
-                        && content_x <= content_width;
+                    let (near_left, near_right) = gitterm_core::workspace::slide::edge_peek(
+                        content_x,
+                        content_width,
+                        position,
+                        order.len(),
+                    );
 
                     if near_left != self.edge_peek_left || near_right != self.edge_peek_right {
                         self.edge_peek_left = near_left;
@@ -31799,7 +31394,9 @@ impl App {
                                 tab_id,
                                 iced_term::Event::BackendCall(
                                     tab_id as u64,
-                                    iced_term::backend::Command::Write(text.into_bytes()),
+                                    iced_term::backend::Command::Write(
+                                        gitterm_core::dictation::terminal_transcript_bytes(text),
+                                    ),
                                 ),
                             ));
                         } else {
@@ -31905,7 +31502,7 @@ impl App {
                 if let Some(start_time) = self.slide_start_time {
                     let elapsed = start_time.elapsed().as_millis() as f32;
                     let t = (elapsed / SLIDE_DURATION_MS).min(1.0);
-                    let eased = 1.0 - (1.0 - t).powi(3);
+                    let eased = gitterm_core::workspace::slide::eased(elapsed);
                     self.slide_offset = self.slide_start_offset
                         + (self.slide_target - self.slide_start_offset) * eased;
 
@@ -31960,7 +31557,11 @@ impl App {
                         // Update active workspace based on current scroll
                         // position, in the slide's order (TRU-175).
                         let order = self.slide_order();
-                        let position = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let position = gitterm_core::workspace::slide::nearest(
+                            offset,
+                            viewport_width,
+                            order.len(),
+                        );
                         let nearest = order
                             .get(position.min(order.len().saturating_sub(1)))
                             .copied()
@@ -55175,6 +54776,7 @@ mod tests {
             run_command: None,
             bottom_terminals: Vec::new(),
             env: HashMap::new(),
+            legacy_env_base: None,
             active: false,
             chats: Vec::new(),
             parked: parked_at.map(|at| ParkedInfo {
@@ -55485,6 +55087,7 @@ mod tests {
     #[test]
     fn the_repos_section_keeps_open_repos_and_those_closed_workspaces_list() {
         let open = vec![RepoConfig {
+            extra: Default::default(),
             dir: "/tmp/tru180-open".into(),
             location: None,
             run_command: None,
@@ -55492,6 +55095,7 @@ mod tests {
             bottom_terminals: Vec::new(),
         }];
         let stored_for = |dir: &str| RepoConfig {
+            extra: Default::default(),
             dir: dir.into(),
             location: None,
             run_command: Some("make".into()),

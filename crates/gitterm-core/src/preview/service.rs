@@ -240,6 +240,9 @@ pub fn classify_task_action(action: &TaskMutationAction) -> Class {
         A::PersistPreparation { .. } => class("Save task", Access::Write),
         A::PersistDelivery { .. } => class("Save delivery", Access::Write),
         A::PersistHandoff { .. } => class("Save handoff", Access::Write),
+        A::StopTask { .. } => class("Close session", Access::Process),
+        A::CancelQueue { .. } => class("Save task", Access::Write),
+        A::ResumeConversation { .. } => class("Launch session", Access::Process),
         A::ArchiveTask { .. } => class("Close task", Access::Write),
         A::RemoveWorktree { .. } => class("Remove worktree", Access::Write),
         A::ClearWorktree { .. } => class("Remove worktree", Access::Write),
@@ -378,17 +381,17 @@ impl ServiceContext {
         })
     }
 
-    /// Live admits task/merge-plan writes, guarded PR actions, task execution
-    /// and result delivery. General restore and
+    /// Live admits task/merge-plan writes, guarded PR actions, task execution,
+    /// result delivery, browser control and HTML previews. General restore and
     /// notify ingress stay closed; current workers have scoped notify admission.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
     }
     /// Browser setup must not open a default target or initialize an external
-    /// engine in Preview, fixtures, or this restricted Live slice.
+    /// engine in Preview or fixtures. Live uses the production engine/profile.
     pub fn browser_read_only(&self) -> bool {
-        self.gpui_live || self.is_preview()
+        self.is_preview()
     }
 
     pub fn is_preview(&self) -> bool {
@@ -489,6 +492,9 @@ impl ServiceContext {
     }
 
     pub fn runner(&self, effect: RunnerEffect, target: Option<&Path>) -> Result<(), Denied> {
+        if self.gpui_live && !self.is_preview() && effect == RunnerEffect::HtmlPreview {
+            return Ok(());
+        }
         self.authorize(classify_runner(effect), target)
     }
 
@@ -497,11 +503,17 @@ impl ServiceContext {
     }
 
     pub fn phone<C>(&self, call: &crate::remote::phone_panel::PhoneCall<C>) -> Result<(), Denied> {
+        if self.gpui_live && matches!(self.mode, Mode::Production) {
+            return Ok(());
+        }
         self.authorize(classify_phone_request(&call.request), None)
     }
 
     /// `tool` is the browser MCP tool name, used as the notice label.
     pub fn browser(&self, tool: &str, access: BrowserAccess) -> Result<(), Denied> {
+        if self.gpui_live && !self.is_preview() {
+            return Ok(());
+        }
         self.decide(tool, classify_browser(access), None)
     }
 
@@ -596,6 +608,10 @@ impl ServiceContext {
                     | "merge_plan_set"
                     | "Dismiss delegation"
                     | "Save delivery"
+                    | "Create task"
+                    | "Save task"
+                    | "Close task"
+                    | "Remove worktree"
             );
         let live_task_process = access == Access::Process
             && matches!(
@@ -612,13 +628,16 @@ impl ServiceContext {
                     | "Stop delegation"
                     | "Automatic delivery"
                     | "Deliver results"
+                    | "Close session"
             );
+        let live_task_publish = access == Access::Outside && label == "Publish";
         let live_pr_action =
             access == Access::Outside && matches!(label, "Approve" | "Merge" | "Ready for review");
         if self.gpui_live
             && !matches!(access, Access::Read | Access::Existing)
             && !live_task_write
             && !live_task_process
+            && !live_task_publish
             && !live_pr_action
         {
             return Err(denied(label));
@@ -939,6 +958,71 @@ mod tests;
 mod live_tests {
     use super::*;
     #[test]
+    fn task_panel_effects_are_live_only_and_access_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = ServiceContext::production(temp.path(), "panel")
+            .unwrap()
+            .for_gpui_live();
+        let protected = crate::preview::ProtectedRoots::new(&temp.path().join("home"), []).unwrap();
+        let preview = Preview::validate(&temp.path().join("preview"), protected).unwrap();
+        let preview = ServiceContext::preview(std::sync::Arc::new(preview)).unwrap();
+        use TaskMutationAction as A;
+        let actions = [
+            A::PrepareTask(crate::task_commands::TaskCreate {
+                title: "Placeholder".into(),
+                objective: "Placeholder".into(),
+                repository_path: "/tmp/repo".into(),
+                workspace_name: None,
+                issue_key: None,
+                base_reference: Some("main".into()),
+                stopping_boundary: crate::tasks::StoppingBoundary::PlanOnly,
+                origin: crate::task_commands::TaskCreateOrigin::Form,
+            }),
+            A::CancelQueue {
+                task_id: "placeholder".into(),
+            },
+            A::ArchiveTask {
+                task_id: "placeholder".into(),
+            },
+            A::StopTask {
+                task_id: "placeholder".into(),
+                targets: vec![],
+            },
+            A::ClearWorktree {
+                task_id: "placeholder".into(),
+            },
+            A::RemoveWorktree {
+                task_id: "placeholder".into(),
+                repository: "/tmp/repo".into(),
+                path: "/tmp/worktree".into(),
+            },
+            A::Publish {
+                task_id: "placeholder".into(),
+                action: crate::task_commands::TaskPublish::PushBranch,
+                path: "/tmp/worktree".into(),
+                branch: "task/placeholder".into(),
+                base: "main".into(),
+                title: "Placeholder".into(),
+                body: "Placeholder".into(),
+            },
+        ];
+        for action in actions {
+            assert!(live.task_action(&action, None).is_ok(), "{action:?}");
+            assert_eq!(
+                preview.task_action(&action, None).unwrap_err().notice(),
+                preview_notice(classify_task_action(&action).label)
+            );
+        }
+        for (label, access) in [
+            ("Publish", Access::Write),
+            ("Close session", Access::Outside),
+            ("notify", Access::Write),
+        ] {
+            assert!(live.authorize(class(label, access), None).is_err());
+        }
+    }
+
+    #[test]
     fn live_pr_actions_are_admitted_only_in_production() {
         let dir = tempfile::tempdir().unwrap();
         let preview = Preview::validate(
@@ -976,12 +1060,81 @@ mod live_tests {
     }
 
     #[test]
+    fn live_browser_admits_production_only_and_html_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = ServiceContext::production(temp.path(), "fixture-live")
+            .unwrap()
+            .for_gpui_live();
+        let protected =
+            super::super::ProtectedRoots::new(&temp.path().join("fixture-home"), []).unwrap();
+        let roots = Arc::new(Preview::validate(&temp.path().join("preview"), protected).unwrap());
+        let preview = ServiceContext::preview(roots).unwrap().for_gpui_live();
+        for access in [
+            BrowserAccess::Read,
+            BrowserAccess::Launch,
+            BrowserAccess::Interact,
+            BrowserAccess::Scratch,
+        ] {
+            assert!(live.browser("browser_fixture", access).is_ok());
+            assert_eq!(
+                preview.browser("browser_fixture", access).is_ok(),
+                access == BrowserAccess::Read
+            );
+        }
+        assert!(!live.browser_read_only());
+        assert!(preview.browser_read_only());
+        assert!(live.runner(RunnerEffect::HtmlPreview, None).is_ok());
+        assert!(preview.runner(RunnerEffect::HtmlPreview, None).is_err());
+        assert!(live.runner(RunnerEffect::AutomaticDelivery, None).is_ok());
+    }
+
+    #[test]
+    fn parity_phone_live_context_admits_pair_and_revoke_preview_refuses() {
+        use crate::remote::phone_panel::{PhoneCall, PhoneRequest};
+        let temp = tempfile::tempdir().unwrap();
+        let production = ServiceContext::production(temp.path(), "placeholder").unwrap();
+        let live = production.clone().for_gpui_live();
+        assert_eq!(production.task_mcp().token(), live.task_mcp().token());
+        let protected = super::super::ProtectedRoots::new(&temp.path().join("home"), []).unwrap();
+        let roots = Arc::new(Preview::validate(&temp.path().join("preview"), protected).unwrap());
+        let preview = ServiceContext::preview(roots.clone())
+            .unwrap()
+            .for_gpui_live();
+        let fixture = temp.path().join("fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        std::fs::write(fixture.join(FIXTURE_MARKER), b"").unwrap();
+        let fixtures = ServiceContext::fixture_launch(roots, [fixture])
+            .unwrap()
+            .for_gpui_live();
+        for request in [
+            PhoneRequest::List,
+            PhoneRequest::Create {
+                device_name: "Example".into(),
+                scope: "view",
+            },
+            PhoneRequest::Revoke {
+                id: "placeholder".into(),
+            },
+        ] {
+            let read = request == PhoneRequest::List;
+            let call = PhoneCall {
+                remote_id: "placeholder".into(),
+                request,
+                client: (),
+            };
+            assert!(live.phone(&call).is_ok());
+            assert_eq!(preview.phone(&call).is_ok(), read);
+            assert_eq!(fixtures.phone(&call).is_ok(), read);
+        }
+    }
+
+    #[test]
     fn live_pr_integration_keeps_production_identity_but_closes_later_slice_effects() {
         let temp = tempfile::tempdir().unwrap();
         let production = ServiceContext::production(temp.path(), "274").unwrap();
         let live = production.clone().for_gpui_live();
         assert!(!live.is_preview());
-        assert!(live.browser_read_only());
+        assert!(!live.browser_read_only());
         assert_eq!(production.task_mcp().token(), live.task_mcp().token());
         for label in [
             "task_create",

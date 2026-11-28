@@ -486,3 +486,470 @@ fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppC
         px(16.)
     );
 }
+
+fn work_document(home: &Path, repos: &[&Path]) -> gitterm_core::workspace_config::WorkspacesFile {
+    serde_json::from_value(serde_json::json!({
+        "workspaces": [{ "name": "Fixture", "abbrev": "F", "color": "blue", "dir": home,
+            "chats": ["owned"], "repos": repos, "tabs": [] }], "active_workspace": 0
+    }))
+    .unwrap()
+}
+
+#[gpui::test]
+fn files_roots_follow_repositories_added_and_removed_during_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    let docs = home.path().join("docs");
+    for dir in [&first, &second, &docs] {
+        fs::create_dir(dir).unwrap();
+    }
+    fs::write(first.join("file.txt"), "snapshot").unwrap();
+    let (view, owner, cx) = setup(cx, home.path(), config.path());
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&first]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), first.clone(), docs.clone()]
+        )
+    });
+    view.update(cx, |view, cx| view.browse_root(first.clone(), cx));
+    wait_for(&view, "file.txt", cx);
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(
+            config.path(),
+            work_document(home.path(), &[&first, &second]),
+            cx,
+        )
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[
+                home.path().to_path_buf(),
+                first.clone(),
+                second.clone(),
+                docs.clone()
+            ]
+        );
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&second]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), second, docs]
+        );
+        // Iced retains panel_repo_root until All folders is clicked.
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    click(cx, "files-all-folders");
+    assert!(cx.debug_bounds("files-root-0").is_some());
+}
+
+#[gpui::test]
+fn files_hidden_entries_follow_saved_show_hidden_setting(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    for name in ["visible.txt", ".hidden"] {
+        fs::write(root.path().join(name), "fixture").unwrap();
+    }
+    fs::create_dir(root.path().join(".hidden-dir")).unwrap();
+    fs::create_dir(root.path().join("target")).unwrap();
+    let (_, owner, cx) = setup(cx, root.path(), config.path());
+    for show_hidden in [false, true] {
+        let settings =
+            serde_json::to_vec(&serde_json::json!({"show_hidden": show_hidden})).unwrap();
+        fs::write(config.path().join("settings.json"), &settings).unwrap();
+        owner.update(cx, |owner, cx| {
+            owner.apply_desktop_document(config.path(), work_document(root.path(), &[]), cx)
+        });
+        let view = cx.new(|cx| {
+            FilesView::new(
+                crate::data::WorkspaceId(1),
+                Rc::new(LocalData(owner.clone())),
+                cx,
+            )
+        });
+        wait_for(&view, "visible.txt", cx);
+        let listed = names(&view, cx);
+        assert_eq!(listed.contains(&".hidden".into()), show_hidden);
+        assert_eq!(listed.contains(&".hidden-dir".into()), show_hidden);
+        assert!(!listed.contains(&"target".into()));
+        assert_eq!(
+            fs::read(config.path().join("settings.json")).unwrap(),
+            settings
+        );
+    }
+}
+
+#[gpui::test]
+fn tab_context_gap3_files_directory_and_selection_return_with_the_tab(cx: &mut TestAppContext) {
+    let _app = crate::test_app::Cleanup::new(cx);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("child")).unwrap();
+    fs::write(root.path().join("child/file.txt"), "fixture").unwrap();
+    let (view, owner, cx) = setup(cx, root.path(), config.path());
+    let first = crate::data::SessionId(41);
+    let second = crate::data::SessionId(42);
+    let workspace = crate::data::WorkspaceId(1);
+    owner.update(cx, |owner, cx| {
+        for id in [first, second] {
+            owner.model.session_contexts.insert(
+                id,
+                crate::data::SessionContext {
+                    cwd: root.path().into(),
+                    terminal_dir: Some(root.path().into()),
+                    repo: root.path().into(),
+                    task_root: None,
+                    task_context: false,
+                    panel_repo: None,
+                    follow: Default::default(),
+                    observed_events: 0,
+                    follow_listing: false,
+                    follow_pending: Vec::new(),
+                },
+            );
+        }
+        owner.model.active_sessions.insert(workspace, first);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.navigate(root.path().join("child"), cx);
+        view.selected_file = Some(root.path().join("child/file.txt"));
+    });
+    owner.update(cx, |owner, cx| {
+        assert_eq!(
+            owner.model.session_contexts[&first].cwd,
+            root.path().join("child")
+        );
+        owner.model.active_sessions.insert(workspace, second);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.directory, root.path());
+        assert!(view.selected_file.is_none());
+    });
+    owner.update(cx, |owner, cx| {
+        owner.model.active_sessions.insert(workspace, first);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.directory, root.path().join("child"));
+        assert_eq!(view.selected_file, Some(root.path().join("child/file.txt")));
+    });
+}
+
+#[gpui::test]
+fn tab_context_gap3_directory_uses_v6_dir_in_live_and_never_writes_source_in_preview(
+    cx: &mut TestAppContext,
+) {
+    let _app = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let repo = root.path().join("repo");
+    let child = repo.join("child");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&child).unwrap();
+    let document = serde_json::json!({
+        "future_document": true, "active_workspace": 0,
+        "workspaces": [{ "name": "Fixture", "abbrev": "F", "color": "blue", "dir": repo,
+            "future_workspace": 7, "tabs": [{"dir": repo, "repo_dir": repo, "session_uid": "fixture-caller", "future_tab": "kept"}] }]
+    });
+    let path = source.join("workspaces.json");
+    fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let catalog = crate::workspace_config::IcedCatalog::read(&source).unwrap();
+    let model = WorkspaceStatus::from_iced(&catalog);
+    let workspace = crate::data::WorkspaceId(1);
+    let mut store = WorkspaceStore::new(&root.path().join("preview"));
+    store.iced = Some(catalog);
+    let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+    let (view, cx) = cx
+        .add_window_view(|_, cx| FilesView::new(workspace, Rc::new(LocalData(owner.clone())), cx));
+    cx.run_until_parked();
+    // Browsing in Preview changes the runtime tab without touching Iced's bytes.
+    view.update(cx, |view, cx| view.navigate(child.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    view.update(cx, |view, cx| view.navigate(repo.clone(), cx));
+    let desktop = gitterm_core::desktop_store::DesktopStore::open(&source).unwrap();
+    cx.update(|_, cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
+    view.update(cx, |view, cx| view.navigate(child.clone(), cx));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if saved["workspaces"][0]["tabs"][0]["dir"] == child.to_str().unwrap() {
+            assert_eq!(saved["future_document"], true);
+            assert_eq!(saved["workspaces"][0]["future_workspace"], 7);
+            assert_eq!(saved["workspaces"][0]["tabs"][0]["future_tab"], "kept");
+            assert_eq!(
+                saved["workspaces"][0]["tabs"][0]["repo_dir"],
+                repo.to_str().unwrap()
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "directory save did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|_, cx| {
+        cx.remove_global::<crate::workspace_config::LiveWorkspaces>();
+    });
+}
+
+#[gpui::test]
+fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut TestAppContext) {
+    use crate::data::ShellData;
+    use gitterm_core::chat::{runtime::RuntimeEvent, types::HarnessEvent};
+
+    let _app = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let output = gitterm_core::git_status::git_command()
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture",
+        "--allow-empty",
+    ]);
+    let linked = [temp.path().join("one"), temp.path().join("two")];
+    for (path, branch) in linked.iter().zip(["one", "two"]) {
+        git(&["worktree", "add", "-qb", branch, path.to_str().unwrap()]);
+        fs::write(path.join(format!("{branch}.txt")), "fixture").unwrap();
+    }
+    let linked = linked.map(|path| path.canonicalize().unwrap());
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let config = temp.path().join("preview");
+    let services = gitterm_core::preview::service::ServiceContext::production(
+        &temp.path().join("live"),
+        "worktree-follow-test",
+    )
+    .unwrap();
+    cx.update(|cx| crate::chat::policy::install_live(services, cx).unwrap());
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let tabs = ["first", "second"].map(|uid| {
+            serde_json::json!({
+                "dir": repo, "repo_dir": repo, "tab_kind": "agent",
+                "session_uid": uid,
+                "agent_config": {"backend": "claude", "model": "default"},
+            })
+        });
+        fs::write(
+            source.join("workspaces.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "workspaces": [{"name": "Fixture", "abbrev": "F", "color": "blue",
+                    "dir": repo, "tabs": tabs}], "active_workspace": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::read(&source).unwrap();
+        let model = WorkspaceStatus::from_iced(&catalog);
+        let mut store = crate::preview::tests::guarded_store(&config);
+        store.iced = Some(catalog);
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+        let mut shell = crate::Shell::with_owner(
+            Rc::new(LocalData(owner.clone())),
+            owner.clone(),
+            &config,
+            true,
+            window,
+            cx,
+        )
+        .unwrap();
+        let sessions = shell.workspaces[0].sessions.clone();
+        shell.restore_live_workspace_sessions(crate::WorkspaceId(1), window, cx);
+        shell.select_session_id(sessions[0].id, window, cx);
+        shell
+    });
+    let before = fs::read(source.join("workspaces.json")).unwrap();
+    let (owner, sessions, chats) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let sessions = shell.workspaces[0].sessions.clone();
+        let chats: Vec<_> = sessions
+            .iter()
+            .map(|session| {
+                let pane = shell.workspaces[0].panes[&crate::session_pane_id(session.id)].read(cx);
+                let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+                    panic!("chat")
+                };
+                chat.clone()
+            })
+            .collect();
+        for (session, chat) in sessions.iter().zip(&chats) {
+            assert_eq!(
+                chat.read(cx).tab_context(),
+                Some((crate::WorkspaceId(1), session.id)),
+            );
+        }
+        (shell.owner.clone(), sessions, chats)
+    });
+    let workspace = crate::data::WorkspaceId(1);
+    let emit = |index: usize, cx: &mut VisualTestContext| {
+        chats[index].update(cx, |chat, cx| {
+            for event in [
+                HarnessEvent::ItemStarted {
+                    id: "read".into(),
+                    kind: gitterm_core::chat::types::ItemKind::ToolCall {
+                        name: "Read".into(),
+                        input: serde_json::json!({"file_path": linked[index].join("fixture.txt")}),
+                    },
+                },
+                HarnessEvent::ItemCompleted {
+                    id: "read".into(),
+                    output: String::new(),
+                    is_error: false,
+                },
+            ] {
+                chat.receive_runtime_event(
+                    &chat.runtime_source(),
+                    RuntimeEvent::Harness(event),
+                    cx,
+                );
+            }
+        });
+    };
+    let owner_handle = owner.clone();
+    let wait_context = |root: &Path, branch: &str, cx: &mut VisualTestContext| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            if owner.read_with(cx, |owner, cx| {
+                let status = LocalData(owner_handle.clone()).status(workspace, cx);
+                owner.model.workspaces[0].root == root
+                    && status.checked
+                    && status.branch == branch
+                    && owner
+                        .files
+                        .get(&workspace)
+                        .is_some_and(|tree| tree.root == root)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Files/Git did not follow {}",
+                root.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        draw(cx);
+    };
+    cx.run_until_parked();
+    emit(0, cx);
+    wait_context(&linked[0], "one", cx);
+    emit(1, cx);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        cx.run_until_parked();
+        if owner.read_with(cx, |owner, _| {
+            owner.model.session_contexts[&sessions[1].id]
+                .follow
+                .panel_root()
+                == Some(linked[1].as_path())
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "background chat did not follow");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_context(&linked[0], "one", cx);
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.select_session_id(sessions[1].id, window, cx)
+        })
+    });
+    wait_context(&linked[1], "two", cx);
+    click(cx, "pstrip-worktree");
+    wait_context(&repo, "main", cx);
+    click(cx, "pstrip-worktree");
+    wait_context(&linked[1], "two", cx);
+    owner.read_with(cx, |owner, _| {
+        for session in &sessions {
+            assert_eq!(owner.model.session_contexts[&session.id].cwd, repo);
+        }
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| shell.new_claude_chat(None, window, cx));
+    });
+    let (new_session, new_chat) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let id = shell.active(cx).active_session.unwrap();
+        let pane = shell.active(cx).panes[&crate::session_pane_id(id)].read(cx);
+        let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+            panic!("new chat must be installed");
+        };
+        assert_eq!(chat.read(cx).tab_context(), Some((workspace, id)));
+        assert!(!sessions.iter().any(|session| session.id == id));
+        assert!(
+            !shell
+                .owner
+                .read(cx)
+                .iced_workspace(workspace)
+                .unwrap()
+                .tabs
+                .iter()
+                .any(|tab| tab.session_uid.as_deref() == Some(&chat.read(cx).target().session_uid))
+        );
+        (id, chat.clone())
+    });
+    new_chat.update(cx, |chat, cx| {
+        chat.receive_runtime_event(
+            &chat.runtime_source(),
+            RuntimeEvent::Harness(HarnessEvent::ItemStarted {
+                id: "unsaved-read".into(),
+                kind: gitterm_core::chat::types::ItemKind::ToolCall {
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": linked[0].join("new.txt")}),
+                },
+            }),
+            cx,
+        );
+    });
+    wait_context(&linked[0], "one", cx);
+    owner.read_with(cx, |owner, _| {
+        assert_eq!(owner.model.active_sessions[&workspace], new_session);
+        assert_eq!(owner.model.session_contexts[&new_session].cwd, repo);
+    });
+    assert_eq!(fs::read(source.join("workspaces.json")).unwrap(), before);
+}

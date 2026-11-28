@@ -48,9 +48,18 @@ pub trait SnapshotRecorder: Send {
     fn capture_end(&mut self) -> SnapshotFuture<'_>;
     fn finish(&mut self) -> SnapshotFuture<'_>;
     fn close(&mut self) -> SnapshotFuture<'_>;
+    fn end(&mut self) -> SnapshotFuture<'_> {
+        Box::pin(async {
+            self.capture_end().await;
+            self.finish().await;
+        })
+    }
 }
 
 impl SnapshotRecorder for crate::turn_snapshots::Recorder {
+    fn end(&mut self) -> SnapshotFuture<'_> {
+        Box::pin(self.end())
+    }
     fn observe(&mut self, event: &HarnessEvent) {
         self.observe(event);
     }

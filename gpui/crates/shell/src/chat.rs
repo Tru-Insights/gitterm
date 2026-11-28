@@ -1,7 +1,12 @@
 //! Native chat composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
+mod acp;
 mod auth;
+pub(crate) use acp::live_acp_catalog;
 mod checkout;
+mod controls;
+pub(crate) use controls::delegation_workspace;
+mod external;
 mod fence;
 mod lease;
 mod managed;
@@ -108,12 +113,37 @@ impl Controller {
             config: resume::default_config(),
         }
     }
+    fn initialize_checkout(&mut self, path: PathBuf) {
+        let effect = self.adapter.choose_checkout(
+            self.source.clone(),
+            self.target.clone(),
+            gitterm_core::chat::state::CheckoutContext {
+                choices: vec![path.clone()],
+                locked_reason: None,
+                process_running: false,
+            },
+            path,
+        );
+        if let gitterm_core::chat::state::Effect::CheckoutBound { runtime, .. } = effect {
+            self.source = runtime;
+        }
+    }
     fn seed_launch(&mut self, settings: &gitterm_gpui_chat::composer::LaunchSettings) {
-        self.config = gitterm_core::chat::types::AgentBackendConfig::Claude {
-            model: settings.model.clone(),
-            permission_mode: Some(settings.permission_mode.clone()),
-            effort: settings.effort.clone(),
-        };
+        self.config =
+            if let gitterm_core::chat::types::AgentBackendConfig::Acp { agent, .. } = self.config {
+                gitterm_core::chat::types::AgentBackendConfig::Acp {
+                    agent,
+                    model: settings.model.clone(),
+                    mode: Some(settings.permission_mode.clone()),
+                    effort: settings.effort.clone(),
+                }
+            } else {
+                gitterm_core::chat::types::AgentBackendConfig::Claude {
+                    model: settings.model.clone(),
+                    permission_mode: Some(settings.permission_mode.clone()),
+                    effort: settings.effort.clone(),
+                }
+            };
         for event in [
             HarnessEvent::ModelChanged(settings.model.clone()),
             HarnessEvent::PermissionModeChanged(settings.permission_mode.clone()),
@@ -137,6 +167,7 @@ impl Controller {
             intent => intent,
         };
         if !self.remote
+            && !self.live
             && matches!(
                 answer,
                 ChatIntent::Permission {
@@ -146,7 +177,7 @@ impl Controller {
             )
         {
             return (
-                Receipt::rejected("Allow and remember · not saved in preview"),
+                Receipt::rejected("Allow and remember · not available in preview"),
                 Update::default(),
             );
         }
@@ -176,21 +207,31 @@ impl Controller {
             self.correlations.insert(correlation, prepared.id());
         }
         let runtime = self.runtime.as_ref();
-        let remote = self.remote;
+        let uncorrelated = self.remote
+            || (self.live
+                && matches!(
+                    self.config.backend(),
+                    gitterm_core::chat::types::AgentBackend::Acp(_)
+                ));
         let result = self
             .adapter
             .execute(prepared, &self.target, now_ms(), |command| {
                 let runtime = runtime.ok_or_else(|| "No preview runtime".to_string())?;
-                if remote {
+                if uncorrelated {
                     runtime.send(command)
                 } else {
                     runtime.send_correlated(command, correlation)
                 }
             });
-        if !matches!(
-            result.0.state,
-            gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
-        ) {
+        if !self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.supports_correlation())
+            || !matches!(
+                result.0.state,
+                gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+            )
+        {
             self.correlations.remove(&correlation);
         }
         result
@@ -228,6 +269,9 @@ impl Controller {
                 });
             }
         };
+        if let HarnessEvent::HistoryReplayed { entries } = event {
+            return self.apply_acp_history(source, entries);
+        }
         let config = &mut self.config;
         let mut observe = |_: &AgentEvent, effects: &gitterm_core::chat::state::EventEffects| {
             use gitterm_core::chat::types::{AgentBackendConfig, SettingChange};
@@ -235,6 +279,12 @@ impl Controller {
                 model,
                 permission_mode,
                 effort,
+            }
+            | AgentBackendConfig::Acp {
+                model,
+                mode: permission_mode,
+                effort,
+                ..
             } = config
             {
                 match &effects.settings_changed {
@@ -368,6 +418,8 @@ struct DeferredLive {
 
 pub(crate) struct ChatPane {
     controller: Controller,
+    /// Runtime UI tab ownership survives provider/chat identity resets.
+    tab_context: Option<(crate::WorkspaceId, crate::data::SessionId)>,
     pub(crate) notification_attention: crate::notifications::ChatAttention,
     deferred_live: Option<DeferredLive>,
     remote: Option<remote::Binding>,
@@ -377,6 +429,7 @@ pub(crate) struct ChatPane {
     resume_error: Option<String>,
     awaiting_resume: bool,
     history_loading: bool,
+    defaults_loading: bool,
     persisted_id: Option<String>,
     _history_load: Option<gpui::Task<()>>,
     saved: SavedChat,
@@ -390,6 +443,7 @@ pub(crate) struct ChatPane {
     /// The cards' ids and states when the checkout's HEAD was last read.
     head_read_for: Vec<(String, String)>,
     _head_load: Option<gpui::Task<()>>,
+    _external_watch: Option<gpui::Task<()>>,
     _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
     _delegation_subscription: gpui::Subscription,
@@ -404,6 +458,26 @@ impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    pub(crate) fn tab_context(&self) -> Option<(crate::WorkspaceId, crate::data::SessionId)> {
+        self.tab_context
+    }
+
+    pub(crate) fn bind_tab_context(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        session: crate::data::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_context != Some((workspace, session)) {
+            self.tab_context = Some((workspace, session));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn conversation_events(&self) -> &[AgentEvent] {
+        &self.controller.adapter.state().conversation
+    }
+
     #[cfg(feature = "stt")]
     pub(crate) fn dictation_view(&self) -> Entity<ChatView> {
         self.view.clone()
@@ -437,24 +511,30 @@ impl ChatPane {
             session_id: None,
             records: vec![],
         };
+        controller.initialize_checkout(saved.cwd.clone());
         let view = cx.new(|cx| {
             let mut view = ChatView::new(vec![], window, cx);
             view.set_appearance(crate::theme::chat_appearance(cx), cx);
             view.set_width(crate::theme::chat_width(cx), cx);
             view.set_preview(cx);
             view.set_backend(gitterm_core::chat::types::AgentBackend::Claude, cx);
+            view.set_checkout(saved.cwd.clone(), cx);
             if controller.live {
-                view.set_live_prelaunch(cx);
+                let selection = controls::new_chat_selection(cx);
+                view.set_live_launch_settings(&selection, cx);
+                controller.seed_launch(&selection);
             } else {
                 view.set_read_only(Some("Preview activation unavailable".into()), cx);
             }
             view
         });
+        Self::subscribe_controls(&view, cx);
         let roster_subscription = Self::forward_roster(&view, cx);
         let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
             view.set_dismiss_gate(dismiss_gate(controller.live), cx);
             if controller.live {
+                view.set_live_permissions(cx);
                 view.enable_delegation_actions(cx);
             }
         });
@@ -497,6 +577,7 @@ impl ChatPane {
         };
         let mut pane = Self {
             controller,
+            tab_context: None,
             deferred_live,
             remote: None,
             notification_attention: Default::default(),
@@ -506,6 +587,7 @@ impl ChatPane {
             resume_error: None,
             awaiting_resume: false,
             history_loading: false,
+            defaults_loading: false,
             persisted_id: None,
             _history_load: None,
             saved,
@@ -516,6 +598,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _external_watch: None,
             _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
@@ -525,6 +608,7 @@ impl ChatPane {
         };
         if pane.controller.live {
             pane.init_live_tab(cx);
+            pane.load_launch_defaults(cx);
         }
         match launch {
             None => {}
@@ -571,7 +655,7 @@ impl ChatPane {
     /// Iced's task store, so rejection leaves its inputs and chat draft intact.
     fn handle_review(
         view: &Entity<ChatView>,
-        cwd: PathBuf,
+        _cwd: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Subscription {
@@ -584,16 +668,11 @@ impl ChatPane {
             move |pane, view, outcome: &gitterm_gpui_chat::review::ReviewOutcome, window, cx| {
                 use gitterm_gpui_chat::review::{ReviewContext, ReviewOutcome};
                 match outcome {
-                    ReviewOutcome::Submit { .. } => {
-                        view.update(cx, |view, cx| {
-                            view.show_review_error(
-                                "Review / Consult is not available in preview".into(),
-                                cx,
-                            )
-                        });
+                    ReviewOutcome::Submit { kind, scope, note } => {
+                        pane.submit_review(*kind, scope.clone(), note.clone(), view, window, cx);
                     }
                     ReviewOutcome::ContextRequested => {
-                        let cwd = cwd.clone();
+                        let cwd = pane.saved.cwd.clone();
                         let config = config.clone();
                         let load = cx.background_executor().spawn(async move {
                             let context = gitterm_core::review_request::review_context(&cwd, None);
@@ -634,6 +713,9 @@ impl ChatPane {
         })
     }
     fn dispatch(&mut self, intent: ChatIntent, cx: &mut Context<Self>) -> Receipt {
+        if self.defaults_loading {
+            return Receipt::rejected("Chat settings are still loading");
+        }
         if self.history_loading {
             return Receipt::rejected("Saved chat history is still loading");
         }
@@ -654,7 +736,14 @@ impl ChatPane {
             }
             if let Err(error) = self.launch_live(cx) {
                 self.shutdown_runtime(cx);
-                let error = format!("Claude unavailable: {error:#}");
+                let error = if matches!(
+                    self.controller.config.backend(),
+                    gitterm_core::chat::types::AgentBackend::Acp(_)
+                ) {
+                    format!("{error:#}")
+                } else {
+                    format!("Claude unavailable: {error:#}")
+                };
                 let view = self.view.clone();
                 let status = error.clone();
                 let missing_cwd = self.remote.is_none()
@@ -685,6 +774,12 @@ impl ChatPane {
         receipt
     }
     fn launch_live(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        if matches!(
+            self.controller.config.backend(),
+            gitterm_core::chat::types::AgentBackend::Acp(_)
+        ) {
+            return self.launch_acp(cx);
+        }
         if self.remote.is_some() {
             return self.launch_remote(None, cx);
         }
@@ -770,7 +865,8 @@ impl ChatPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let controller = Controller::new();
+        let mut controller = Controller::new();
+        controller.initialize_checkout(saved.cwd.clone());
         let config = cx
             .try_global::<crate::work_sidebar::IcedWorkSource>()
             .and_then(|source| source.owner.upgrade())
@@ -801,6 +897,7 @@ impl ChatPane {
             );
             view
         });
+        Self::subscribe_controls(&view, cx);
         let roster_subscription = Self::forward_roster(&view, cx);
         let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
@@ -809,6 +906,7 @@ impl ChatPane {
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         Self {
             controller,
+            tab_context: None,
             deferred_live: None,
             remote: None,
             notification_attention: Default::default(),
@@ -818,6 +916,7 @@ impl ChatPane {
             resume_error: None,
             awaiting_resume: false,
             history_loading: false,
+            defaults_loading: false,
             persisted_id: None,
             _history_load: None,
             saved,
@@ -828,6 +927,7 @@ impl ChatPane {
             held: Default::default(),
             head_read_for: vec![],
             _head_load: None,
+            _external_watch: None,
             _release: cx.on_release(|pane, cx| pane.quit_runtime(cx)),
             _roster_subscription: roster_subscription,
             _delegation_subscription: delegation_subscription,
@@ -897,6 +997,31 @@ impl ChatPane {
         &self.held
     }
 
+    /// Read-only source for Find's shared Iced projections.
+    pub(crate) fn find_source(&self) -> (&gitterm_core::chat::state::State, &[Record]) {
+        (self.controller.adapter.state(), &self.saved.records)
+    }
+    pub(crate) fn move_workspace(
+        &mut self,
+        previous: &gitterm_core::workspace_config::WorkspaceConfig,
+        next: &gitterm_core::workspace_config::WorkspaceConfig,
+        id: crate::WorkspaceId,
+    ) {
+        self.rebind_live_workspace(previous, next);
+        if let Some(runtime) = &self.controller.runtime {
+            let context = gitterm_core::guidelines::config_document_places(next)
+                .as_ref()
+                .map(gitterm_core::guidelines::documents_note);
+            if let Err(error) = runtime
+                .send(gitterm_core::chat::types::HarnessCommand::SetWorkspaceContext(context))
+            {
+                eprintln!("[workspace] cannot update moved chat's workspace context: {error}");
+            }
+        }
+        if let Some(launch) = &mut self.deferred_live {
+            launch.workspace = Some(id);
+        }
+    }
     pub(crate) fn config(&self) -> &gitterm_core::chat::types::AgentBackendConfig {
         &self.controller.config
     }
@@ -1081,6 +1206,9 @@ impl ChatPane {
                 .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
         }
         if self.controller.live {
+            if self.receive_acp_event(&event, cx) {
+                return;
+            }
             if matches!(
                 &event,
                 RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
@@ -1140,6 +1268,13 @@ impl ChatPane {
         };
         let previous_settings = self.controller.adapter.state().acknowledged.clone();
         if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
+            if let Some(change) = update
+                .event
+                .as_ref()
+                .and_then(|effect| effect.settings_changed.clone())
+            {
+                self.remember_choice(change, cx);
+            }
             self.pending.push(update);
             if let Some(event) = &attention_event {
                 self.notification_attention.event(
@@ -1170,6 +1305,16 @@ impl ChatPane {
         }
         if exited {
             self.shutdown_runtime(cx);
+            if matches!(
+                self.controller.config.backend(),
+                gitterm_core::chat::types::AgentBackend::Acp(_)
+            ) {
+                self.history_loading = false;
+                if let Some(error) = self.resume_error.clone() {
+                    self.resume_failed(error, cx);
+                }
+                return;
+            }
             if self.awaiting_resume && self.remote.is_none() {
                 self.resume_failed(
                     "Cannot resume saved Claude session: process exited before the turn started"
@@ -1205,6 +1350,7 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) {
         self.controller.runtime = Some(runtime);
+        self.watch_external_runs(cx);
         if self.controller.remote {
             self.controller.source = self
                 .controller
@@ -1365,10 +1511,11 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     StopRemote(Box<remote::PendingStop>),
     Persist(
-        Box<resume::LiveTab>,
-        gitterm_core::desktop_store::DesktopStore,
+        gitterm_core::desktop_store::Receipt<()>,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
+    #[cfg(test)]
+    Wait(std::sync::mpsc::Receiver<()>),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
 }
 impl RuntimeShutdown {
@@ -1396,14 +1543,18 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, store, reply) => {
-                            let result = tab.persist(&store).map_err(|error| {
+                        ShutdownCommand::Persist(receipt, reply) => {
+                            let result = receipt.wait().map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {
                                 errors.push(error.clone());
                             }
                             let _ = reply.send(result);
+                        }
+                        #[cfg(test)]
+                        ShutdownCommand::Wait(gate) => {
+                            let _ = gate.recv();
                         }
                         ShutdownCommand::Drain(reply) => {
                             let result = if errors.is_empty() {
@@ -1431,6 +1582,8 @@ impl RuntimeShutdown {
                 ShutdownCommand::Drain(_)
                 | ShutdownCommand::Persist(..)
                 | ShutdownCommand::StopRemote(_) => unreachable!(),
+                #[cfg(test)]
+                ShutdownCommand::Wait(_) => unreachable!(),
             })
     }
     pub(crate) fn drain(&self) -> Result<()> {

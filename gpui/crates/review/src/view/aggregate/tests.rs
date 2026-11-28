@@ -56,6 +56,7 @@ fn aggregate_result_draws_bounded_lines_limits_and_authoritative_marks(cx: &mut 
         let view = cx.new(|_| AggregateView {
             model,
             selected: Some("large.txt".into()),
+            ui: AggregateUi::default(),
             bases,
             error: None,
             executor,
@@ -75,14 +76,31 @@ fn aggregate_result_draws_bounded_lines_limits_and_authoritative_marks(cx: &mut 
                 .iter()
                 .any(|notice| notice.contains("truncated"))
         );
-        assert_eq!(view.render_lines(0..10).len(), 10);
-        for mut row in view.render_lines(0..3) {
+        let lines: Vec<_> = view
+            .ui
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| matches!(row, AggregateRow::Line(_, _, _)).then_some(index))
+            .take(10)
+            .collect();
+        assert_eq!(lines.len(), 10);
+        for index in lines.into_iter().take(3) {
+            let mut row = view.render_row(index, cx);
             let style = row.text_style().clone();
             assert_eq!(style.font_family.as_deref(), Some("Menlo"));
             assert_eq!(style.font_size, Some(px(12.).into()));
+            assert_eq!(style.line_height, Some(px(18.).into()));
         }
         assert!(
-            view.selected_file().unwrap().shown_lines()
+            view.model
+                .projection()
+                .files
+                .iter()
+                .find(|row| row.file.path == "large.txt")
+                .unwrap()
+                .file
+                .shown_lines()
                 <= gitterm_core::review::budget::FILE_LINE_CAP
         );
         view.toggle_viewed(cx);
@@ -165,6 +183,7 @@ fn base_selection_then_collection_replaces_the_native_file_projection(cx: &mut T
         let view = cx.new(|_| AggregateView {
             model,
             selected: None,
+            ui: AggregateUi::default(),
             bases,
             error: None,
             executor,
@@ -190,27 +209,34 @@ fn base_selection_then_collection_replaces_the_native_file_projection(cx: &mut T
                 .reference,
             "release"
         );
-        assert!(!view.render_lines(0..10).is_empty());
+        assert!(
+            view.ui
+                .rows
+                .iter()
+                .any(|row| matches!(row, AggregateRow::Line(_, _, _)))
+        );
     });
 }
 
-#[test]
-fn aggregate_file_names_follow_iced_viewed_and_stale_styles() {
-    use gpui::Styled as _;
-    let style = |state| {
-        let mut name = super::file_name("a.rs".into(), state);
-        let text = &name.style().text;
-        (text.color, text.strikethrough.is_some())
-    };
-    assert_eq!(style(ViewedState::Unviewed), (None, false));
-    assert_eq!(
-        style(ViewedState::Viewed),
-        (Some(gpui::rgb(0x9399b2).into()), true)
-    );
-    assert_eq!(
-        style(ViewedState::ChangedSinceViewed),
-        (Some(gpui::rgb(0xf9e2af).into()), false)
-    );
+#[gpui::test]
+fn aggregate_file_names_follow_iced_viewed_and_stale_styles(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let style = |state| {
+            let mut name = super::file_name("a.rs".into(), state, cx);
+            let text = &name.style().text;
+            (text.color, text.strikethrough.is_some())
+        };
+        assert_eq!(style(ViewedState::Unviewed), (None, false));
+        assert_eq!(
+            style(ViewedState::Viewed),
+            (Some(cx.theme().muted_foreground), true)
+        );
+        assert_eq!(
+            style(ViewedState::ChangedSinceViewed),
+            (Some(cx.theme().warning), false)
+        );
+    });
 }
 
 fn runtime() -> Arc<tokio::runtime::Runtime> {
@@ -264,6 +290,70 @@ fn wait_for(
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+#[gpui::test]
+fn edit_review_preserves_resolved_target_and_selects_and_scrolls_to_focus(cx: &mut TestAppContext) {
+    let repo = crate::fixture::aggregate_repo();
+    std::fs::create_dir(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/first.rs"),
+        "fn first() {}\n".repeat(120),
+    )
+    .unwrap();
+    std::fs::create_dir(repo.path().join("tests")).unwrap();
+    std::fs::write(repo.path().join("tests/focus.rs"), "fn focused() {}\n").unwrap();
+    let (mut target, _) = runtime()
+        .block_on(crate::repo::aggregate_target(repo.path().into()))
+        .unwrap();
+    target.owner = "fixture Work row".into();
+    target.repo = "fixture owning repo".into();
+    let expected = target.clone();
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| {
+            AggregateView::open_edit(
+                EditReview {
+                    target,
+                    source: DiffSource::Uncommitted,
+                    focus: "tests/focus.rs".into(),
+                },
+                ReviewHost::default(),
+                cx,
+            )
+        });
+        Root::new(view, window, cx)
+    });
+    let view: Entity<AggregateView> =
+        root.read_with(cx, |root, _| root.view().clone().downcast().unwrap());
+    cx.simulate_resize(size(px(1200.), px(500.)));
+    wait_for(cx, &view, |view| {
+        view.model
+            .state()
+            .pane()
+            .is_some_and(|pane| pane.loaded.is_some())
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        let pane = view.model.state().pane().unwrap();
+        assert_eq!(pane.target, expected);
+        assert_eq!(pane.source, ReviewSource::Uncommitted);
+        assert_eq!(pane.focus.as_deref(), Some("tests/focus.rs"));
+        assert!(!pane.hide_noise);
+        assert_eq!(view.selected.as_deref(), Some("tests/focus.rs"));
+        assert!(
+            view.ui.list.logical_scroll_top().item_ix > 0,
+            "focus must scroll past the first file: offset={:?}, headers={:?}",
+            view.ui.list.logical_scroll_top(),
+            view.ui
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches!(row, AggregateRow::Header(_)))
+                .collect::<Vec<_>>()
+        );
+    });
 }
 
 fn saver(dir: &std::path::Path) -> crate::SaveMarks {
@@ -450,4 +540,311 @@ fn opening_a_review_file_asks_the_host_to_open_its_worktree_path(cx: &mut TestAp
     cx.simulate_click(open.center(), gpui::Modifiers::none());
     view.read_with(cx, |view, _| assert!(view.error.is_none()));
     assert_eq!(*opened.borrow(), [repo.path().join("hello.rs")]);
+}
+
+#[gpui::test]
+fn continuous_sections_render_each_file_and_viewed_collapses_only_its_body(
+    cx: &mut TestAppContext,
+) {
+    let repo = crate::fixture::aggregate_repo();
+    std::fs::write(repo.path().join("other.rs"), "fn other() {}\n").unwrap();
+    let (view, cx) = open_view(cx, repo.path(), ReviewHost::default());
+    cx.simulate_resize(size(px(1200.), px(850.)));
+    draw(cx);
+    let indices = view.read_with(cx, |view, _| {
+        view.ui
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| matches!(row, AggregateRow::Header(_)).then_some(index))
+            .collect::<Vec<_>>()
+    });
+    for index in indices {
+        assert!(
+            cx.debug_bounds(Box::leak(
+                format!("aggregate-section-{index}").into_boxed_str()
+            ))
+            .is_some()
+        );
+    }
+    view.update_in(cx, |view, _, cx| {
+        let sections: Vec<_> = view
+            .ui
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                if let AggregateRow::Header(path) = row {
+                    Some((index, path.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            sections
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["hello.rs", "other.rs"]
+        );
+        view.selected = Some("hello.rs".into());
+        view.toggle_viewed(cx);
+        assert!(
+            view.ui
+                .rows
+                .contains(&AggregateRow::Header("hello.rs".into()))
+        );
+        assert!(
+            !view
+                .ui
+                .rows
+                .iter()
+                .any(|row| matches!(row, AggregateRow::Line(path, _, _) if path == "hello.rs"))
+        );
+        assert!(
+            view.ui
+                .rows
+                .iter()
+                .any(|row| matches!(row, AggregateRow::Line(path, _, _) if path == "other.rs"))
+        );
+        view.toggle_viewed(cx);
+        assert!(
+            view.ui
+                .rows
+                .iter()
+                .any(|row| matches!(row, AggregateRow::Line(path, _, _) if path == "hello.rs"))
+        );
+    });
+}
+
+#[test]
+fn folder_tree_matches_iced_directories_first_and_nested_basename_grouping() {
+    let tree = FileTree::from_paths(
+        [
+            "README.md",
+            "src/main.rs",
+            "src/view/one.rs",
+            "tests/a.rs",
+            "src/view/two.rs",
+        ]
+        .into_iter(),
+    );
+    assert_eq!(tree.files, ["README.md"]);
+    assert_eq!(
+        tree.dirs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["src", "tests"]
+    );
+    let src = &tree.dirs[0].1;
+    assert_eq!(src.files, ["src/main.rs"]);
+    assert_eq!(src.dirs[0].0, "view");
+    assert_eq!(src.dirs[0].1.files, ["src/view/one.rs", "src/view/two.rs"]);
+}
+
+#[gpui::test]
+fn folder_controls_expand_and_collapse_their_children(cx: &mut TestAppContext) {
+    let repo = crate::fixture::aggregate_repo();
+    std::fs::create_dir_all(repo.path().join("src/view")).unwrap();
+    std::fs::write(repo.path().join("src/view/one.rs"), "fn one() {}\n").unwrap();
+    let (view, cx) = open_view(cx, repo.path(), ReviewHost::default());
+    draw(cx);
+    assert!(cx.debug_bounds("aggregate-folder-src/view/").is_some());
+    let folder = cx.debug_bounds("aggregate-folder-src/").unwrap();
+    cx.simulate_click(folder.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("aggregate-folder-src/view/").is_none());
+    view.read_with(cx, |view, _| {
+        assert!(view.ui.closed_folders.contains("src/"))
+    });
+    let folder = cx.debug_bounds("aggregate-folder-src/").unwrap();
+    cx.simulate_click(folder.center(), gpui::Modifiers::none());
+    draw(cx);
+    assert!(cx.debug_bounds("aggregate-folder-src/view/").is_some());
+}
+
+#[gpui::test]
+fn noise_is_initially_hidden_and_remembered_per_checkout_without_recollection(
+    cx: &mut TestAppContext,
+) {
+    let repo = crate::fixture::aggregate_repo();
+    std::fs::create_dir(repo.path().join("tests")).unwrap();
+    std::fs::write(repo.path().join("tests/example.rs"), "fn test() {}\n").unwrap();
+    std::fs::write(repo.path().join("Cargo.lock"), "generated\n").unwrap();
+    let (view, vcx) = open_view(cx, repo.path(), ReviewHost::default());
+    view.update_in(vcx, |view, _, cx| {
+        let projection = view.model.projection();
+        assert!(projection.pane.unwrap().hide_noise);
+        assert_eq!(projection.files.len(), 1);
+        let generation = projection.pane.unwrap().generation;
+        view.toggle_noise(cx);
+        let projection = view.model.projection();
+        assert_eq!(projection.pane.unwrap().generation, generation);
+        assert_eq!(projection.files.len(), 3);
+        for row in &projection.files {
+            assert_eq!(
+                row.file.kind,
+                gitterm_core::review::model::classify_path(&row.file.path)
+            );
+        }
+        view.dispatch(
+            Intent::Collect {
+                page: AggregateModel::page(),
+            },
+            cx,
+        );
+        assert!(!view.model.state().pane().unwrap().hide_noise);
+    });
+    let (reopened, vcx) = open_view(cx, repo.path(), ReviewHost::default());
+    reopened.read_with(vcx, |view, _| {
+        assert!(!view.model.state().pane().unwrap().hide_noise)
+    });
+    let other = crate::fixture::aggregate_repo();
+    let (other, vcx) = open_view(cx, other.path(), ReviewHost::default());
+    other.read_with(vcx, |view, _| {
+        assert!(view.model.state().pane().unwrap().hide_noise)
+    });
+}
+
+#[gpui::test]
+fn aggregate_syntax_tokens_and_surfaces_follow_light_and_dark_appearance(cx: &mut TestAppContext) {
+    // The default test text system emits no glyphs. Give its glyphs a
+    // one-pixel raster so the headless scene records their paint colours.
+    let mut font_cx = TestAppContext::build_with_text_system(
+        cx.dispatcher.clone(),
+        None,
+        Arc::new(PaintTextSystem),
+    );
+    let cx = &mut font_cx;
+    let repo = crate::fixture::aggregate_repo();
+    let (view, cx) = open_view(cx, repo.path(), ReviewHost::default());
+    cx.simulate_resize(size(px(1200.), px(850.)));
+    let mut palettes = Vec::new();
+    for mode in [
+        gpui_component::ThemeMode::Light,
+        gpui_component::ThemeMode::Dark,
+    ] {
+        cx.update(|_, cx| gpui_component::Theme::change(mode, None, cx));
+        draw(cx);
+        let (keyword, background, foreground) = view.read_with(cx, |_, cx| {
+            (
+                cx.theme()
+                    .highlight_theme
+                    .style("keyword")
+                    .unwrap()
+                    .color
+                    .unwrap(),
+                cx.theme().background,
+                cx.theme().foreground,
+            )
+        });
+        cx.update(|window, _| {
+            let scene = window.rendered_scene();
+            assert!(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .any(|sprite| sprite.color == keyword)
+                    || scene
+                        .subpixel_sprites
+                        .iter()
+                        .any(|sprite| sprite.color == keyword),
+                "language keyword colour must be painted"
+            );
+            assert!(
+                scene
+                    .quads
+                    .iter()
+                    .any(|quad| quad.background == background.into()),
+                "appearance background must be painted"
+            );
+        });
+        view.update_in(cx, |view, _, cx| {
+            let line = view
+                .ui
+                .rows
+                .iter()
+                .position(|row| matches!(row, AggregateRow::Line(_, _, _)))
+                .unwrap();
+            let mut row = view.render_row(line, cx);
+            assert_eq!(row.style().text.color, Some(foreground));
+            for state in [ViewedState::Viewed, ViewedState::ChangedSinceViewed] {
+                let mut name = file_name("hello.rs".into(), state, cx);
+                assert_eq!(
+                    name.style().text.color,
+                    Some(if state == ViewedState::Viewed {
+                        cx.theme().muted_foreground
+                    } else {
+                        cx.theme().warning
+                    })
+                );
+            }
+        });
+        palettes.push((keyword, background, foreground));
+    }
+    assert_ne!(palettes[0], palettes[1]);
+}
+
+/// Keep GPUI's deterministic metrics, but emit a raster instead of suppressing
+/// all text paint as NoopTextSystem does. No platform window or fonts needed.
+struct PaintTextSystem;
+impl gpui::PlatformTextSystem for PaintTextSystem {
+    fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> gpui::Result<()> {
+        gpui::NoopTextSystem.add_fonts(fonts)
+    }
+    fn all_font_names(&self) -> Vec<String> {
+        gpui::NoopTextSystem.all_font_names()
+    }
+    fn font_id(&self, font: &gpui::Font) -> gpui::Result<gpui::FontId> {
+        gpui::NoopTextSystem.font_id(font)
+    }
+    fn font_metrics(&self, id: gpui::FontId) -> gpui::FontMetrics {
+        gpui::NoopTextSystem.font_metrics(id)
+    }
+    fn typographic_bounds(
+        &self,
+        font: gpui::FontId,
+        glyph: gpui::GlyphId,
+    ) -> gpui::Result<gpui::Bounds<f32>> {
+        gpui::NoopTextSystem.typographic_bounds(font, glyph)
+    }
+    fn advance(&self, font: gpui::FontId, glyph: gpui::GlyphId) -> gpui::Result<gpui::Size<f32>> {
+        gpui::NoopTextSystem.advance(font, glyph)
+    }
+    fn glyph_for_char(&self, font: gpui::FontId, ch: char) -> Option<gpui::GlyphId> {
+        gpui::NoopTextSystem.glyph_for_char(font, ch)
+    }
+    fn glyph_raster_bounds(
+        &self,
+        _: &gpui::RenderGlyphParams,
+    ) -> gpui::Result<gpui::Bounds<gpui::DevicePixels>> {
+        Ok(gpui::Bounds::new(
+            gpui::point(0.into(), 0.into()),
+            size(1.into(), 1.into()),
+        ))
+    }
+    fn rasterize_glyph(
+        &self,
+        _: &gpui::RenderGlyphParams,
+        bounds: gpui::Bounds<gpui::DevicePixels>,
+    ) -> gpui::Result<(gpui::Size<gpui::DevicePixels>, Vec<u8>)> {
+        Ok((bounds.size, vec![255]))
+    }
+    fn layout_line(
+        &self,
+        text: &str,
+        font_size: gpui::Pixels,
+        runs: &[gpui::FontRun],
+    ) -> gpui::LineLayout {
+        gpui::NoopTextSystem.layout_line(text, font_size, runs)
+    }
+    fn recommended_rendering_mode(
+        &self,
+        font: gpui::FontId,
+        size: gpui::Pixels,
+    ) -> gpui::TextRenderingMode {
+        gpui::NoopTextSystem.recommended_rendering_mode(font, size)
+    }
 }

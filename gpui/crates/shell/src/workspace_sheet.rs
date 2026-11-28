@@ -30,7 +30,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
-use crate::theme::{Palette, UI_FONT_SIZE};
+use crate::theme::{self, Palette};
 
 /// Why the folder picker is open; decides what "Use this folder" does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,7 +249,8 @@ impl Focusable for WorkspaceSheet {
 impl Render for WorkspaceSheet {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::current(cx);
-        let small = UI_FONT_SIZE - 1.;
+        let font = theme::font_sizes(cx).ui;
+        let small = font - 1.;
         let muted = if p.base == 0x1e1e2e {
             0x9399b2
         } else {
@@ -293,7 +294,12 @@ impl Render for WorkspaceSheet {
             .text_size(px(small))
             .line_height(gpui::relative(1.3))
             .text_color(rgb(p.text))
-            .child(div().text_size(px(UI_FONT_SIZE)).child("Workspace"))
+            .child(
+                div()
+                    .debug_selector(|| "workspace-sheet-title".into())
+                    .text_size(px(font))
+                    .child("Workspace"),
+            )
             .child(secondary("Open existing work or start new work."))
             .child(
                 div()
@@ -343,7 +349,7 @@ impl Render for WorkspaceSheet {
                     };
                     let id = id.clone();
                     row = row.child(
-                        sheet_button(("existing-work", index), label)
+                        sheet_button(("existing-work", index), label, small)
                             .debug_selector(|| format!("workspace-sheet-existing-{index}"))
                             .h(px(20.))
                             .px(px(10.))
@@ -391,7 +397,7 @@ impl Render for WorkspaceSheet {
                         .rounded(px(12.))
                         .child(repo_name(dir))
                         .child(
-                            sheet_button(("remove-repo", index), "×")
+                            sheet_button(("remove-repo", index), "×", small)
                                 .debug_selector(|| format!("workspace-sheet-remove-{index}"))
                                 .ghost()
                                 .h(px(16.))
@@ -407,7 +413,7 @@ impl Render for WorkspaceSheet {
         }
         repos = repos.child(
             div().child(
-                sheet_button("add-repo", "Add repo…")
+                sheet_button("add-repo", "Add repo…", small)
                     .debug_selector(|| "workspace-sheet-add-repo".into())
                     .h(px(24.))
                     .px(px(10.))
@@ -428,7 +434,7 @@ impl Render for WorkspaceSheet {
             for (index, dir) in shortcuts.into_iter().enumerate() {
                 let dir = dir.clone();
                 recent = recent.child(
-                    sheet_button(("recent-repo", index), repo_name(&dir))
+                    sheet_button(("recent-repo", index), repo_name(&dir), small)
                         .debug_selector(|| format!("workspace-sheet-recent-{index}"))
                         .ghost()
                         .h(px(20.))
@@ -477,7 +483,7 @@ impl Render for WorkspaceSheet {
                 .items_center()
                 .gap(px(8.))
                 .child(
-                    sheet_button("cancel-workspace", "Cancel")
+                    sheet_button("cancel-workspace", "Cancel", small)
                         .debug_selector(|| "workspace-sheet-cancel".into())
                         .outline()
                         .border_color(rgb(button_border))
@@ -485,7 +491,7 @@ impl Render for WorkspaceSheet {
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )
                 .child(
-                    sheet_button("create-workspace", self.create_label())
+                    sheet_button("create-workspace", self.create_label(), small)
                         .debug_selector(|| "workspace-sheet-create".into())
                         .primary()
                         .disabled(self.sheet.name.trim().is_empty() || self.picking_folder)
@@ -517,12 +523,16 @@ impl Render for WorkspaceSheet {
     }
 }
 
-fn sheet_button(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>) -> Button {
+fn sheet_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    small: f32,
+) -> Button {
     let label = label.into();
     // Native button labels have their own rem-based size; Iced uses ui_font_small.
     Button::new(id)
         .accessibility_label(label.clone())
-        .child(div().text_size(px(UI_FONT_SIZE - 1.)).child(label))
+        .child(div().text_size(px(small)).child(label))
         .small()
         .h(px(28.))
         .px(px(12.))

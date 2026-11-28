@@ -461,11 +461,15 @@ fn general_text_viewer_uses_core_text_and_escapes_html() {
     )
     .unwrap();
     let document = Document::local_file(root.path(), Path::new("source.rs"), true).unwrap();
-    assert!(
-        document
-            .html()
-            .contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; value")
-    );
+    // Highlighting divides the escaped text into spans; join their text nodes.
+    let text_nodes: String = document
+        .html()
+        .split('<')
+        .filter_map(|part| part.split_once('>').map(|(_, text)| text))
+        .collect();
+    assert!(text_nodes.contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; value"));
+    assert!(!document.html().contains("<script>"));
+    assert_eq!(document.text, "<script>alert(1)</script> & value");
     std::fs::write(root.path().join("empty"), "").unwrap();
     assert!(Document::local_file(root.path(), Path::new("empty"), false).is_ok());
     assert!(Document::local_file(root.path(), Path::new("missing.txt"), false).is_err());
@@ -552,16 +556,22 @@ fn page_policy_wraps_the_shared_decision_like_iced_wry_handlers() {
         github_accounts: [("example".to_string(), "sample-login".to_string())].into(),
         linear_workspaces: ["sample-a".to_string()].into(),
     });
-    // Popups open in the browser and embedded frames load in place, whatever
+    // Popups and embedded frames open in the browser, whatever
     // the decision table says; only HTTP(S) is ever loaded or opened.
     assert!(!policy.decide(Some(origin), true, false));
-    assert!(policy.decide(Some("https://example.com/frame"), false, false));
+    assert!(!policy.decide(Some("https://example.com/frame"), false, false));
     for url in [Some("file:///etc/hosts"), Some("about:blank"), None] {
         for (popup, main) in [(false, true), (true, false), (false, false)] {
             assert!(!policy.decide(url, popup, main), "{url:?}");
         }
     }
-    assert_eq!(policy.drain(), vec![R::External(origin.into())]);
+    assert_eq!(
+        policy.drain(),
+        vec![
+            R::External(origin.into()),
+            R::External("https://example.com/frame".into())
+        ]
+    );
     // Main-frame navigations follow the shared decision.
     let next = "https://github.com/example/gitterm/pull/2";
     assert!(policy.decide(Some(next), false, true));
@@ -590,5 +600,96 @@ fn page_policy_wraps_the_shared_decision_like_iced_wry_handlers() {
             0xa9, 0x35,
         ]),
         "a90d78b9-36e7-7e9f-1ee4-3b89d3f8a935"
+    );
+}
+
+#[test]
+fn files_image_preview_matches_iced_formats_and_has_no_inline_size_cap() {
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    for (extension, mime) in [
+        ("PNG", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("gif", "image/gif"),
+        ("webp", "image/webp"),
+        ("bmp", "image/bmp"),
+        ("ico", "image/x-icon"),
+    ] {
+        let name = format!("fixture.{extension}");
+        let bytes = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==").unwrap();
+        std::fs::write(dir.path().join(&name), &bytes).unwrap();
+        let doc = Document::local_file(dir.path(), Path::new(&name), true).unwrap();
+        assert!(doc.html().contains(&format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )));
+        assert!(doc.html().contains("object-fit:contain"));
+        assert!(doc.text.is_empty());
+    }
+    let image = dir.path().join("large.png");
+    std::fs::write(
+        &image,
+        vec![0; gitterm_core::content::MAX_INLINE_WEBVIEW_BYTES as usize + 1],
+    )
+    .unwrap();
+    assert!(
+        Document::local_file(dir.path(), Path::new("large.png"), false)
+            .unwrap()
+            .html()
+            .contains("<img")
+    );
+    std::fs::write(dir.path().join("unsupported.svg"), "<svg/>").unwrap();
+    assert!(
+        !Document::local_file(dir.path(), Path::new("unsupported.svg"), true)
+            .unwrap()
+            .html()
+            .contains("<img")
+    );
+}
+
+#[test]
+fn source_viewer_has_iced_line_numbers_shared_highlighting_limits_and_monospace() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = "fn main() {\n\n    println!(\"<&>\");\n}\n";
+    std::fs::write(dir.path().join("source.rs"), text).unwrap();
+    for dark in [true, false] {
+        let doc = Document::local_file(dir.path(), Path::new("source.rs"), dark).unwrap();
+        assert_eq!(doc.text, text);
+        assert_eq!(doc.html().matches("class=\"line-number\"").count(), 4);
+        assert!(doc.html().contains("class=\"line-number\">   1</span>"));
+        assert!(doc.html().contains("font:13px/1.3 monospace"));
+        assert!(doc.html().contains("font-family:monospace"));
+        let (lines, notice) = gitterm_core::content::syntax::build_syntax_highlight_lines(
+            &dir.path().join("source.rs"),
+            text,
+            dark,
+        );
+        assert!(notice.is_none());
+        for segment in lines.unwrap().into_iter().flat_map(|line| line.segments) {
+            let [r, g, b] = segment.color;
+            assert!(doc.html().contains(&format!(
+                "<span style=\"color:#{r:02x}{g:02x}{b:02x}\">{}</span>",
+                gitterm_core::file_page::html_escape(&segment.text)
+            )));
+        }
+    }
+    std::fs::write(dir.path().join("many.txt"), "line\n".repeat(1201)).unwrap();
+    let doc = Document::local_file(dir.path(), Path::new("many.txt"), true).unwrap();
+    assert_eq!(doc.html().matches("class=\"line-number\"").count(), 1200);
+    assert!(
+        doc.html()
+            .contains("Rendering first 1200 of 1201 lines (1 hidden) for performance.")
+    );
+    assert!(
+        doc.html()
+            .contains("Syntax highlighting limited to first 1200 lines")
+    );
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    assert!(
+        Document::local_file(dir.path(), Path::new("empty.txt"), true)
+            .unwrap()
+            .html()
+            .contains("(empty file)")
     );
 }

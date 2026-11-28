@@ -4,6 +4,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Iced's `SttTranscriptReady` terminal delivery: raw UTF-8, with no paste
+/// envelope, newline conversion, or submit appended.
+pub fn terminal_transcript_bytes(text: String) -> Vec<u8> {
+    text.into_bytes()
+}
+
 pub const MIN_RECORDING_SECONDS: f32 = 0.25;
 pub const MIN_RMS: f32 = 0.001;
 pub const MIN_PEAK: f32 = 0.01;
@@ -313,6 +319,12 @@ pub fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_transcript_bytes_match_iced_write() {
+        let text = "  spoken café\r\nnext\n\x1b[201~  ";
+        assert_eq!(terminal_transcript_bytes(text.into()), text.as_bytes());
+        assert!(terminal_transcript_bytes(String::new()).is_empty());
+    }
     #[test]
     fn downmix() {
         let mut out = Vec::new();

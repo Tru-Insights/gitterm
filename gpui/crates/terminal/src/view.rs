@@ -92,7 +92,7 @@ pub type TitleCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &st
 
 pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
 
-pub type UrlOpener = Box<dyn Fn(&str)>;
+pub type UrlOpener = Box<dyn Fn(&str, &App)>;
 
 pub type ExportCallback = Box<dyn Fn(Result<String, ServiceError>, &mut Context<TerminalView>)>;
 
@@ -648,7 +648,12 @@ impl TerminalView {
     }
 
     /// The embedding app owns URL policy and opening. The terminal never launches URLs.
-    pub fn with_url_opener(mut self, opener: impl Fn(&str) + 'static) -> Self {
+    pub fn with_url_opener(self, opener: impl Fn(&str) + 'static) -> Self {
+        self.with_app_url_opener(move |url, _| opener(url))
+    }
+
+    /// Supply the foreground App for hosts using GPUI's platform URL service.
+    pub fn with_app_url_opener(mut self, opener: impl Fn(&str, &App) + 'static) -> Self {
         self.url_opener = Some(Box::new(opener));
         self
     }
@@ -761,11 +766,11 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
-        self.mouse_down(event);
+        self.mouse_down(event, cx);
         cx.notify();
     }
 
-    pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent) {
+    pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, cx: &App) {
         let Some(point) = self.hit_test_cell(event.position) else {
             return;
         };
@@ -778,7 +783,7 @@ impl TerminalView {
                     .handle(Command::ProcessLink(LinkAction::Open, point))
                 && let Some(opener) = &self.url_opener
             {
-                opener(&url);
+                opener(&url, cx);
             }
             return;
         }
@@ -1002,10 +1007,20 @@ impl TerminalView {
     }
 
     pub fn update_config(&mut self, config: TerminalConfig, cx: &mut Context<Self>) {
-        self.renderer.font_family = config.font_family.clone();
-        self.renderer.font_size = config.font_size;
-        self.renderer.line_height_multiplier = config.line_height_multiplier;
-        self.renderer.palette = config.colors.clone();
+        if self.config.colors != config.colors {
+            // Refresh the entire presentation on a theme change, including
+            // scrollback. Keep the backend: rerunning a PTY can repeat commands.
+            self.renderer = TerminalRenderer::new(
+                config.font_family.clone(),
+                config.font_size,
+                config.line_height_multiplier,
+                config.colors.clone(),
+            );
+        } else {
+            self.renderer.font_family = config.font_family.clone();
+            self.renderer.font_size = config.font_size;
+            self.renderer.line_height_multiplier = config.line_height_multiplier;
+        }
 
         self.backend.set_history_limit(config.scrollback);
         self.config = config;
@@ -1057,7 +1072,8 @@ impl TerminalView {
         false
     }
 
-    fn write_input_bytes(&self, bytes: &[u8]) -> bool {
+    /// Write raw input without clipboard normalization or bracketed-paste wrapping.
+    pub fn write_input_bytes(&self, bytes: &[u8]) -> bool {
         self.wrote_input(self.backend.input_bytes(bytes))
     }
 

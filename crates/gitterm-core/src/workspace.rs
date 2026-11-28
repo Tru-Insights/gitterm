@@ -13,6 +13,8 @@
 //! ([`next_attention`]) and the content slide ([`slide_order`]) all read
 //! [`visible_order`], so the nth key, dot and panel is the nth chip.
 
+pub mod slide;
+
 /// Runtime identity of an open workspace; never persisted.
 /// The host allocates IDs and owns the workspace catalog.
 pub type WorkspaceId = u64;

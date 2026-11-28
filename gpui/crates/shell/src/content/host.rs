@@ -230,7 +230,7 @@ pub enum PageRequest {
 
 /// A Page's link policy: Iced's wry handlers around the shared
 /// `page_navigation_decision`. Popups open in the browser; main-frame
-/// navigations follow the decision; embedded frames load in place.
+/// navigations follow the decision; embedded frames open externally, as in wry.
 #[derive(Debug)]
 pub struct PagePolicy {
     pub context: PageNavigationContext,
@@ -247,15 +247,16 @@ impl PagePolicy {
 
     /// Whether WebKit may load `url`; queues the other effects for the window.
     pub fn decide(&mut self, url: Option<&str>, new_window: bool, main_frame: bool) -> bool {
-        let Some(url) = url.filter(|url| gitterm_core::page_store::browser_url(url).is_ok()) else {
+        let Some(url) = url else {
             return false;
         };
-        if new_window {
-            self.requests.push(PageRequest::External(url.to_owned()));
+        if new_window || !main_frame {
+            if gitterm_core::page_navigation::page_new_window_decision(url)
+                == PageNavigationDecision::External
+            {
+                self.requests.push(PageRequest::External(url.to_owned()));
+            }
             return false;
-        }
-        if !main_frame {
-            return true;
         }
         match page_navigation_decision(url, &self.context) {
             PageNavigationDecision::Allow => {
@@ -526,5 +527,43 @@ impl Drop for LocalWebKitHost {
             self.view.setNavigationDelegate(None);
         }
         self.view.removeFromSuperview();
+    }
+}
+
+#[cfg(test)]
+mod page_policy_tests {
+    use super::*;
+
+    #[test]
+    fn page_iframes_and_new_windows_open_externally_like_iced_wry() {
+        let origin = "https://github.com/example/repo/pull/1";
+        let mut policy = PagePolicy::new(PageNavigationContext {
+            url: origin.into(),
+            store: PageStore::Default,
+            github_accounts: Default::default(),
+            linear_workspaces: Default::default(),
+        });
+        for (popup, main) in [(false, false), (true, false), (true, true)] {
+            for url in [
+                origin,
+                "http://example.com/frame",
+                "https://example.com/frame",
+            ] {
+                assert!(!policy.decide(Some(url), popup, main));
+                assert_eq!(policy.drain(), vec![PageRequest::External(url.into())]);
+                assert_eq!(policy.context.url, origin);
+            }
+            for url in [
+                None,
+                Some("about:blank"),
+                Some("file:///tmp/fixture"),
+                Some("javascript:alert(1)"),
+            ] {
+                assert!(!policy.decide(url, popup, main));
+                assert!(policy.drain().is_empty());
+            }
+        }
+        assert!(policy.decide(Some(origin), false, true));
+        assert_eq!(policy.drain(), vec![PageRequest::Navigated(origin.into())]);
     }
 }

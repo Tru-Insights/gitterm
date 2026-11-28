@@ -286,7 +286,7 @@ fn finding_f2_new_and_fresh_tabs_store_provider_directory(cx: &mut gpui::TestApp
 }
 
 #[test]
-fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
+fn finding_f3_typed_settings_keep_unknown_fields() {
     let Some(root) = root() else {
         return;
     };
@@ -310,9 +310,18 @@ fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
     .persist(&gitterm_core::desktop_store::DesktopStore::open(&root).unwrap())
     .unwrap();
     let gpui: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let mut expected_config = iced_config;
+    // The shared desktop writer retains unknown provider fields alongside the
+    // typed Iced settings, including when another known tab field changes.
+    expected_config["future"] =
+        document["workspaces"][0]["tabs"][0]["agent_config"]["future"].clone();
     assert_eq!(
         gpui["workspaces"][0]["tabs"][0]["agent_config"],
-        iced_config
+        expected_config
+    );
+    assert_eq!(
+        gpui["workspaces"][0]["tabs"][0]["dir"],
+        root.join("changed").display().to_string()
     );
     assert_eq!(gpui["workspaces"][0]["tabs"][0]["future_tab"], true);
 }

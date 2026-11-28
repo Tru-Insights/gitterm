@@ -551,3 +551,216 @@ mod tests {
         assert_eq!(errors, ["no origin"]);
     }
 }
+
+/// Work's two local writes; the shared row reducers above remain Iced's rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalControl {
+    ClearHold { root: String, key: PrKey },
+    DismissNews { pr: String, news: String },
+}
+impl LocalControl {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ClearHold { .. } => "clear hold",
+            Self::DismissNews { .. } => "×",
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) fn save(&self, root: &Path, at: &str) -> Result<(), String> {
+        let path = match self {
+            Self::ClearHold { root: chat, .. } => {
+                crate::merge_plan::plan_path(&crate::merge_plan::plans_dir(root), chat)?
+            }
+            Self::DismissNews { .. } => WatchFile::path_in(root),
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("Read {}: {e}", path.display())),
+        };
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("Read {}: {e}", path.display()))?;
+        if !value.is_object() {
+            return Err(format!("Read {}: expected a JSON object", path.display()));
+        }
+        let changed = match self {
+            Self::ClearHold { root, key } => {
+                let mut plan: MergePlan = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                if plan.root_chat_id != *root {
+                    return Err(format!("Read {}: merge plan root changed", path.display()));
+                }
+                let mut plans = [(root.clone(), plan.clone())].into();
+                if let Some((_, next)) = clear_hold(&mut plans, &HashSet::new(), root, key, at) {
+                    let index = plan
+                        .entries
+                        .iter()
+                        .position(|e| e.key().id() == key.id() && e.hold.is_some())
+                        .expect("cleared entry");
+                    plan = next;
+                    value
+                        .get_mut("entries")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|entries| entries.get_mut(index))
+                        .and_then(serde_json::Value::as_object_mut)
+                        .ok_or_else(|| {
+                            format!("Read {}: expected an object plan entry", path.display())
+                        })?
+                        .remove("hold");
+                    value["updated_at"] = plan.updated_at.into();
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::DismissNews { pr, news } => {
+                let mut watch: WatchFile = serde_json::from_value(value.clone())
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                if dismiss_news(&mut watch, pr, news) {
+                    let index = watch.prs[pr]
+                        .news
+                        .iter()
+                        .position(|n| n.key == *news)
+                        .expect("dismissed item");
+                    if value["prs"][pr]["news"][index]["dismissed"] == true {
+                        return Ok(());
+                    }
+                    value
+                        .get_mut("prs")
+                        .and_then(|prs| prs.get_mut(pr))
+                        .and_then(|pr| pr.get_mut("news"))
+                        .and_then(serde_json::Value::as_array_mut)
+                        .and_then(|news| news.get_mut(index))
+                        .and_then(serde_json::Value::as_object_mut)
+                        .ok_or_else(|| {
+                            format!("Read {}: expected an object news item", path.display())
+                        })?
+                        .insert("dismissed".into(), true.into());
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if changed {
+            let bytes = serde_json::to_vec_pretty(&value)
+                .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+            crate::atomic_file::write_atomically(&path, &bytes)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod remaining_controls_tests {
+    use super::*;
+    use crate::desktop_store::DesktopStore;
+    use serde_json::json;
+
+    #[test]
+    fn remaining_clear_hold_saved_projection_equals_iced_and_keeps_unknowns() {
+        let dir = tempfile::tempdir().unwrap();
+        let plans = crate::merge_plan::plans_dir(dir.path());
+        std::fs::create_dir_all(&plans).unwrap();
+        let path = crate::merge_plan::plan_path(&plans, "root").unwrap();
+        let value = json!({"future":17,"root_chat_id":"root","source":"agent","updated_at":"before","entries":[{"repo":"example/repo","number":1,"hold":"wait","note":"keep","future_entry":true},{"repo":"example/repo","number":2,"hold":"other"}]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let previous: MergePlan = serde_json::from_value(value).unwrap();
+        let key = PrKey::new("example/repo", 1);
+        let mut iced = [("root".into(), previous)].into();
+        clear_hold(&mut iced, &HashSet::new(), "root", &key, "after").unwrap();
+        let untouched = dir.path().join("workspaces.json");
+        std::fs::write(&untouched, "{\n  \"workspaces\": []\n}").unwrap();
+        let before = std::fs::read(&untouched).unwrap();
+        let store = DesktopStore::open(dir.path()).unwrap();
+        let action = LocalControl::ClearHold {
+            root: "root".into(),
+            key,
+        };
+        store
+            .pr_control(action.clone(), "after".into())
+            .wait()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let saved: MergePlan = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved, iced["root"]);
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["future"], 17);
+        assert_eq!(saved["entries"][0]["future_entry"], true);
+        assert_eq!(std::fs::read(&untouched).unwrap(), before);
+        store.pr_control(action, "later".into()).wait().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn remaining_news_dismiss_saved_projection_equals_iced_and_keeps_unknowns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = WatchFile::path_in(dir.path());
+        let value = json!({"future":"keep","prs":{"example/repo#1":{"key":{"repo":"example/repo","number":1},"future_pr":12,"news":[{"key":"news1","kind":"checks_failed","text":"test failed","at":"2026-11-01T00:00:00Z","told":true,"future_news":true},{"key":"news2","kind":"merged","text":"merged","at":"2026-11-01T00:00:00Z"}]}}});
+        let mut iced: WatchFile = serde_json::from_value(value.clone()).unwrap();
+        dismiss_news(&mut iced, "example/repo#1", "news1");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let store = DesktopStore::open(dir.path()).unwrap();
+        let action = LocalControl::DismissNews {
+            pr: "example/repo#1".into(),
+            news: "news1".into(),
+        };
+        store
+            .pr_control(action.clone(), "unused".into())
+            .wait()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(serde_json::from_slice::<WatchFile>(&bytes).unwrap(), iced);
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved["future"], "keep");
+        assert_eq!(saved["prs"]["example/repo#1"]["future_pr"], 12);
+        assert_eq!(
+            saved["prs"]["example/repo#1"]["news"][0]["future_news"],
+            true
+        );
+        store.pr_control(action, "unused".into()).wait().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn remaining_malformed_pr_files_and_unsafe_plan_ids_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = WatchFile::path_in(dir.path());
+        std::fs::write(&path, "broken").unwrap();
+        let store = DesktopStore::open(dir.path()).unwrap();
+        assert!(store
+            .pr_control(
+                LocalControl::DismissNews {
+                    pr: "example/repo#1".into(),
+                    news: "n".into()
+                },
+                "now".into()
+            )
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+        std::fs::write(&path, "[]").unwrap();
+        assert!(store
+            .pr_control(
+                LocalControl::DismissNews {
+                    pr: "example/repo#1".into(),
+                    news: "n".into()
+                },
+                "now".into()
+            )
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "[]");
+        assert!(store
+            .pr_control(
+                LocalControl::ClearHold {
+                    root: "../escape".into(),
+                    key: PrKey::new("example/repo", 1)
+                },
+                "now".into()
+            )
+            .wait()
+            .is_err());
+    }
+}

@@ -1692,12 +1692,7 @@ fn newest_instance_settings(dir: &Path) -> Option<(Config, PathBuf)> {
 }
 
 fn save_settings_to(dir: &Path, config: &Config) -> Result<(), String> {
-    let path = dir.join(SETTINGS_FILE);
-    let json = serde_json::to_vec_pretty(config)
-        .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
-    std::fs::create_dir_all(dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    gitterm::merge_plan::write_atomically(&path, &json)
+    gitterm_core::settings::save_to(dir, config)
 }
 
 // Workspace persistence
@@ -2084,6 +2079,7 @@ mod repo_action_compatibility {
         iced.repos.insert(
             1,
             RepoConfig {
+                extra: Default::default(),
                 dir: extra.to_string_lossy().into_owned(),
                 location: None,
                 run_command: Some("cargo run".into()),

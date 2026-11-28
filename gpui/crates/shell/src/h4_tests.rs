@@ -197,6 +197,24 @@ fn find_open_resume_select_existing_history_and_refuse_new_process(cx: &mut Test
         draw(cx);
     }
     cx.read(|cx| {
+        assert!(
+            shell
+                .read(cx)
+                .owner
+                .read(cx)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not available in preview")
+        );
+    });
+    sidebar.update(cx, |_, cx| {
+        cx.emit(FindOutcome::Open {
+            id: ChatRef::local("first"),
+        })
+    });
+    draw(cx);
+    cx.read(|cx| {
         let shell = shell.read(cx);
         assert_eq!(shell.find_owner(cx), owner);
         assert_eq!(shell.active(cx).sessions.len(), 2);
@@ -277,13 +295,16 @@ fn file_open_event_close_button_and_escape_return_to_same_session(cx: &mut TestA
 fn find_open_rows_refresh_and_keep_needs_you_before_working_before_idle(cx: &mut TestAppContext) {
     let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
-    click(cx, "Find");
     let sessions = cx.read(|cx| shell.read(cx).active(cx).sessions.clone());
     for (first_title, second_title, expected) in [
         ("Idle", "◐ Working", 1),
         ("✳ Needs you", "◐ Working", 0),
         ("Idle", "Idle", 0),
     ] {
+        // Selecting a row restores that tab's own sidebar mode.
+        if cx.read(|cx| shell.read(cx).active(cx).store.regions.sidebar_mode) != SidebarMode::Find {
+            click(cx, "Find");
+        }
         shell.update(cx, |shell, cx| {
             for (session, title) in sessions.iter().zip([first_title, second_title]) {
                 shell.active(cx).panes[&session_pane_id(session.id)].update(cx, |pane, cx| {

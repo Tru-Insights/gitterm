@@ -3,6 +3,8 @@
 pub mod budget;
 #[cfg(feature = "runtime")]
 pub mod collect;
+#[cfg(feature = "runtime")]
+pub mod edit;
 pub mod model;
 pub mod patch;
 pub mod state;

@@ -1,9 +1,10 @@
 use crate::{
     data::{SessionKind, ShellData, WorkspaceId},
+    terminal_setup::{self, Placement},
     theme::Palette,
 };
 use gitterm_gpui_chat::{ChatView, events::parse_fixture};
-use gitterm_terminal::{TerminalConfig, TerminalLaunch, TerminalView};
+use gitterm_terminal::{TerminalLaunch, TerminalView};
 use gpui::*;
 use gpui_component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use std::rc::Rc;
@@ -62,7 +63,7 @@ pub struct Pane {
     pub(crate) terminal_cwd: Option<std::path::PathBuf>,
     /// Iced's restored tracked cwd, until the local shell reports a new cwd.
     pub(crate) terminal_saved_dir: Option<std::path::PathBuf>,
-    workspace: WorkspaceId,
+    pub(crate) workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
     files: Option<Entity<crate::files_view::FilesView>>,
@@ -109,6 +110,10 @@ impl Pane {
                     },
                     ..Default::default()
                 };
+                let mut launch = launch;
+                if let Some(target) = &session {
+                    crate::browser::terminal_environment(&mut launch, &target.session_uid, cx);
+                }
                 // Headless fixtures must not run host rc/session-restore scripts.
                 #[cfg(test)]
                 let launch = TerminalLaunch {
@@ -173,7 +178,7 @@ impl Pane {
                     let exit_target = session.clone();
                     let cwd_target = session.clone();
                     PaneContent::Terminal(cx.new(|cx| {
-                        TerminalView::launch(launch, TerminalConfig::default(), cx)
+                        terminal_setup::launch(launch, Placement::Main, cx)
                             .with_title_callback(move |_, cx, title| {
                                 let _ = pane.update(cx, |pane, cx| {
                                     if pane.session != title_target {
@@ -525,8 +530,11 @@ impl Render for Pane {
 
 impl crate::Shell {
     /// Mount the retained Git subview when the Work repo route is selected.
-    pub(crate) fn git_sidebar(&self, sidebar: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
-        let state = self.active(cx);
+    pub(crate) fn git_sidebar(
+        &self,
+        sidebar: Stateful<Div>,
+        state: &crate::WorkspaceDock,
+    ) -> Stateful<Div> {
         sidebar.child(
             div().flex_1().min_h_0().child(
                 state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone(),

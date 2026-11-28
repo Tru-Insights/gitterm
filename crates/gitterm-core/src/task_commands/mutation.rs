@@ -103,6 +103,17 @@ pub enum TaskMutation {
     Close {
         task_id: String,
     },
+    Stop {
+        task_id: String,
+    },
+    CancelQueue {
+        task_id: String,
+    },
+    ResumeConversation {
+        task_id: String,
+        chat_id: String,
+        timestamp: String,
+    },
     CloseSession {
         target: session::Target,
         confirmed: bool,
@@ -202,6 +213,17 @@ pub enum TaskMutationAction {
     },
     ArchiveTask {
         task_id: String,
+    },
+    StopTask {
+        task_id: String,
+        targets: Vec<session::Target>,
+    },
+    CancelQueue {
+        task_id: String,
+    },
+    ResumeConversation {
+        task_id: String,
+        session: Box<TaskSessionRecord>,
     },
     Session(session::Effect),
     InspectCleanup {
@@ -317,10 +339,21 @@ pub struct TaskMutationFacts {
     /// Caller UIDs whose task sessions are currently Working (versus idle).
     pub working_sessions: Vec<String>,
     pub publish_busy: Vec<String>,
+    /// Claude IDs with no transcript (existence only, not transcript contents).
+    pub phantom_conversations: Vec<String>,
+    /// Optional already-loaded chat index facts; absent entries do not block resume.
+    pub conversations: Vec<TaskConversationFact>,
     pub presets: Vec<TaskPreset>,
     pub policy_blocked: bool,
     pub policy_reason: String,
     pub slot_holders: Vec<String>,
     pub queue: Vec<String>,
     pub concurrency_limit: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskConversationFact {
+    pub chat_id: String,
+    pub cwd: PathBuf,
+    pub remote: bool,
 }

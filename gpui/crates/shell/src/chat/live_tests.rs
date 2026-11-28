@@ -62,14 +62,14 @@ fn live_pane_defers_and_missing_host_rejects_first_submission(cx: &mut gpui::Tes
             cx,
         )
     });
-    pane.read_with(cx, |pane, _| {
+    pane.read_with(cx, |pane, cx| {
         assert!(pane.controller.live);
         assert!(pane.controller.runtime.is_none());
         let deferred = pane.deferred_live.as_ref().unwrap();
         assert_eq!(deferred.caller, pane.target().session_uid);
         assert_eq!(
             *deferred.settings.borrow(),
-            gitterm_gpui_chat::composer::LaunchSettings::default()
+            controls::new_chat_selection(cx)
         );
     });
     // Invoke from inside the borrowed view, as a real composer key event does.
@@ -532,4 +532,161 @@ async fn resume_round_trip(services: &ServiceContext, root: &Path) {
         drop(runtime);
         contender.provider_id(&id).unwrap();
     }
+}
+
+#[tokio::test]
+async fn live_allow_and_remember_delivers_iced_rule_and_saved_json_to_fake_child() {
+    use gitterm_core::{
+        chat::types::{RuntimeDecision, RuntimeRequestKind},
+        harness::claude::{Launch, LaunchFlags},
+        turn_snapshots::{Recorder, SnapshotRoots},
+    };
+    use gitterm_gpui_chat::{PermissionDecision, adapter::ReceiptState};
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::create_dir(root.join("home")).unwrap();
+    std::fs::create_dir(root.join("provider")).unwrap();
+    std::fs::create_dir(root.join(".claude")).unwrap();
+    std::fs::write(
+        root.join(".claude/settings.local.json"),
+        br#"{"future":true,"permissions":{"allow":["Read"]}}"#,
+    )
+    .unwrap();
+    let program = tests::script(
+        &root,
+        "fake-permission",
+        r#"#!/usr/bin/python3
+import json,signal,sys
+from pathlib import Path
+signal.alarm(20)
+Path('argv.json').write_text(json.dumps(sys.argv[1:]))
+init=json.loads(sys.stdin.readline())
+print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}}),flush=True)
+choice={'type':'addRules','destination':'localSettings','behavior':'allow','rules':[{'toolName':'Bash','ruleContent':'echo synthetic'}]}
+print(json.dumps({'type':'control_request','request_id':'remember','request':{'subtype':'can_use_tool','tool_name':'Bash','tool_use_id':'tool','input':{'command':'echo synthetic'},'permission_suggestions':[choice]}}),flush=True)
+answer=json.loads(sys.stdin.readline())
+Path('answer.json').write_text(json.dumps(answer['response']['response']))
+assert answer['response']['response']['updatedPermissions']==[choice]
+path=Path('.claude/settings.local.json')
+settings=json.loads(path.read_text())
+settings['permissions']['allow'].append('Bash(echo synthetic)')
+path.write_text(json.dumps(settings,indent=2))
+print(json.dumps({'type':'control_request','request_id':'saved','request':{'subtype':'can_use_tool','tool_name':'Read','tool_use_id':'saved','input':{},'permission_suggestions':[]}}),flush=True)
+sys.stdin.read()
+"#,
+    );
+    let mut cfg = config(&root);
+    cfg.mcp_servers.clear();
+    cfg.chrome = false;
+    let iced_args = cfg.args();
+    let path = root.clone();
+    let (runtime, mut events) = Session::spawn_runtime(move |token| {
+        Ok(Launch {
+            flags: LaunchFlags::Standard,
+            config: cfg,
+            program,
+            environment: vec![
+                ("HOME".into(), path.join("home").into_os_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    path.join("provider").into_os_string(),
+                ),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            temporary_dir: path.clone(),
+            snapshots: Box::new(
+                Recorder::new(
+                    SnapshotRoots::new(path.join("snapshots"), path.clone()).unwrap(),
+                    path.clone(),
+                    None,
+                    None,
+                    Some(path.join("home")),
+                )
+                .with_close_token(token),
+            ),
+        })
+    });
+    let mut controller = Controller::new();
+    controller.live = true;
+    controller.runtime = Some(runtime.into());
+    let source = controller.source.clone();
+    let suggestion = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let requested = match &event {
+            RuntimeEvent::Harness(HarnessEvent::RuntimeRequest {
+                request_id,
+                kind: RuntimeRequestKind::Permission { suggestions, .. },
+                ..
+            }) if request_id == "remember" => Some(suggestions[0].clone()),
+            _ => None,
+        };
+        controller.apply_runtime_outcome(&source, event);
+        if let Some(suggestion) = requested {
+            break suggestion;
+        }
+    };
+    let identity = controller
+        .adapter
+        .state()
+        .request_identity(&source, &[], "remember")
+        .unwrap();
+    let intent = ChatIntent::Answer {
+        identity,
+        answer: Box::new(ChatIntent::Permission {
+            request_id: "remember".into(),
+            decision: PermissionDecision::AllowAlways {
+                suggestion: suggestion.clone(),
+            },
+        }),
+    };
+    let (receipt, _) = controller.dispatch(intent.clone());
+    assert_eq!(receipt.state, ReceiptState::ChannelAccepted);
+    let (duplicate, _) = controller.dispatch(intent);
+    assert_eq!(
+        duplicate.id, receipt.id,
+        "duplicate stays attached to the single pending answer"
+    );
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(&event,RuntimeEvent::Harness(HarnessEvent::RuntimeRequest{request_id,..}) if request_id=="saved")
+        {
+            break;
+        }
+        controller.apply_runtime_outcome(&source, event);
+    }
+    controller
+        .runtime
+        .as_mut()
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("answer.json")).unwrap()).unwrap();
+    let expected = gitterm_core::harness::claude_parser::permission_result(
+        &RuntimeDecision::Allow {
+            updated_input: None,
+            remember: Some(suggestion),
+        },
+        "tool",
+        &serde_json::json!({"command":"echo synthetic"}),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".claude/settings.local.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        saved,
+        serde_json::json!({"future":true,"permissions":{"allow":["Read","Bash(echo synthetic)"]}})
+    );
+    let actual_args: Vec<String> =
+        serde_json::from_slice(&std::fs::read(root.join("argv.json")).unwrap()).unwrap();
+    assert_eq!(actual_args, iced_args);
 }

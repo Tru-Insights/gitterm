@@ -40,6 +40,9 @@ pub struct RegionLayout {
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     pub sidebar_mode: SidebarMode,
+    /// Like Iced TabState.sidebar_mode: runtime only.
+    #[serde(skip)]
+    pub(crate) session_modes: std::collections::HashMap<crate::data::SessionId, SidebarMode>,
     pub bottom_height: f32,
     pub bottom_visible: bool,
     pub bottom_opened: bool,
@@ -53,6 +56,7 @@ impl Default for RegionLayout {
             sidebar_width: 360.,
             sidebar_collapsed: false,
             sidebar_mode: SidebarMode::Work,
+            session_modes: Default::default(),
             bottom_height: 200.,
             bottom_visible: true,
             bottom_opened: false,
@@ -594,6 +598,7 @@ mod tests {
             sidebar_width: 492.,
             sidebar_collapsed: true,
             sidebar_mode: SidebarMode::Files,
+            session_modes: Default::default(),
             bottom_height: 321.,
             bottom_visible: false,
             bottom_opened: true,

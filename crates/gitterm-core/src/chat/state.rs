@@ -269,6 +269,8 @@ pub struct CheckoutContext {
 #[derive(Debug)]
 pub struct State {
     pub conversation: Vec<AgentEvent>,
+    #[cfg(feature = "runtime")]
+    pub live_times: crate::chat_overview::LiveTimes,
     pub session_id: Option<String>,
     pub state: AgentSessionState,
     pub pending_requests: Vec<String>,
@@ -291,6 +293,8 @@ impl Default for State {
     fn default() -> Self {
         Self {
             conversation: Vec::new(),
+            #[cfg(feature = "runtime")]
+            live_times: Default::default(),
             session_id: None,
             state: AgentSessionState::Idle,
             pending_requests: Vec::new(),
@@ -1275,6 +1279,13 @@ impl State {
         ev: AgentEvent,
         now_ms: Option<i64>,
     ) -> (Vec<AgentEvent>, Vec<AgentEvent>) {
+        #[cfg(feature = "runtime")]
+        if let Some(ms) = now_ms.and_then(|ms| u64::try_from(ms).ok()) {
+            self.live_times.observe(
+                &ev,
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms),
+            );
+        }
         self.revision = self.revision.wrapping_add(1);
         let turn_started = matches!(&ev, AgentEvent::Harness(HarnessEvent::TurnStarted { .. }))
             || matches!(

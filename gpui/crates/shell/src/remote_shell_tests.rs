@@ -450,8 +450,18 @@ fn refresh_lists_remote_sessions_through_the_client(cx: &mut TestAppContext) {
         shell.select_workspace_id(id, window, cx)
     });
     draw(cx);
+    crate::workspace_navigation::settle_slide(cx, 1);
     assert!(cx.debug_bounds("remote-session-home").is_some());
     click("remote-session-refresh", cx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while cx.read(|cx| f.shell.read(cx).remote.sessions.loading) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "remote sessions did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        draw(cx);
+    }
     assert_eq!(
         f.fake.calls_after_handshake(),
         ["list_sessions box dev@box.invalid".to_string()]

@@ -124,6 +124,7 @@ fn inputs(open: &[&str]) -> Inputs {
         titles: Default::default(),
         presets: vec![],
         open_chats: vec![],
+        conversations: vec![],
     }
 }
 
@@ -1670,7 +1671,8 @@ fn start_names_the_first_preset_and_the_picker_lists_presets(cx: &mut TestAppCon
         let host = host(cx).unwrap();
         let task = host.store().as_ref().unwrap().get("ready").unwrap();
         let context = crate::session_picker::TaskContext::from_task(task, 0, true);
-        let mut model = crate::session_picker::PickerModel::new(shell.picker_inputs(Some(context)));
+        let mut model =
+            crate::session_picker::PickerModel::new(shell.picker_inputs(Some(context), cx));
         model.open();
         model
             .entries()

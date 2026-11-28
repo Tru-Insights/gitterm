@@ -10,11 +10,11 @@ pub type OpenFile = Rc<dyn Fn(PathBuf, &mut App)>;
 
 #[derive(Clone, Default)]
 pub struct ReviewHost {
-    /// Iced's shared config dir; its `review-viewed.json` is only ever read.
+    /// Iced's shared config dir, read by the review; the host chooses the writer.
     pub iced_marks_dir: Option<PathBuf>,
     /// The preview state root's own marks, read and merged over Iced's.
     pub preview_marks_dir: Option<PathBuf>,
-    /// Writes the encoded marks into the preview state root, nowhere else.
+    /// Writes the encoded overlay to Preview, or merges edits into Iced in Live.
     pub save_marks: Option<SaveMarks>,
     /// Iced's turn snapshot store, read-only. None leaves turns unavailable.
     pub snapshot_roots: Option<SnapshotRoots>,

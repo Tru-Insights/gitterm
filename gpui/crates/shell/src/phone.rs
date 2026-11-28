@@ -1,14 +1,9 @@
-//! Iced's "Pair a phone" panel (TRU-151). The preview is read-only on Iced's
-//! data: typing and the checkbox are local, the paired phones are listed
-//! from the agent, and every control that would grant a pairing or revoke a
-//! phone is refused by the preview gate with a notice and calls nothing.
-//!
-//! The state and rules are core's `remote::phone_panel` (Iced's too); this
-//! file draws them, and the shell (`remote_shell.rs`) runs each call the
-//! rules start. The pairing QR image is not drawn (no QR dependency, and the
-//! preview never issues a pairing to draw it for).
+//! Iced's phone panel, using core's state, agent calls and QR pixels.
 
-use std::time::{Duration, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 
 use gitterm_core::{
     chats,
@@ -71,10 +66,13 @@ fn seen_text(last_seen_unix_secs: u64) -> String {
     }
 }
 
+pub(crate) type PairingImage = Arc<gpui::RenderImage>;
+
 pub struct PhonePanel {
+    pub(crate) list_generation: u64,
     /// Iced's rules and state; the name field's text lives in `name` and is
     /// copied over when a pairing is asked for.
-    pub panel: phone_panel::PhonePanel<()>,
+    pub panel: phone_panel::PhonePanel<PairingImage>,
     name: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
@@ -105,6 +103,7 @@ impl PhonePanel {
         });
         Self {
             panel: phone_panel::PhonePanel::open(remote_id, machine_name),
+            list_generation: 0,
             name,
             _subscriptions: vec![subscription],
         }
@@ -137,14 +136,31 @@ impl PhonePanel {
         cx.notify();
     }
 
-    /// The answer to a create call. The QR image is not drawn.
+    pub(crate) fn phones_loaded_at(
+        &mut self,
+        generation: u64,
+        remote_id: &str,
+        result: Result<Vec<PairedPhoneInfo>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.list_generation == generation {
+            self.phones_loaded(remote_id, result, cx);
+        }
+    }
+
+    /// The answer to a create call, drawn from the same pixels as Iced.
     pub fn pairing_created(
         &mut self,
         remote_id: &str,
         result: Result<PhonePairing, String>,
         cx: &mut Context<Self>,
     ) {
-        self.panel.pairing_created(remote_id, result, |_| Ok(()));
+        self.panel.pairing_created(remote_id, result, |url| {
+            let qr = phone_panel::pairing_qr(url)?;
+            let image = image::RgbaImage::from_raw(qr.side, qr.side, qr.pixels)
+                .ok_or("Invalid pairing QR pixels")?;
+            Ok(Arc::new(gpui::RenderImage::new([image::Frame::new(image)])))
+        });
         cx.notify();
     }
 
@@ -268,7 +284,11 @@ impl Render for PhonePanel {
             .child(allow);
 
         if let Some(pairing) = &self.panel.pairing {
-            let mut block = div().flex().flex_col().items_center().gap(px(6.));
+            let mut block = div().flex().flex_col().items_center().gap(px(6.)).child(
+                div()
+                    .debug_selector(|| "phone-pairing-qr".into())
+                    .child(gpui::img(pairing.qr.clone()).w(px(240.)).h(px(240.))),
+            );
             // An older agent sends no short code; the pairing still works.
             if !pairing.short_code.is_empty() {
                 block = block
