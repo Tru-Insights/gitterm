@@ -856,6 +856,18 @@ pub(crate) struct LiveWorkspaceSaved {
     pub closed: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
 }
 
+pub(crate) fn workspace_remote_id(
+    workspace: &gitterm_core::workspace_config::WorkspaceConfig,
+) -> Option<String> {
+    match &workspace.location {
+        Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent {
+            remote_id,
+            ..
+        }) => Some(remote_id.clone()),
+        _ => None,
+    }
+}
+
 /// Runs on a background executor; DesktopStore owns the complete document and
 /// publishes no candidate on a failed save. UI callers apply effects only on Ok.
 pub(crate) fn save_live_workspace(
@@ -889,10 +901,6 @@ pub(crate) fn save_live_workspace(
             };
             if let Some(key) = target && file.workspaces.iter().filter(|w| key.matches(w)).count() > 1 {
                 return Err(format!("Several saved workspaces are named {} in {}; this workspace cannot be changed in Live.", key.name, key.dir));
-            }
-            if let Some(workspace) = target.and_then(|key| file.workspaces.iter().find(|w| key.matches(w)))
-                && (workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))) {
-                return Err("Remote workspaces cannot be changed in Live yet.".into());
             }
             let mut workspace = match action {
                 LiveWorkspaceAction::Create { name, start, .. } => {
@@ -988,13 +996,13 @@ pub(crate) fn save_live_workspace(
                         open: file.workspaces.iter().filter(|w| w.active || open.iter().any(|key| key.matches(w))).map(|w| park::OpenWorkspace {
                             target: park::Target { uid: 0, tabs: vec![] },
                             key: park::Key { name: w.name.clone(), dir: w.dir.clone() },
-                            running: None, remote_id: None,
+                            running: None, remote_id: workspace_remote_id(w),
                             conversations: w.tabs.iter().filter_map(|t| t.chat_session_id.clone()).collect(),
                         }).collect(),
                         closed: vec![],
                     };
                     let park::Effect::FilteredRestore { indices, active_tab } = state.reduce(park::Intent::FilterRestore {
-                        remote_id: None, tabs: workspace.tabs.iter().map(|t| t.session_identity()).collect(), active_tab: workspace.active_tab,
+                        remote_id: workspace_remote_id(&workspace), tabs: workspace.tabs.iter().map(|t| t.session_identity()).collect(), active_tab: workspace.active_tab,
                     }) else { unreachable!("filter restore effect") };
                     workspace.tabs = workspace.tabs.into_iter().enumerate().filter_map(|(i,t)| indices.contains(&i).then_some(t)).collect();
                     workspace.active_tab = active_tab;
@@ -1182,6 +1190,99 @@ mod live_workspace_tests {
             .unwrap();
         assert!(status.success());
     }
+    #[test]
+    fn golive20b_remote_park_resume_done_preserves_machine_and_partitions_conversations() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let tab = serde_json::json!({"dir":"/remote/project","repo_dir":"/remote/project","tab_kind":"agent","agent_config":{"backend":"claude","model":"opus","permission_mode":"plan","effort":"high"},"chat_session_id":"shared-id","session_uid":"remote-caller","future":"retained"});
+        let remote = serde_json::json!({"name":"Remote","abbrev":"R","dir":"/remote/project","color":"blue","location":{"kind":"remote_agent","remote_id":"placeholder","workspace_id":"fixture","root":"/remote/project"},"env":{"PLACEHOLDER":"value"},"future":"keep","tabs":[tab],"active_tab":0});
+        let local = serde_json::json!({"name":"Local","abbrev":"L","dir":"/local/project","color":"red","tabs":[{"dir":"/local/project","chat_session_id":"shared-id"}]});
+        std::fs::write(
+            &path,
+            serde_json::to_vec(
+                &serde_json::json!({"future":42,"workspaces":[remote,local],"active_workspace":0}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let key = Key {
+            name: "Remote".into(),
+            dir: "/remote/project".into(),
+        };
+        let store = DesktopStore::open(root.path()).unwrap();
+        let before: WorkspacesFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let parked = save_live_workspace(
+            &store,
+            LiveWorkspaceAction::Park {
+                key: key.clone(),
+                info: Info::new("later", "2026-11-20T00:00:00Z".into()),
+                done: false,
+                tabs: before.workspaces[0].tabs.clone(),
+                bottom_terminals: vec![],
+                active_tab: Some(0),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(parked.workspace.is_parked());
+        assert_eq!(parked.workspace.location, before.workspaces[0].location);
+        assert_eq!(parked.workspace.env, before.workspaces[0].env);
+        assert_eq!(parked.workspace.extra, before.workspaces[0].extra);
+        drop(store);
+        let store = DesktopStore::open(root.path()).unwrap();
+        let resumed = save_live_workspace(
+            &store,
+            LiveWorkspaceAction::Resume {
+                key: key.clone(),
+                reopen: false,
+                open: vec![],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&resumed.workspace.tabs).unwrap(),
+            serde_json::to_value(&before.workspaces[0].tabs).unwrap(),
+            "a local conversation with the same id cannot remove a remote chat"
+        );
+        save_live_workspace(
+            &store,
+            LiveWorkspaceAction::Park {
+                key: key.clone(),
+                info: Info::new("done", "2026-11-20T00:00:00Z".into()),
+                done: false,
+                tabs: resumed.workspace.tabs,
+                bottom_terminals: vec![],
+                active_tab: Some(0),
+            },
+            None,
+        )
+        .unwrap();
+        let done =
+            save_live_workspace(&store, LiveWorkspaceAction::Done(key.clone()), None).unwrap();
+        assert!(done.workspace.done_at.is_some());
+        assert_eq!(done.workspace.location, before.workspaces[0].location);
+        let resumed = save_live_workspace(
+            &store,
+            LiveWorkspaceAction::Resume {
+                key,
+                reopen: true,
+                open: vec![],
+            },
+            None,
+        )
+        .unwrap();
+        assert!(resumed.workspace.active && resumed.workspace.done_at.is_none());
+        assert_eq!(
+            serde_json::to_value(&resumed.workspace.tabs).unwrap(),
+            serde_json::to_value(&before.workspaces[0].tabs).unwrap()
+        );
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(after["future"], 42);
+    }
+
     fn fixture(root: &Path) -> Key {
         // The original Iced format, before repo normalization and park notes.
         std::fs::write(root.join("workspaces.json"), br#"{"active_workspace":0,"workspaces":[

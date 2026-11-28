@@ -176,7 +176,7 @@ impl WorkspaceOwner {
         }
         let chat_quit = cx.on_app_quit(|owner: &mut Self, cx| {
             for chat in owner.chats.values() {
-                chat.update(cx, |chat, cx| chat.shutdown_runtime(cx));
+                chat.update(cx, |chat, cx| chat.quit_runtime(cx));
             }
             if cx.try_global::<crate::lifetime::Barrier>().is_none()
                 && let Err(error) = owner.chat_shutdown.drain()

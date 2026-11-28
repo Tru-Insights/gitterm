@@ -185,6 +185,7 @@ pub struct ChatView {
     /// re-project the chips at once. Dropped once the session is ready.
     shadow: Option<gitterm_core::chat::state::State>,
     checkout_source: Option<crate::composer::CheckoutSource>,
+    remote_checkout: Option<(String, String)>,
     dismiss_gate: Option<crate::interactions::DismissGate>,
     delegation_actions_live: bool,
     callback: Option<IntentCallback>,
@@ -333,6 +334,7 @@ impl ChatView {
             fixture_composer,
             shadow: None,
             checkout_source: None,
+            remote_checkout: None,
             dismiss_gate: None,
             delegation_actions_live: false,
             callback: None,
@@ -565,6 +567,16 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Remote Live permissions are applied by the agent on its own machine.
+    pub fn enable_live_permissions(&mut self, cx: &mut Context<Self>) {
+        self.preview = false;
+        for card in self.cards.values() {
+            card.update(cx, |card, cx| {
+                card.preview = false;
+                cx.notify();
+            });
+        }
+    }
     /// Enable choosing the launch configuration before the first live turn.
     /// Card, resume and persistence fences remain those set by `set_preview`.
     pub fn set_live_prelaunch(&mut self, cx: &mut Context<Self>) {
@@ -710,6 +722,19 @@ impl ChatView {
     /// Picks made before the session is ready are held and sent when it starts.
     fn settings_enabled(&self) -> bool {
         self.read_only_reason.is_none() && self.callback.is_some()
+    }
+    pub fn set_remote_checkout(&mut self, machine: String, path: String) {
+        self.remote_checkout = Some((machine, path));
+        self.project_remote_checkout();
+    }
+    fn project_remote_checkout(&mut self) {
+        if let Some((machine, path)) = &self.remote_checkout {
+            self.composer_state.checkout_path = Some(path.clone());
+            self.composer_state.checkout_locked = Some(format!(
+                "This chat runs on {machine} in the workspace's directory"
+            ));
+            self.composer_state.checkout_choices.clear();
+        }
     }
     /// The host's source for the checkout menu, asked again whenever it opens.
     pub fn set_checkout_source(
@@ -1105,6 +1130,7 @@ impl ChatView {
         }
         self.projection_runtime = Some(source.clone());
         self.composer_state.project(state, update.event.as_ref());
+        self.project_remote_checkout();
         self.shadow = (!self.composer_state.commands_ready).then(|| {
             let mut shadow = gitterm_core::chat::state::State::default();
             shadow.conversation = state.conversation.clone();
