@@ -26,6 +26,15 @@ use gitterm_core::{
 /// Blocking reads, run on the background executor. Errors are user-facing.
 pub trait RemoteClient: Send + Sync {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String>;
+    /// Live only; Preview callers never enter this route. Default fakes stay offline.
+    fn start_session(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _workspace: String,
+        _launch: gitterm_core::remote::launch::AgentSessionLaunch,
+    ) -> Result<String, String> {
+        Err("remote session launch unavailable".into())
+    }
     /// Iced's picker source: the remote's whole filesystem (root "/").
     fn list_dir(&self, remote: &RemoteAgentConfig, dir: String) -> SourceDirListing;
     fn list_chats(&self, remote: &RemoteAgentConfig) -> Result<Vec<ChatIndexEntry>, String>;
@@ -71,6 +80,25 @@ impl RemoteClient for AgentClient {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String> {
         let backend = PreviewSourceHost::backend(remote.clone().into());
         block_on(backend.handshake())?.map_err(|error| error.to_string())
+    }
+    fn start_session(
+        &self,
+        remote: &RemoteAgentConfig,
+        workspace: String,
+        launch: gitterm_core::remote::launch::AgentSessionLaunch,
+    ) -> Result<String, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(backend.start_session(
+            workspace,
+            launch.cwd,
+            launch.kind,
+            launch.command,
+            launch.env,
+            launch.cols,
+            launch.rows,
+        ))?
+        .map(|session| session.session_id)
+        .map_err(|error| error.to_string())
     }
     fn list_dir(&self, remote: &RemoteAgentConfig, dir: String) -> SourceDirListing {
         let source = WorkspaceSource::<PreviewSourceHost>::RemoteAgent {
