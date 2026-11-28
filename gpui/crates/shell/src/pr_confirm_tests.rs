@@ -369,3 +369,47 @@ fn gh_active_login_decides_own_pr_and_names_the_account(cx: &mut gpui::TestAppCo
     });
     sidebar.read_with(cx, |s, _| assert!(has_approve(s), "the mapping wins"));
 }
+
+#[gpui::test]
+fn live_pr_cancel_does_nothing_and_confirm_executes(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext;
+    cx.background_executor.allow_parking();
+    let (dir, live, fake) = crate::pr_live::tests::fixture();
+    let path = gitterm_core::prs::WatchFile::path_in(dir.path());
+    let before = std::fs::read(&path).unwrap();
+    cx.update(|cx| cx.set_global(live));
+    let sidebar = cx.new(|_| crate::work_sidebar::tests::fixture(false));
+    let prepare = |s: &mut crate::work_sidebar::WorkSidebar| {
+        s.confirm = Some(PrActionConfirm::open(
+            fake.watched.key.clone(),
+            ActionKind::Approve,
+            [],
+            &BTreeMap::new(),
+        ));
+        s.live_guard = Some(gitterm_core::work::pr_live::Guard::capture(
+            Some(&fake.watched),
+            Some("reviewer"),
+        ));
+    };
+    sidebar.update(cx, |s, cx| {
+        prepare(s);
+        s.confirm_close(cx);
+        s.confirm_run(cx);
+    });
+    cx.run_until_parked();
+    assert!(fake.writes.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    sidebar.update(cx, |s, cx| {
+        prepare(s);
+        s.confirm_run(cx);
+    });
+    for _ in 0..100 {
+        cx.run_until_parked();
+        if sidebar.read_with(cx, |s, _| !s.confirm_open()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(fake.writes.lock().unwrap().len(), 1);
+    assert!(!sidebar.read_with(cx, |s, _| s.confirm_open()));
+}

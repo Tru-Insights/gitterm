@@ -377,6 +377,7 @@ pub(crate) struct ChatPane {
     _delegation_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
+    created_prs: gitterm_core::work::pr_created::CreatedPrs,
 }
 /// The provider finished a turn (Iced's `HarnessEvent::TurnCompleted`).
 #[derive(Clone, Debug)]
@@ -501,6 +502,7 @@ impl ChatPane {
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
+            created_prs: Default::default(),
         };
         if pane.controller.live {
             pane.init_live_tab(cx);
@@ -806,6 +808,7 @@ impl ChatPane {
             _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
+            created_prs: Default::default(),
         }
     }
     pub(crate) fn set_roster(&mut self, projection: RosterProjection, cx: &mut Context<Self>) {
@@ -1031,6 +1034,31 @@ impl ChatPane {
             RuntimeEvent::Harness(HarnessEvent::ConversationReset { .. })
         ) {
             crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
+        }
+        if self.controller.live
+            && let RuntimeEvent::Harness(event) = &event
+        {
+            let prs = self.created_prs.observe(event);
+            if !prs.is_empty()
+                && let Some(chat) = self
+                    .live_tab
+                    .as_ref()
+                    .and_then(|t| t.tab.chat_session_id.clone())
+                && let Some(watch) = cx.try_global::<crate::pr_live::LivePrs>().cloned()
+            {
+                let job = cx
+                    .background_executor()
+                    .spawn(async move { watch.note_live_prs(&chat, &prs) });
+                cx.spawn(async move |pane, cx| {
+                    if let Err(error) = job.await {
+                        _ = pane.update(cx, |pane, cx| {
+                            pane.view
+                                .update(cx, |view, cx| view.set_status_error(error, cx))
+                        });
+                    }
+                })
+                .detach();
+            }
         }
         let attention_event = match &event {
             RuntimeEvent::Harness(

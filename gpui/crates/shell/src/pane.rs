@@ -51,6 +51,8 @@ pub struct Pane {
     pub title: String,
     pub(crate) notification_chat_title: Option<String>,
     pub content: PaneContent,
+    /// Imported DTO owned by this runtime pane, including unmounted native agents.
+    pub(crate) imported_tab: Option<gitterm_core::workspace_config::WorkspaceTabConfig>,
     pub(crate) startup_command: Option<String>,
     pub(crate) chat_session_id: Option<String>,
     pub(crate) terminal_title: Option<String>,
@@ -58,6 +60,8 @@ pub struct Pane {
     pub(crate) exited: bool,
     pub(crate) exit_pending: bool,
     pub(crate) terminal_cwd: Option<std::path::PathBuf>,
+    /// Iced's restored tracked cwd, until the local shell reports a new cwd.
+    pub(crate) terminal_saved_dir: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
@@ -194,6 +198,7 @@ impl Pane {
                                         return;
                                     }
                                     pane.terminal_cwd = Some(cwd.to_path_buf());
+                                    pane.terminal_saved_dir = None;
                                     cx.notify();
                                 });
                             })
@@ -271,6 +276,7 @@ impl Pane {
             title,
             content,
             terminal_title: None,
+            imported_tab: None,
             startup_command: None,
             chat_session_id: None,
             notification_chat_title: None,
@@ -281,6 +287,7 @@ impl Pane {
             exited: false,
             exit_pending: false,
             terminal_cwd,
+            terminal_saved_dir: None,
             workspace,
             data: data.clone(),
             focus: cx.focus_handle(),

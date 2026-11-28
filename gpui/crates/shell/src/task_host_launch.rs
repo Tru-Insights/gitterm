@@ -1234,12 +1234,72 @@ impl TaskHostOwner {
         if let Some(hook) = &self.terminal_spec_hook {
             hook(&mut spec);
         }
-        Ok(TerminalLaunch {
-            cwd: Some(spec.cwd),
-            program: spec.program,
-            args: spec.args,
-            env: spec.env.into_iter().map(|(k, v)| (k, Some(v))).collect(),
-            ..Default::default()
+        Ok(TerminalLaunch::from_command(spec))
+    }
+
+    pub(crate) fn authorize_remote_session(&self) -> Result<(), String> {
+        if !self.is_live() {
+            return Err(preview_notice("Remote terminal"));
+        }
+        if self.is_shut_down() {
+            return Err(SHUT_DOWN.into());
+        }
+        self.host
+            .services()
+            .authorize(
+                Class {
+                    label: "Launch session",
+                    access: Access::Process,
+                },
+                None,
+            )
+            .map_err(|error| error.notice().to_string())
+    }
+
+    /// A remote attach is an ordinary Iced terminal bridge. Never infer a
+    /// local harness or rewrite the saved command into a fresh remote launch.
+    pub(crate) fn open_remote_terminal(
+        &mut self,
+        workspace: &str,
+        tab: &gitterm_core::workspace_config::WorkspaceTabConfig,
+        cwd: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalLaunched, String> {
+        if !self.is_live() {
+            return Err(preview_notice("Remote terminal"));
+        }
+        let target = session::Target {
+            session_uid: tab
+                .session_identity()
+                .open(|| crate::sessions::fresh_target().session_uid)
+                .identity
+                .session_uid,
+            ..crate::sessions::fresh_target()
+        };
+        let session_id = target.session_uid.clone();
+        let authorized = self.authorize_process("Launch session", std::slice::from_ref(&cwd))?;
+        let env = self.live_terminal_env(workspace, &cwd, &session_id)?;
+        self.host
+            .services()
+            .recheck(&authorized)
+            .map_err(|error| error.notice().to_string())?;
+        let terminal = self.spawn_live_terminal(
+            &cwd,
+            tab.startup_command.as_deref(),
+            env,
+            &session_id,
+            &Arc::new(AtomicBool::new(false)),
+            cx,
+        )?;
+        self.host.issue_caller(&session_id);
+        self.terminals.insert(session_id.clone(), terminal);
+        Ok(TerminalLaunched {
+            session_id,
+            title: "Remote".into(),
+            cwd,
+            startup_command: tab.startup_command.clone(),
+            chat_session_id: tab.chat_session_id.clone(),
+            target,
         })
     }
 
