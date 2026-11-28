@@ -1859,3 +1859,29 @@ fn shutdown_worker_identity_io_is_tracked_and_cannot_block_the_poll_deadline() {
         store.get("task-slot").unwrap().sessions[0].launch_identity
     );
 }
+
+#[test]
+fn shutdown_remote_refusal_still_saves_pending_workspaces() {
+    if isolated("shutdown_remote_refusal_still_saves_pending_workspaces") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mut app = app_with_tabs(fixture.path());
+    app.remote_agent_defs = serde_json::from_value(serde_json::json!([{
+        "id":"mini", "name":"Mini", "endpoint":"http://127.0.0.1:9",
+        "auth":{"type":"token","token_ref":"env:SYNTHETIC_TOKEN"}
+    }]))
+    .unwrap();
+    app.save_workspace_configs(app.workspace_configs());
+    app.workspaces[0].name = "Pending workspace change".into();
+    let remote_path = RemoteAgentsFile::file_path();
+    let malformed = b"{ malformed fixture\n";
+    std::fs::write(&remote_path, malformed).unwrap();
+    app.shutdown_phase = ShutdownPhase::FinalSave;
+    let configs = app.workspace_configs();
+    let error = app.workspace_save(configs)().unwrap_err();
+    assert!(error.contains(gitterm_core::remote::connect::MALFORMED));
+    let saved = WorkspacesFile::load().unwrap();
+    assert_eq!(saved.workspaces[0].name, "Pending workspace change");
+    assert_eq!(std::fs::read(remote_path).unwrap(), malformed);
+}

@@ -1213,6 +1213,56 @@ fn shell_hookup_reports_chat_identity_and_actual_working_state(cx: &mut gpui::Te
     });
 }
 
+#[gpui::test]
+fn received_turn_end_preserves_rate_limit_observation(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (dir, preview) = fixture();
+    let saved = SavedChat {
+        uid: "limit-chat".into(),
+        cwd: dir.path().to_owned(),
+        provider: preview.provider(),
+        session_id: Some("provider-id".into()),
+        records: vec![],
+    };
+    let (pane, cx) = cx
+        .add_window_view(|window, cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
+    let readings = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    cx.update(|_, cx| {
+        let readings = readings.clone();
+        cx.subscribe(&pane, move |_, event: &TurnEnded, _| {
+            readings.borrow_mut().push(event.0.clone());
+        })
+        .detach();
+    });
+    let reading = gitterm_core::chat::types::RateLimitReading {
+        observed_at: 1234,
+        info: serde_json::json!({"status": "rejected", "rateLimitType": "five_hour"}),
+    };
+    pane.update(cx, |pane, cx| {
+        let source = pane.runtime_source();
+        pane.receive_runtime_event(
+            &source,
+            RuntimeEvent::Harness(HarnessEvent::TurnStarted {
+                session_id: None,
+                model: None,
+            }),
+            cx,
+        );
+        pane.receive_runtime_event(
+            &source,
+            RuntimeEvent::Harness(HarnessEvent::TurnCompleted {
+                status: gitterm_core::chat::types::TurnStatus::Completed,
+                usage: serde_json::json!({}),
+                cost_usd: None,
+                rate_limit: Some(reading.clone()),
+            }),
+            cx,
+        );
+        assert!(!pane.is_working());
+    });
+    assert_eq!(*readings.borrow(), vec![Some(reading)]);
+}
+
 #[tokio::test]
 async fn fake_process_picker_requests_acknowledge_and_reject_without_sticking() {
     use gitterm_core::chat::types::SettingChange;

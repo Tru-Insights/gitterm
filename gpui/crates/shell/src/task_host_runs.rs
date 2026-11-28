@@ -339,7 +339,7 @@ impl TaskHostOwner {
                 .as_ref()
                 .and_then(|store| store.delegation(id))
                 .ok_or_else(|| format!("delegation {id} is not stored"))?;
-            let mut run = gitterm_core::delegations::codex_run(delegation, self.roots.root())?;
+            let mut run = gitterm_core::delegations::codex_run(delegation, self.process_root())?;
             // Iced's start_delegation_run: the guidelines for an AGENTS.md
             // reader, without the task tools note.
             run.guidelines = self.launch_instructions(
@@ -349,43 +349,51 @@ impl TaskHostOwner {
                 false,
                 cx,
             );
-            let fixture = self.fixture_of(&run.cwd, START_LABEL)?;
-            let targets: Vec<PathBuf> = std::iter::once(run.cwd.clone())
-                .chain(delegation.options.add_dirs.iter().cloned())
-                .collect();
-            let authorized = self.authorize_process(START_LABEL, &targets)?;
-            let env = self.fixture_child_env(&fixture, None)?;
-            let codex_home = value_of(&env, "CODEX_HOME")
-                .map(PathBuf::from)
-                .ok_or("the fixture child has no CODEX_HOME")?;
-            // The whole fixture guard once more, after the runner's git
-            // preflight and immediately before Codex starts: the cwd and
-            // each extra folder still resolve where they did, and their Git
-            // dir and common dir still resolve inside the fixture with no
-            // link under them. So whatever a config-driven program in the
-            // preflight changed (a clean filter, a hook) cannot redirect the
-            // run. Then Git itself, in Codex's own environment, names the
-            // work tree, Git dir and common dir of each, which must lie in
-            // the fixture too: config the preflight rewrote (`core.worktree`,
-            // a `config.worktree`) can point the work tree elsewhere while
-            // the admin dirs stay put. The remaining gap is the instant
-            // between this check and the exec.
-            let services = self.host.services().clone();
-            let child_env = env.clone();
-            let before_spawn = BeforeSpawn::new(move |_cwd: &Path| {
-                // The cwd is the first authorized target.
-                services
-                    .recheck(&authorized)
-                    .and_then(|()| services.recheck_git_work_trees(&authorized, &child_env))
-                    .map_err(|denied| denied.notice().to_string())
-            });
             let stop = CodexStop::new();
-            let environment = CodexEnvironment {
-                search_path: self.codex_search_path(&env),
-                sessions_root: codex_home.join("sessions"),
-                child_env: Some(env),
-                before_spawn: Some(before_spawn),
-                stop: Some(stop.clone()),
+            let environment = if self.is_live() {
+                let mut environment =
+                    CodexEnvironment::detect().map_err(|error| error.to_string())?;
+                environment.stop = Some(stop.clone());
+                environment
+            } else {
+                let fixture = self.fixture_of(&run.cwd, START_LABEL)?;
+                let targets: Vec<PathBuf> = std::iter::once(run.cwd.clone())
+                    .chain(delegation.options.add_dirs.iter().cloned())
+                    .collect();
+                let authorized = self.authorize_process(START_LABEL, &targets)?;
+                let env = self.fixture_child_env(&fixture, None)?;
+                let codex_home = value_of(&env, "CODEX_HOME")
+                    .map(PathBuf::from)
+                    .ok_or("the fixture child has no CODEX_HOME")?;
+                // The whole fixture guard once more, after the runner's git
+                // preflight and immediately before Codex starts: the cwd and
+                // each extra folder still resolve where they did, and their Git
+                // dir and common dir still resolve inside the fixture with no
+                // link under them. So whatever a config-driven program in the
+                // preflight changed (a clean filter, a hook) cannot redirect the
+                // run. Then Git itself, in Codex's own environment, names the
+                // work tree, Git dir and common dir of each, which must lie in
+                // the fixture too: config the preflight rewrote (`core.worktree`,
+                // a `config.worktree`) can point the work tree elsewhere while
+                // the admin dirs stay put. The remaining gap is the instant
+                // between this check and the exec.
+                let services = self.host.services().clone();
+                let child_env = env.clone();
+                let before_spawn = BeforeSpawn::new(move |_cwd: &Path| {
+                    // The cwd is the first authorized target.
+                    services
+                        .recheck(&authorized)
+                        .and_then(|()| services.recheck_git_work_trees(&authorized, &child_env))
+                        .map_err(|denied| denied.notice().to_string())
+                });
+
+                CodexEnvironment {
+                    search_path: self.codex_search_path(&env),
+                    sessions_root: codex_home.join("sessions"),
+                    child_env: Some(env),
+                    before_spawn: Some(before_spawn),
+                    stop: Some(stop.clone()),
+                }
             };
             let runtime = &self
                 .servers
@@ -620,6 +628,9 @@ impl TaskHostOwner {
 
     /// Git discovery from `path` stops below the fixture's parent.
     pub(super) fn ceiling_for(&self, path: &Path, label: &'static str) -> Result<PathBuf, String> {
+        if self.is_live() {
+            return Ok(PathBuf::from("/"));
+        }
         let fixture = self.fixture_of(path, label)?;
         Ok(fixture.parent().unwrap_or(&fixture).to_path_buf())
     }
@@ -697,11 +708,15 @@ impl TaskHostOwner {
             .max_concurrent_reviews
     }
 
-    /// Iced's plan-limit reading, from its file (only read).
+    /// Live admission uses current observations; preview only reads the source file.
     pub(super) fn policy(&self) -> PolicyNow {
         use gitterm_core::plan_limits::{PlanLimitsFile, evaluate_policy};
-        let file = PlanLimitsFile::load(&PlanLimitsFile::path_in(&self.iced_config));
-        let evaluation = evaluate_policy(&file, chrono::Utc::now().timestamp());
+        let evaluation = if let Some(state) = &self.plan_limits {
+            state.evaluation_for_launch()
+        } else {
+            let file = PlanLimitsFile::load(&PlanLimitsFile::path_in(&self.iced_config));
+            evaluate_policy(&file, chrono::Utc::now().timestamp())
+        };
         PolicyNow {
             report: evaluation.report.clone(),
             evaluation,
@@ -711,6 +726,9 @@ impl TaskHostOwner {
     /// Iced's `delegation_identity` for a GPUI chat pane: the pane, and the
     /// Iced workspace whose folder holds its checkout.
     pub(super) fn delegation_identity(&self, uid: &str, cx: &App) -> Result<Caller, String> {
+        if let Some(caller) = self.live_terminal_caller(uid, cx) {
+            return Ok(caller);
+        }
         let chat = open_chats(cx)
             .into_iter()
             .find(|chat| chat.session_uid == uid)
@@ -794,6 +812,9 @@ fn check_delegation_run(
     caller: &CallerTab,
     ceiling: &Path,
 ) -> Result<Authority, String> {
+    if ceiling == Path::new("/") {
+        return gitterm_core::task_host::command::check_delegation_run(new, caller);
+    }
     gitterm_core::delegations::check_run(new, caller)?;
     let path = new.options.checkout.as_deref().unwrap_or(&new.parent.cwd);
     let checkout = std::fs::canonicalize(path)

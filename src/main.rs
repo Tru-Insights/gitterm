@@ -4728,14 +4728,6 @@ fn preset_conversation_backend(preset: &AgentPreset) -> Option<HarnessConversati
     }
 }
 
-/// Directory holding composed task briefs. A launch command hands the full
-/// multiline brief to the harness via `"$(cat <path>)"`, so the content never
-/// needs shell escaping — only the path does. Files are kept after launch:
-/// they are small and double as an audit record of what each session was told.
-fn task_brief_dir() -> PathBuf {
-    config::global_config_dir().join("task-briefs")
-}
-
 /// Whether this backend's CLI accepts a positional initial prompt
 /// (`claude "…"`, `codex "…"`, `pi [messages…]`). Plain terminals and unknown
 /// presets keep the clipboard flow.
@@ -4768,25 +4760,12 @@ fn write_task_brief(
     task: &TaskRecord,
     report_back: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let dir = task_brief_dir();
-    let path = dir.join(format!("{session_id}.md"));
-    if path.display().to_string().contains('\'') {
-        return Err(format!(
-            "brief path {} contains a single quote and cannot be shell-quoted",
-            path.display()
-        ));
-    }
-    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    std::fs::write(
-        &path,
-        format!(
-            "{}\n\n{}\n",
-            task_handoff_prompt(task, report_back),
-            chats::task_session_marker(session_id)
-        ),
+    gitterm_core::task_host::command::write_task_brief(
+        &config::global_config_dir(),
+        session_id,
+        task,
+        report_back,
     )
-    .map_err(|error| format!("write {}: {error}", path.display()))?;
-    Ok(path)
 }
 
 /// Appends the brief file as the harness's initial prompt. The
@@ -8643,66 +8622,11 @@ use gitterm_core::remote::phone_panel::{
     self, scope_label as phone_scope_label, PhoneCall, PhoneRequest,
 };
 
-/// Insert or update an agent by id. Updates touch only the fields the
-/// connect form edits; hand-maintained `shell_command` / `session_commands`
-/// on an existing entry are preserved.
-fn upsert_remote_agent_config(definitions: &mut Vec<RemoteAgentConfig>, agent: RemoteAgentConfig) {
-    if let Some(existing) = definitions
-        .iter_mut()
-        .find(|existing| existing.id == agent.id)
-    {
-        existing.name = agent.name;
-        existing.endpoint = agent.endpoint;
-        existing.auth = agent.auth;
-    } else {
-        definitions.push(agent);
-    }
-}
-
-/// Upsert a single agent into remote-agents.json, leaving every other
-/// entry exactly as the user maintains it on disk.
-fn save_remote_agent_to_disk(agent: &RemoteAgentConfig) {
-    let mut file = RemoteAgentsFile::load().unwrap_or_default();
-    upsert_remote_agent_config(&mut file.remote_agents, agent.clone());
-    file.save();
-}
-
-/// Derive a stable id from a display name: lowercase alphanumerics with
-/// single dashes, e.g. "Mac mini" -> "mac-mini".
-fn remote_agent_id_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut prev_dash = true;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-    let slug = slug.trim_end_matches('-');
-    if slug.is_empty() {
-        "remote".to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-/// Store a pasted token under ~/.config/gitterm-v6/tokens/<id>.token and
-/// return the path. Owner-only permissions on unix.
-fn write_remote_agent_token(remote_id: &str, token: &str) -> std::io::Result<PathBuf> {
-    let dir = config::global_config_dir().join("tokens");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{remote_id}.token"));
-    std::fs::write(&path, format!("{token}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(path)
-}
+#[cfg(test)]
+use gitterm_core::remote::connect::remote_agent_id_slug;
+use gitterm_core::remote::connect::{
+    save_remote_connect, upsert_remote_agent_config, ConnectDraft,
+};
 
 fn remote_agent_for_session<'a>(
     definitions: &'a [RemoteAgentConfig],
@@ -10773,8 +10697,11 @@ impl App {
             let remotes = RemoteSessionsFile {
                 remote_sessions: remote_sessions.clone(),
             };
+            let mut errors = Vec::new();
             if shutting_down {
-                remotes.save_for_shutdown()?;
+                if let Err(error) = remotes.save_for_shutdown() {
+                    errors.push(error);
+                }
             } else {
                 remotes.save();
             }
@@ -10783,7 +10710,9 @@ impl App {
                     remote_agents: remote_agent_defs.clone(),
                 };
                 if shutting_down {
-                    agents.save_for_shutdown()?;
+                    if let Err(error) = agents.save_for_shutdown() {
+                        errors.push(error);
+                    }
                 } else {
                     agents.save();
                 }
@@ -10797,7 +10726,14 @@ impl App {
                 collapsed_repo_groups,
             };
             if shutting_down {
-                workspaces.save_for_shutdown()
+                if let Err(error) = workspaces.save_for_shutdown() {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             } else {
                 workspaces.save();
                 Ok(())
@@ -14672,7 +14608,7 @@ impl App {
         // The host saves the session and attaches the worker before the tab
         // is published; on failure it drops the tab, stopping the terminal.
         // The host's session save and worker attach are store writes.
-        let tab = freeze_span!("task store: publish launch (session + worker attach)", {
+        let published = freeze_span!("task store: publish launch (session + worker attach)", {
             self.task_host.publish_launch(
                 ticket,
                 LaunchedSession {
@@ -14682,9 +14618,28 @@ impl App {
                     objective_delivery,
                     timestamp,
                 },
-                tab,
+                &tab,
             )
-        })?;
+        });
+        if let Err(error) = published {
+            if let Some(process) = tab.worker_process.take() {
+                match process.discard_unpublished() {
+                    Ok(Some(stop)) => gitterm::shutdown::spawn(
+                        gitterm::shutdown::Kind::Session,
+                        "unpublished-worker-stop",
+                        move || {
+                            stop.join()
+                                .map_err(|_| "unpublished worker shutdown panicked".to_string())?
+                        },
+                    ),
+                    Ok(None) => {}
+                    Err(cleanup) => {
+                        return Err(format!("{error}; stopping unpublished worker: {cleanup}"))
+                    }
+                }
+            }
+            return Err(error);
+        }
         self.workspaces[workspace_idx].tabs.push(tab);
         let tab_idx = self.workspaces[workspace_idx].tabs.len() - 1;
         if focus {
@@ -19063,39 +19018,7 @@ fn check_delegation_run(
     new: &mut gitterm::tasks::NewDelegation,
     caller: &gitterm::delegations::CallerTab,
 ) -> Result<delegation_state::Authority, String> {
-    gitterm::delegations::check_run(new, caller)?;
-    let path = new.options.checkout.as_deref().unwrap_or(&new.parent.cwd);
-    let checkout = std::fs::canonicalize(path)
-        .map_err(|error| format!("resolve delegation checkout {}: {error}", path.display()))?;
-    // Review/consult authority tracks Git's actual common directory, including
-    // bare-backed worktrees and submodules; worker main-checkout trust is separate.
-    let repository = gitterm::delegations::repository_identity(&checkout)?;
-    let live = Repository::discover(&checkout)
-        .map_err(|error| format!("open delegation checkout {}: {error}", checkout.display()))?;
-    let workdir = live.workdir().ok_or_else(|| {
-        format!(
-            "delegation checkout {} has no working directory",
-            checkout.display()
-        )
-    })?;
-    let workdir = std::fs::canonicalize(workdir).map_err(|error| {
-        format!(
-            "resolve delegation working directory {}: {error}",
-            workdir.display()
-        )
-    })?;
-    // Matches check_run's known_roots: a missing unrelated repository does
-    // not invalidate a target that another available root authorizes.
-    let roots = std::iter::once(&caller.home)
-        .chain(caller.repos.iter())
-        .map(|root| std::fs::canonicalize(root).ok())
-        .collect();
-    Ok(delegation_state::Authority {
-        checkout,
-        repository,
-        workdir,
-        roots,
-    })
+    gitterm_core::task_host::command::check_delegation_run(new, caller)
 }
 
 /// Delegations a chat tab requested (TRU-142 S3b/S4/S5): request, run,
@@ -20989,9 +20912,16 @@ fn restore_task_tab(
 }
 
 fn task_session_is_working(tab: &TabState, store: Option<&TaskStore>) -> bool {
-    tab.task_live_state == Some(TaskSessionLiveState::Working)
-        && !tab.worker_shutdown_refused
-        && worker_accepts_input(tab, store)
+    gitterm_core::task_host::worker_session_is_working(
+        store,
+        &gitterm_core::task_host::WorkerSession {
+            task_id: tab.task_id.as_deref(),
+            task_session_id: tab.task_session_id.as_deref(),
+            closing: tab.worker_closing,
+            shutdown_refused: tab.worker_shutdown_refused,
+            live: tab.task_live_state,
+        },
+    )
 }
 
 fn worker_accepts_input(tab: &TabState, store: Option<&TaskStore>) -> bool {
@@ -21070,15 +21000,7 @@ fn persist_worker_identity_record(
     session: &str,
     identity: &gitterm::tasks::LaunchIdentity,
 ) -> Result<(), String> {
-    let mut record = store
-        .get(task)
-        .and_then(|task| task.sessions.iter().find(|s| s.task_session_id == session))
-        .cloned()
-        .ok_or_else(|| format!("worker session {session} is missing from task {task}"))?;
-    record.launch_identity = Some(identity.clone());
-    store
-        .upsert_session(task, record, &chrono::Utc::now().to_rfc3339())
-        .map_err(|error| error.to_string())
+    gitterm::worker_process::persist_identity_record(store, task, session, identity)
 }
 
 fn load_task_store_for_startup(
@@ -22101,66 +22023,7 @@ impl App {
     /// rule). New Claude launches receive an id, and resume/session-id presets
     /// reuse the identity they already specify.
     fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
-        if gitterm::workers::provider_for_command(command)
-            == gitterm::workers::WorkerProvider::Claude
-        {
-            match Self::claude_preset_session_id(command) {
-                Ok(Some(id)) => return (command.to_string(), Some(id)),
-                Err(()) => return (command.to_string(), None),
-                Ok(None) => {}
-            }
-            let id = uuid::Uuid::new_v4().to_string();
-            (format!("{command} --session-id {id}"), Some(id))
-        } else {
-            (command.to_string(), None)
-        }
-    }
-
-    /// Read an explicit Claude conversation identity from a preset command.
-    /// `Err` means the preset selects a session without a safely extractable id.
-    fn claude_preset_session_id(command: &str) -> Result<Option<String>, ()> {
-        let words = shell_words::split(command).map_err(|_| ())?;
-        let mut session_id: Option<String> = None;
-        let mut saw_identity_flag = false;
-        for (index, word) in words.iter().enumerate().skip(1) {
-            if word == "--continue" || word == "-c" {
-                return Err(());
-            }
-            let value = if let Some(value) = word
-                .strip_prefix("--resume=")
-                .or_else(|| word.strip_prefix("--session-id="))
-            {
-                saw_identity_flag = true;
-                Some(value)
-            } else if word == "--resume" || word == "-r" || word == "--session-id" {
-                saw_identity_flag = true;
-                Some(
-                    words
-                        .get(index + 1)
-                        // A following flag (`--resume -d`) is not an id.
-                        .filter(|value| !value.starts_with('-'))
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                )
-            } else {
-                None
-            };
-            if let Some(value) = value {
-                if value.is_empty()
-                    || session_id
-                        .as_deref()
-                        .is_some_and(|existing| existing != value)
-                {
-                    return Err(());
-                }
-                session_id = Some(value.to_string());
-            }
-        }
-        if saw_identity_flag {
-            session_id.map(Some).ok_or(())
-        } else {
-            Ok(None)
-        }
+        gitterm_core::workers::with_preassigned_session_id(command)
     }
 
     fn launch_session_tab(
@@ -22344,155 +22207,20 @@ impl App {
         terminal_font_size: f32,
         extra_env: &[(&str, &str)],
     ) -> iced_term::settings::Settings {
-        #[cfg(target_os = "windows")]
-        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string());
-
-        #[cfg(not(target_os = "windows"))]
-        let shell = std::env::var("SHELL")
-            .ok()
-            .or_else(|| {
-                let user = std::env::var("USER").ok()?;
-                let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-                for line in passwd.lines() {
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.first() == Some(&user.as_str()) {
-                        return parts.get(6).map(|s| s.to_string());
-                    }
-                }
-                None
-            })
-            .unwrap_or_else(|| "/bin/zsh".to_string());
-
-        let mut env = std::collections::HashMap::new();
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            env.insert("TERM".to_string(), "xterm-256color".to_string());
-            env.insert("COLORTERM".to_string(), "truecolor".to_string());
-            env.insert(
-                "LANG".to_string(),
-                std::env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".to_string()),
-            );
-            if let Ok(home) = std::env::var("HOME") {
-                env.insert("HOME".to_string(), home.clone());
-                env.insert("PATH".to_string(), format!("{}/.local/bin:{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", home, home));
-            }
-            if let Ok(user) = std::env::var("USER") {
-                env.insert("USER".to_string(), user.clone());
-                env.insert("LOGNAME".to_string(), user);
-            }
-            env.insert("SHELL".to_string(), shell.clone());
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            for (key, value) in std::env::vars() {
-                env.insert(key, value);
-            }
-        }
-
-        env.insert("GITTERM_PRECMD".to_string(), "1".to_string());
-
-        // A child GitTerm must never reuse its launching worker's PID file.
-        env.remove(gitterm::worker_process::PID_FILE_ENV);
-        for (key, value) in extra_env {
-            env.insert(key.to_string(), value.to_string());
-        }
-
-        let runtime_startup_command = startup_command.map(|command| {
-            let command = env
-                .get(browser_mcp::BROWSER_MCP_URL_ENV)
-                .map(|endpoint| browser_mcp::configure_browser_command(command, endpoint))
-                .unwrap_or_else(|| command.to_string());
-            env.get(task_mcp::TASK_MCP_URL_ENV)
-                .map(|endpoint| task_mcp::configure_task_command(&command, endpoint))
-                .unwrap_or(command)
-        });
-        let runtime_startup_command = runtime_startup_command.map(|command| {
-            env.get(gitterm::worker_process::PID_FILE_ENV)
-                .map(|path| {
-                    gitterm::worker_process::record_shell(&command, path).unwrap_or_else(|error| {
-                        eprintln!("[tasks] refuse worker launch: {error}");
-                        "exit 1".to_string()
-                    })
-                })
-                .unwrap_or(command)
-        });
-        if let Some(command) = &runtime_startup_command {
-            env.insert("GITTERM_STARTUP_CMD".to_string(), command.clone());
-        }
-
-        env.insert("CLAUDECODE".to_string(), String::new());
-        env.insert("CLAUDE_CODE_ENTRYPOINT".to_string(), String::new());
-
-        let is_zsh = shell.contains("zsh");
-        let is_bash = shell.contains("bash");
-        let is_windows = cfg!(target_os = "windows");
-
-        let args = if is_windows {
-            if let Some(cmd) = runtime_startup_command.as_deref() {
-                let lower = shell.to_lowercase();
-                if lower.contains("powershell") || lower.contains("pwsh") {
-                    vec![
-                        "-NoExit".to_string(),
-                        "-Command".to_string(),
-                        cmd.to_string(),
-                    ]
-                } else {
-                    vec!["/K".to_string(), cmd.to_string()]
-                }
-            } else {
-                vec![]
-            }
-        } else if is_zsh {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let gitterm_dir = config::global_config_dir()
-                .join("zsh")
-                .to_string_lossy()
-                .into_owned();
-            let gitterm_zshrc = format!("{gitterm_dir}/.zshrc");
-            let codex_zsh_integration =
-                gitterm_core::task_commands::mcp_protocol::codex_zsh_integration();
-
-            let _ = std::fs::create_dir_all(&gitterm_dir);
-            let zshrc_content = format!(
-                r#"# GitTerm shell integration - sets terminal title on directory change
-_gitterm_set_title() {{ print -Pn "\e]0;%~\a" }}
-autoload -Uz add-zsh-hook
-add-zsh-hook precmd _gitterm_set_title
-add-zsh-hook chpwd _gitterm_set_title
-_gitterm_set_title
-[[ -f "{home}/.zshenv" ]] && source "{home}/.zshenv"
-[[ -f "{home}/.zprofile" ]] && source "{home}/.zprofile"
-[[ -f "{home}/.zshrc" ]] && source "{home}/.zshrc"
-{codex_zsh_integration}
-if [[ -n "$GITTERM_STARTUP_CMD" ]]; then
-    _gitterm_cmd="$GITTERM_STARTUP_CMD"
-    unset GITTERM_STARTUP_CMD
-    eval "$_gitterm_cmd"
-    unset _gitterm_cmd
-fi
-"#
-            );
-            let _ = std::fs::write(&gitterm_zshrc, zshrc_content);
-
-            env.insert("ZDOTDIR".to_string(), gitterm_dir);
-            vec!["-l".to_string()]
-        } else if is_bash {
-            let prompt_cmd = r#"printf "\e]0;%s\a" "$PWD"; if [[ -n "$GITTERM_STARTUP_CMD" ]]; then _c="$GITTERM_STARTUP_CMD"; unset GITTERM_STARTUP_CMD; eval "$_c"; unset _c; fi"#;
-            env.insert("PROMPT_COMMAND".to_string(), prompt_cmd.to_string());
-            vec!["-l".to_string()]
-        } else {
-            vec!["-l".to_string()]
-        };
-
+        let launch = gitterm_core::task_host::command::terminal_command(
+            cwd,
+            startup_command,
+            extra_env,
+            &config::global_config_dir(),
+            browser_mcp::configure_browser_command,
+        );
         iced_term::settings::Settings {
             backend: iced_term::settings::BackendSettings {
-                program: shell,
-                args,
-                working_directory: Some(cwd.to_path_buf()),
+                program: launch.program,
+                args: launch.args,
+                working_directory: Some(launch.cwd),
                 scrollback_lines,
-                env,
+                env: launch.env,
             },
             theme: iced_term::settings::ThemeSettings::new(Box::new(theme.terminal_palette())),
             font: iced_term::settings::FontSettings {
@@ -22740,34 +22468,8 @@ fi
                     }
                 }
                 let command = startup_command.as_deref().expect("checked command").trim();
-                if gitterm::workers::provider_for_command(command)
-                    == gitterm::workers::WorkerProvider::Claude
-                {
-                    gitterm::workers::validate_claude_trust_launch(command, &home, &extra_env)?;
-                    if let Some(main) = gitterm::workers::claude_task_trust(
-                        &repo_path,
-                        &roots,
-                        &home.join(".claude.json"),
-                    )? {
-                        eprintln!(
-                            "[tasks] accepted Claude workspace trust for {} in ~/.claude.json",
-                            main.display()
-                        );
-                    }
-                    Ok(Some(command.to_string()))
-                } else {
-                    gitterm::workers::validate_codex_trust_home(&home, &extra_env)?;
-                    let overlay = gitterm::workers::codex_task_trust(
-                        command,
-                        &repo_path,
-                        &roots,
-                        &home.join(".codex/config.toml"),
-                    )?;
-                    Ok(Some(match overlay {
-                        Some(value) => gitterm::workers::with_codex_trust(command, &value)?,
-                        None => command.to_string(),
-                    }))
-                }
+                gitterm::workers::task_trust_command(command, &repo_path, &home, &roots, &extra_env)
+                    .map(Some)
             })();
             match checked {
                 Ok(command) => command,
@@ -23023,79 +22725,30 @@ fi
         let Some(form) = self.remote_connect_form.as_ref() else {
             return Task::none();
         };
-        let name = form.name.trim().to_string();
-        let endpoint_raw = form.endpoint.trim().to_string();
-        let token = form.token.trim().to_string();
-        let saved_id = form.saved_remote_id.clone();
-
-        let fail = |app: &mut Self, message: String| {
-            if let Some(form) = app.remote_connect_form.as_mut() {
-                form.error = Some(message);
-            }
-            Task::none()
-        };
-
-        if name.is_empty() || endpoint_raw.is_empty() || token.is_empty() {
-            return fail(
-                self,
-                "Name, endpoint, and token are all required".to_string(),
-            );
-        }
-        let endpoint = if endpoint_raw.contains("://") {
-            endpoint_raw
-        } else {
-            format!("http://{endpoint_raw}")
-        };
-
-        // Keep the id stable across retries so an edited endpoint/token
-        // updates the entry we already wrote instead of appending another.
-        let id = saved_id.unwrap_or_else(|| {
-            let base = remote_agent_id_slug(&name);
-            let on_disk: Vec<String> = RemoteAgentsFile::load()
-                .map(|file| {
-                    file.remote_agents
-                        .into_iter()
-                        .map(|agent| agent.id)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let taken = |candidate: &str| {
-                on_disk.iter().any(|id| id == candidate)
-                    || self
-                        .remote_agent_defs
-                        .iter()
-                        .any(|agent| agent.id == candidate)
-            };
-            let mut id = base.clone();
-            let mut suffix = 2;
-            while taken(&id) {
-                id = format!("{base}-{suffix}");
-                suffix += 1;
-            }
-            id
+        let saved = form.saved_remote_id.as_deref().and_then(|id| {
+            self.remote_agent_config_by_id(id).and_then(|agent| {
+                gitterm_core::remote::state::Identity::new(id.into(), agent.endpoint.clone()).ok()
+            })
         });
-
-        let token_ref = if token.starts_with("env:")
-            || token.starts_with("file:")
-            || token.starts_with("keychain:")
-        {
-            token
-        } else {
-            match write_remote_agent_token(&id, &token) {
-                Ok(path) => format!("file:{}", path.display()),
-                Err(err) => return fail(self, format!("Could not store token: {err}")),
+        let agent = match save_remote_connect(
+            &config::global_config_dir(),
+            &self.remote_agent_defs,
+            ConnectDraft {
+                name: &form.name,
+                endpoint: &form.endpoint,
+                token: &form.token,
+                saved: saved.as_ref(),
+            },
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                if let Some(form) = self.remote_connect_form.as_mut() {
+                    form.error = Some(error);
+                }
+                return Task::none();
             }
         };
-
-        let agent = RemoteAgentConfig {
-            id: id.clone(),
-            name,
-            endpoint,
-            auth: config::RemoteAgentAuthConfig::Token { token_ref },
-            shell_command: None,
-            session_commands: Default::default(),
-        };
-        save_remote_agent_to_disk(&agent);
+        let id = agent.id.clone();
         upsert_remote_agent_config(&mut self.remote_agent_defs, agent);
         if let Some(form) = self.remote_connect_form.as_mut() {
             form.error = None;
@@ -25339,11 +24992,10 @@ fi
                                 tab.task_live_state = Some(TaskSessionLiveState::Working);
                                 task_signal = tab.task_id.clone().map(|task_id| (task_id, None));
                             }
-                        } else if tab.task_live_state == Some(TaskSessionLiveState::AwaitingInput)
-                            && tab.terminal_title().is_none_or(|title| {
-                                terminal_title_attention_reason(title).is_none()
-                            })
-                        {
+                        } else if gitterm_core::task_host::input_resumes_waiting(
+                            tab.task_live_state,
+                            tab.terminal_title(),
+                        ) {
                             // A keystroke answers a notify-driven waiting
                             // state (Codex). ✳-titled tabs (Claude/pi) are
                             // excluded — their title adapter owns both
