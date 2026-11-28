@@ -701,10 +701,8 @@ fn preview_write_controls_only_show_the_exact_clicked_label(cx: &mut gpui::TestA
         ("tools added to this workspace's repos", "Undo"),
         ("tools added to this workspace's repos", "×"),
         ("tools", "×"),
-        ("home", "Open in editor"),
         ("home", "✎"),
         ("tools", "+ run command"),
-        ("tru-274", "Open in editor"),
         ("✦ Ship parity", "↗"),
         ("✦ Ship parity", "⊞ Make workspace"),
         ("Draft change", "Review"),
@@ -935,18 +933,18 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
         ]
     );
     click_sidebar(cx, "work-name-3");
-    // Open in editor is still unavailable in the preview; its banner row
-    // moves the repo row to index 4 from here on.
+    // Open in editor is read-only-safe and emits without adding a banner.
     click_sidebar(cx, "work-control-3-0");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
-    assert_eq!(events.borrow().len(), 2, "editor launch is notice-only");
+    assert_eq!(events.borrow().len(), 3);
     assert_eq!(
-        sidebar
-            .read_with(cx, |sidebar, _| sidebar.error.clone())
-            .as_deref(),
-        Some("Open in editor · not available in preview")
+        events.borrow().last(),
+        Some(&WorkSidebarOutcome::OpenEditor {
+            dir: "/repos/home".into()
+        })
     );
-    click_sidebar(cx, "work-control-4-1");
+    assert!(sidebar.read_with(cx, |sidebar, _| sidebar.error.is_none()));
+    click_sidebar(cx, "work-control-3-1");
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.editing.is_none()));
     assert!(sidebar.read_with(cx, |sidebar, _| sidebar.open.contains(&fold)));
     assert!(cx.debug_bounds("work-run-4").is_some());
@@ -957,7 +955,7 @@ fn repo_name_and_disclosure_toggle_but_only_run_emits_command(cx: &mut gpui::Tes
             .as_deref(),
         Some("✎ · not available in preview")
     );
-    assert_eq!(events.borrow().len(), 2);
+    assert_eq!(events.borrow().len(), 3);
 }
 
 #[gpui::test]
@@ -1824,9 +1822,6 @@ fn write_outcomes_report_unavailable_without_emitting_events(cx: &mut gpui::Test
             command: Some("cargo run".into()),
         },
         WorkSidebarOutcome::DismissAutoRepos { workspace: 7 },
-        WorkSidebarOutcome::OpenEditor {
-            dir: "/repos/tools".into(),
-        },
         WorkSidebarOutcome::MakeWorkspace {
             chat: "root".into(),
         },
@@ -3704,4 +3699,89 @@ fn unopened_chat_emits_only_after_live_policy_is_installed(cx: &mut gpui::TestAp
     });
     sidebar.update(cx, |sidebar, cx| sidebar.emit(outcome.clone(), cx));
     assert_eq!(*events.borrow(), [outcome]);
+}
+
+#[gpui::test]
+fn editor_outcome_is_read_only_safe_and_emitted_in_preview(cx: &mut gpui::TestAppContext) {
+    let sidebar = cx.new(|_| fixture(false));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let received = events.clone();
+    cx.update(|cx| {
+        cx.subscribe(&sidebar, move |_, event: &WorkSidebarOutcome, _| {
+            received.borrow_mut().push(event.clone())
+        })
+        .detach()
+    });
+    let outcome = WorkSidebarOutcome::OpenEditor {
+        dir: "/repos/tools".into(),
+    };
+    assert_eq!(outcome.preview_error(), None);
+    sidebar.update(cx, |sidebar, cx| sidebar.emit(outcome.clone(), cx));
+    assert_eq!(*events.borrow(), [outcome]);
+}
+
+#[gpui::test]
+fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let store = gitterm_core::desktop_store::DesktopStore::open(root.path()).unwrap();
+    cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(store)));
+    let mut fixture = fixture(false);
+    fixture.open.insert(Fold::Repo("/repos/tools".into()));
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(800.), px(2000.)));
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "Repos", "+ Add repo…");
+    click_control(
+        &sidebar,
+        cx,
+        "tools added to this workspace's repos",
+        "Undo",
+    );
+    click_control(&sidebar, cx, "tools", "×");
+    assert_eq!(
+        *events.borrow(),
+        [
+            WorkSidebarOutcome::AddRepo,
+            WorkSidebarOutcome::UndoAutoRepo {
+                workspace: 7,
+                repos: vec!["/repos/tools".into()]
+            },
+            WorkSidebarOutcome::RemoveRepo {
+                workspace: 7,
+                repo: "/repos/tools".into()
+            },
+        ]
+    );
+    click_control(&sidebar, cx, "tools", "+ run command");
+    assert!(sidebar.read_with(cx, |s, _| s.editing.is_some()));
+    click_control(&sidebar, cx, "Parity", "✎");
+    assert!(sidebar.read_with(cx, |s, _| s.renaming.is_some()));
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::Rename {
+                workspace: 7,
+                name: "Renamed".into(),
+            },
+            cx,
+        )
+    });
+    assert!(
+        matches!(events.borrow().last(), Some(WorkSidebarOutcome::Rename { name, .. }) if name == "Renamed")
+    );
+    assert!(sidebar.read_with(cx, |s, _| s.error.is_none()));
+    // Unrelated writes retain their existing Preview notice even in this slice.
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::MakeWorkspace {
+                chat: "root".into(),
+            },
+            cx,
+        )
+    });
+    assert_eq!(events.borrow().len(), 4);
 }

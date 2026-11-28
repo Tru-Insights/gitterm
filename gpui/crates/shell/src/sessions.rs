@@ -952,7 +952,13 @@ impl crate::Shell {
                 continue;
             }
             conversations.extend(saved.chats.iter().cloned());
-            for (session, tab) in crate::data::iced_sessions(saved).iter().zip(&saved.tabs) {
+            for (session, tab) in self
+                .owner
+                .read(cx)
+                .iced_sessions(saved)
+                .iter()
+                .zip(&saved.tabs)
+            {
                 if tab.tab_kind.as_deref() != Some("agent") {
                     continue;
                 }
@@ -1011,6 +1017,7 @@ impl crate::Shell {
                         session.title = title.clone();
                         pane.update(cx, |pane, cx| {
                             pane.title = title.clone();
+                            pane.notification_chat_title = Some(title.clone());
                             cx.notify();
                         });
                     }
@@ -1594,7 +1601,10 @@ impl crate::Shell {
             .find(|tab| tab.chat_session_id.as_deref() == Some(id))
             .cloned()
         {
-            let existing = crate::data::iced_sessions(&saved)
+            let existing = self
+                .owner
+                .read(cx)
+                .iced_sessions(&saved)
                 .iter()
                 .zip(&saved.tabs)
                 .find(|(_, tab)| tab.chat_session_id.as_deref() == Some(id))
@@ -1905,7 +1915,7 @@ impl crate::Shell {
         {
             return;
         }
-        let imported = crate::data::iced_sessions(&saved);
+        let imported = self.owner.read(cx).iced_sessions(&saved);
         if saved.done_at.is_none()
             && crate::bottom_pane_ids(self.workspace(workspace), cx).is_empty()
             && !saved.bottom_terminals.is_empty()
@@ -2167,7 +2177,7 @@ impl crate::Shell {
         let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id) else {
             return vec![];
         };
-        let imported = crate::data::iced_sessions(saved);
+        let imported = self.owner.read(cx).iced_sessions(saved);
         let bottom = crate::bottom_pane_ids(state, cx);
         state
             .sessions

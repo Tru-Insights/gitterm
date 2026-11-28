@@ -49,6 +49,7 @@ pub struct Pane {
     pub(crate) session: Option<gitterm_core::session::Target>,
     pub id: String,
     pub title: String,
+    pub(crate) notification_chat_title: Option<String>,
     pub content: PaneContent,
     pub(crate) startup_command: Option<String>,
     pub(crate) chat_session_id: Option<String>,
@@ -265,6 +266,7 @@ impl Pane {
             terminal_title: None,
             startup_command: None,
             chat_session_id: None,
+            notification_chat_title: None,
             center_terminal: matches!(
                 kind,
                 PaneKind::CenterTerminal(_) | PaneKind::StoppedTerminal(_, true)
@@ -380,6 +382,9 @@ impl Pane {
     #[cfg(test)]
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
         self.data.status(self.workspace, cx)
+    }
+    pub(crate) fn notification_terminal_title(&self) -> Option<&str> {
+        self.terminal_title.as_deref()
     }
     pub(crate) fn tab_title(&self) -> String {
         if matches!(self.content, PaneContent::Terminal(_)) {
