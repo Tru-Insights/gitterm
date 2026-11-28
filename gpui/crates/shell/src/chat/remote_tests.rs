@@ -724,6 +724,7 @@ fn golive20b_review_f3_park_preserves_unloaded_remote_bottom_terminals(
 ) {
     let f = Fixture::new(cx, true);
     let expected = vec![gitterm_core::workspace_config::BottomTerminalConfig {
+        extra: Default::default(),
         dir: "/remote/project/subdir".into(),
     }];
     let bottom = expected.clone();

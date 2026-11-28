@@ -97,6 +97,7 @@ fn tru274_live_new_local_shell_cli_and_bottom_match_iced(cx: &mut TestAppContext
     tru274_wait(&shell, cx);
     expected.workspaces[0].bottom_terminals.push(
         gitterm_core::workspace_config::BottomTerminalConfig {
+            extra: Default::default(),
             dir: git.repo.to_string_lossy().into_owned(),
         },
     );
@@ -295,10 +296,221 @@ fn tru274_live_empty_inventory_keeps_iced_default_shell(cx: &mut TestAppContext)
     );
     expected.workspaces[0].bottom_terminals.push(
         gitterm_core::workspace_config::BottomTerminalConfig {
+            extra: Default::default(),
             dir: git.repo.to_string_lossy().into_owned(),
         },
     );
     tru274_assert_iced_bytes(&fixture, &expected);
+    golive19_stop(&shell, cx);
+    host.update(cx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn tru274_f1_open_unmounted_worktree_reuses_persisted_identity(cx: &mut TestAppContext) {
+    if child("tru274_f1_open_unmounted_worktree_reuses_persisted_identity") { return; }
+    tru274_isolate_processes();
+    cx.background_executor.allow_parking();
+    let (fixture, git) = fixture();
+    let mut iced = tru274_document(&fixture, &git.repo);
+    super::git(&git.repo, &["worktree", "add", "-q", "-b", "placeholder-worktree", git.worktree.to_str().unwrap()]);
+    let (host, _) = golive19_start(&fixture, cx);
+    let specs = golive19_capture(&host, cx);
+    let (shell, cx) = golive19_shell(&fixture, &host, cx);
+    let before = specs.borrow().len();
+    let sub = git.repo.join("placeholder-subdir");
+    std::fs::create_dir(&sub).unwrap();
+    iced.workspaces[0].tabs[0].dir = sub.to_string_lossy().into_owned();
+    shell.update_in(cx, |s, window, cx| {
+        let workspace = s.active(cx).workspace.id;
+        let id = s.active(cx).active_session.unwrap();
+        let pane = s.active(cx).panes[&crate::session_pane_id(id)].clone();
+        pane.update(cx, |pane, cx| {
+            pane.terminal_cwd = Some(sub.clone());
+            pane.terminal_saved_dir = None;
+            pane.git = Some(cx.new(|cx| crate::pane::git_view::GitView::new(workspace, s.data.clone(), cx)));
+        });
+        s.live_worktree_action(workspace, &crate::pane::git_view::GitAction::OpenWorktree(git.worktree.clone()), window, cx);
+    });
+    wait_until(cx, |cx| shell.read_with(cx, |s, cx| {
+        s.active(cx).active_session.and_then(|id| s.active(cx).panes.get(&crate::session_pane_id(id)))
+            .and_then(|pane| pane.read(cx).task_folder(cx)).as_deref() == Some(git.worktree.as_path())
+    }));
+    tru274_wait(&shell, cx);
+    let uid = shell.read_with(cx, |s, cx| {
+        let id = s.active(cx).active_session.unwrap();
+        s.active(cx).panes[&crate::session_pane_id(id)].read(cx).session.as_ref().unwrap().session_uid.clone()
+    });
+    // Iced WorktreeOpen -> add_tab_with_command -> workspace_config: one tab.
+    iced.workspaces[0].tabs.push(serde_json::from_value(json!({"dir":git.worktree,"repo_dir":git.worktree,"session_uid":uid})).unwrap());
+    iced.workspaces[0].active_tab = Some(2);
+    tru274_assert_iced_bytes(&fixture, &iced);
+    assert_eq!(specs.borrow().len(), before + 1);
+    golive19_stop(&shell, cx);
+    let (restored, cx) = golive19_shell(&fixture, &host, cx);
+    restored.read_with(cx, |s, cx| assert_eq!(s.active(cx).sessions.len(), 4));
+    tru274_assert_iced_bytes(&fixture, &iced);
+    golive19_stop(&restored, cx);
+    host.update(cx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn tru274_f2_close_bottom_removes_descriptor_and_does_not_restore(cx: &mut TestAppContext) {
+    if child("tru274_f2_close_bottom_removes_descriptor_and_does_not_restore") { return; }
+    tru274_isolate_processes();
+    cx.background_executor.allow_parking();
+    let (fixture, git) = fixture();
+    let mut iced = tru274_document(&fixture, &git.repo);
+    iced.workspaces[0].bottom_terminals[0].extra.insert("future_bottom".into(), json!("original"));
+    std::fs::write(fixture.iced.join("workspaces.json"), serde_json::to_vec_pretty(&iced).unwrap()).unwrap();
+    let (host, _) = golive19_start(&fixture, cx);
+    golive19_capture(&host, cx);
+    let (shell, cx) = golive19_shell(&fixture, &host, cx);
+    shell.update_in(cx, |s, window, cx| s.new_terminal_in(crate::DockPlacement::Bottom, window, cx));
+    tru274_wait(&shell, cx);
+    // Close the just-added shell, then the original restored shell. Iced
+    // BottomTerminalClose removes the descriptor at exactly that ordinal.
+    for _ in 0..2 {
+        shell.update_in(cx, |s, window, cx| {
+            let state = s.active(cx);
+            let terminal = state.store.terminals.as_ref().unwrap().iter().rev().find(|t| t.bottom).unwrap();
+            let target = state.panes[&crate::session_pane_id(crate::SessionId(terminal.id))].read(cx).session.clone().unwrap();
+            s.close_target_with(&target, true, window, cx);
+        });
+        tru274_wait(&shell, cx);
+        tru274_assert_iced_bytes(&fixture, &iced);
+        iced.workspaces[0].bottom_terminals.clear();
+    }
+    // Orderly restart waits for the independent GPUI layout queue too.
+    let layout = shell.read_with(cx, |s, cx| s.active(cx).store.path.clone());
+    wait_until(cx, |_| {
+        std::fs::read(&layout).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value["terminal_sessions"].as_array().is_some_and(Vec::is_empty))
+    });
+    golive19_stop(&shell, cx);
+    let (restored, cx) = golive19_shell(&fixture, &host, cx);
+    restored.read_with(cx, |s, cx| assert!(crate::bottom_pane_ids(s.active(cx), cx).is_empty()));
+    tru274_assert_iced_bytes(&fixture, &iced);
+    golive19_stop(&restored, cx);
+    host.update(cx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn tru274_f3_new_tab_projects_mounted_cwd_command_and_legacy_uid(cx: &mut TestAppContext) {
+    if child("tru274_f3_new_tab_projects_mounted_cwd_command_and_legacy_uid") { return; }
+    tru274_isolate_processes();
+    cx.background_executor.allow_parking();
+    let (fixture, git) = fixture();
+    let mut iced = tru274_document(&fixture, &git.repo);
+    iced.workspaces[0].tabs[0].session_uid = None;
+    iced.workspaces[0].tabs[0].repo_dir = None;
+    iced.workspaces[0].tabs[0].tab_kind = Some("terminal".into());
+    iced.workspaces[0].tabs[1].startup_command = Some("placeholder-cli --old".into());
+    std::fs::write(fixture.iced.join("workspaces.json"), serde_json::to_vec_pretty(&iced).unwrap()).unwrap();
+    let (host, _) = golive19_start(&fixture, cx);
+    golive19_capture(&host, cx);
+    let (shell, cx) = golive19_shell(&fixture, &host, cx);
+    let sub = git.repo.join("placeholder-subdir");
+    std::fs::create_dir(&sub).unwrap();
+    let uid = shell.update_in(cx, |s, window, cx| {
+        let state = s.active(cx);
+        let first = state.panes[&crate::session_pane_id(state.sessions[0].id)].clone();
+        let second = state.panes[&crate::session_pane_id(state.sessions[1].id)].clone();
+        first.update(cx, |pane, _| { pane.terminal_cwd = Some(sub.clone()); pane.terminal_saved_dir = None; });
+        second.update(cx, |pane, _| { pane.startup_command = Some("placeholder-cli --resume synthetic".into()); });
+        let uid = first.read(cx).session.as_ref().unwrap().session_uid.clone();
+        s.new_terminal_at(crate::DockPlacement::Center, Some(git.repo.clone()), window, cx);
+        uid
+    });
+    tru274_wait(&shell, cx);
+    iced.workspaces[0].tabs[0].dir = sub.to_string_lossy().into_owned();
+    iced.workspaces[0].tabs[0].repo_dir = Some(git.repo.to_string_lossy().into_owned());
+    iced.workspaces[0].tabs[0].tab_kind = None;
+    iced.workspaces[0].tabs[0].session_uid = Some(uid);
+    iced.workspaces[0].tabs[1].startup_command = Some("placeholder-cli --resume synthetic".into());
+    let new_uid = shell.read_with(cx, |s, cx| {
+        let state = s.active(cx);
+        state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx).session.as_ref().unwrap().session_uid.clone()
+    });
+    iced.workspaces[0].tabs.push(serde_json::from_value(json!({"dir":git.repo,"repo_dir":git.repo,"session_uid":new_uid})).unwrap());
+    iced.workspaces[0].active_tab = Some(2);
+    tru274_assert_iced_bytes(&fixture, &iced);
+    golive19_stop(&shell, cx);
+    host.update(cx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn tru274_f6_explicit_local_location_saves_main_and_bottom(cx: &mut TestAppContext) {
+    if child("tru274_f6_explicit_local_location_saves_main_and_bottom") { return; }
+    tru274_isolate_processes();
+    cx.background_executor.allow_parking();
+    let (fixture, git) = fixture();
+    let mut iced = tru274_document(&fixture, &git.repo);
+    iced.workspaces[0].location = Some(gitterm_core::remote::config::WorkspaceLocationConfig::Local { root: git.repo.to_string_lossy().into_owned() });
+    std::fs::write(fixture.iced.join("workspaces.json"), serde_json::to_vec_pretty(&iced).unwrap()).unwrap();
+    let (host, _) = golive19_start(&fixture, cx);
+    golive19_capture(&host, cx);
+    let (shell, cx) = golive19_shell(&fixture, &host, cx);
+    shell.update_in(cx, |s, window, cx| s.new_terminal(window, cx));
+    tru274_wait(&shell, cx);
+    let uid = shell.read_with(cx, |s, cx| {
+        let state = s.active(cx);
+        state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx).session.as_ref().unwrap().session_uid.clone()
+    });
+    iced.workspaces[0].tabs.push(serde_json::from_value(json!({"dir":git.repo,"repo_dir":git.repo,"session_uid":uid})).unwrap());
+    iced.workspaces[0].active_tab = Some(2);
+    shell.update_in(cx, |s, window, cx| s.new_terminal_in(crate::DockPlacement::Bottom, window, cx));
+    tru274_wait(&shell, cx);
+    iced.workspaces[0].bottom_terminals.push(serde_json::from_value(json!({"dir":git.repo})).unwrap());
+    tru274_assert_iced_bytes(&fixture, &iced);
+    golive19_stop(&shell, cx);
+    host.update(cx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn tru274_f7_failed_inventory_save_is_retried_by_drain(cx: &mut TestAppContext) {
+    if child("tru274_f7_failed_inventory_save_is_retried_by_drain") { return; }
+    tru274_isolate_processes();
+    cx.background_executor.allow_parking();
+    let (fixture, git) = fixture();
+    let mut iced = tru274_document(&fixture, &git.repo);
+    let (host, _) = golive19_start(&fixture, cx);
+    golive19_capture(&host, cx);
+    let (shell, cx) = golive19_shell(&fixture, &host, cx);
+    let path = fixture.iced.join("workspaces.json");
+    let original = std::fs::read(&path).unwrap();
+    let desktop = cx.read(|cx| cx.global::<crate::workspace_config::LiveWorkspaces>().0.clone());
+    let (entered, ready) = std::sync::mpsc::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let hold = desktop.try_edit_workspaces(move |_| {
+        entered.send(()).unwrap();
+        blocked.recv().unwrap();
+        Ok(())
+    });
+    ready.recv().unwrap();
+    // The host still reads valid launch metadata. Block replacement only
+    // after the terminal exists and its inventory edit has been queued.
+    shell.update_in(cx, |s, window, cx| s.new_terminal(window, cx));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    release.send(()).unwrap();
+    hold.wait().unwrap();
+    wait_until(cx, |cx| shell.read_with(cx, |s, cx| {
+        !s.owner.read(cx).workspace_save_pending && s.owner.read(cx).error.is_some()
+    }));
+    let desktop = cx.read(|cx| cx.global::<crate::workspace_config::LiveWorkspaces>().0.clone());
+    assert!(desktop.snapshot().wait().unwrap().workspaces.dirty);
+    let uid = shell.read_with(cx, |s, cx| {
+        let state = s.active(cx);
+        state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx).session.as_ref().unwrap().session_uid.clone()
+    });
+    iced.workspaces[0].tabs.push(serde_json::from_value(json!({"dir":git.repo,"repo_dir":git.repo,"session_uid":uid})).unwrap());
+    iced.workspaces[0].active_tab = Some(2);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, original).unwrap();
+    desktop.drain().wait().unwrap();
+    assert!(!desktop.snapshot().wait().unwrap().workspaces.dirty);
+    tru274_assert_iced_bytes(&fixture, &iced);
     golive19_stop(&shell, cx);
     host.update(cx, |host, cx| host.quit(cx));
 }

@@ -9995,6 +9995,7 @@ impl App {
                 .iter()
                 .filter(|bt| bt.run.is_none())
                 .map(|bt| BottomTerminalConfig {
+                    extra: Default::default(),
                     dir: bt.cwd.to_string_lossy().to_string(),
                 })
                 .collect(),

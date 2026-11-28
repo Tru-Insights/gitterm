@@ -151,7 +151,7 @@ impl DesktopStore {
     ) -> Receipt<()> {
         self.submit(move |state, root| {
             mutate(&mut state.workspaces, edit)?;
-            save(&mut state.workspaces, &root.join("workspaces.json"))
+            save_workspace_document(&mut state.workspaces, &root.join("workspaces.json"))
         })
     }
 
@@ -196,40 +196,29 @@ impl DesktopStore {
                 dirty: true,
                 error: None,
             };
-            let path = root.join("workspaces.json");
-            if matches!(&state.workspaces.loaded, LoadState::Valid(_)) {
-                let original =
-                    std::fs::read(&path).map_err(|e| format!("Read {}: {e}", path.display()))?;
-                let raw: serde_json::Value = serde_json::from_slice(&original)
-                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
-                let decoded: WorkspacesFile = serde_json::from_value(raw.clone())
-                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
-                let known = serde_json::to_value(decoded)
-                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
-                let LoadState::Valid(candidate) = &pending.loaded else {
-                    unreachable!()
-                };
-                let mut next = serde_json::to_value(candidate)
-                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
-                preserve_workspace_unknown(&raw, &known, &mut next);
-                let typed: WorkspacesFile = serde_json::from_value(next.clone())
-                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
-                // Match Iced's struct field order whenever the DTO can retain
-                // everything. Older nested records without flatten still keep
-                // their unknown fields via the merged raw representation.
-                let bytes = if serde_json::to_value(&typed).map_err(|e| e.to_string())? == next {
-                    serde_json::to_vec_pretty(&typed)
-                } else {
-                    serde_json::to_vec_pretty(&next)
-                }
-                .map_err(|e| format!("Encode {}: {e}", path.display()))?;
-                crate::atomic_file::write_atomically(&path, &bytes)?;
-                pending.dirty = false;
-            } else {
-                save(&mut pending, &path)?;
-            }
+            save_workspace_document(&mut pending, &root.join("workspaces.json"))?;
             state.workspaces = pending;
             Ok(result)
+        })
+    }
+
+    /// Runtime inventory already exists in the UI. Keep a validated edit dirty
+    /// on IO failure, like Iced, so drain or the next save retries all of it.
+    pub fn edit_runtime_workspaces(
+        &self,
+        edit: impl FnOnce(&mut WorkspacesFile) -> Result<(), String> + Send + 'static,
+    ) -> Receipt<WorkspacesFile> {
+        self.submit(move |state, root| {
+            let mut candidate = match &state.workspaces.loaded {
+                LoadState::Missing => WorkspacesFile::default(),
+                LoadState::Valid(document) => document.clone(),
+                LoadState::Refused(error) => return Err(error.clone()),
+            };
+            edit(&mut candidate)?;
+            state.workspaces.loaded = LoadState::Valid(candidate.clone());
+            state.workspaces.dirty = true;
+            save_workspace_document(&mut state.workspaces, &root.join("workspaces.json"))?;
+            Ok(candidate)
         })
     }
 
@@ -342,7 +331,9 @@ impl DesktopStore {
     }
 
     pub fn save_workspaces(&self) -> Receipt<()> {
-        self.submit(|state, root| save(&mut state.workspaces, &root.join("workspaces.json")))
+        self.submit(|state, root| {
+            save_workspace_document(&mut state.workspaces, &root.join("workspaces.json"))
+        })
     }
 
     pub fn save_settings(&self) -> Receipt<()> {
@@ -352,7 +343,8 @@ impl DesktopStore {
     pub fn drain(&self) -> Receipt<()> {
         self.submit(|state, root| {
             // Try both files even if one writer is blocked.
-            let workspaces = save(&mut state.workspaces, &root.join("workspaces.json"));
+            let workspaces =
+                save_workspace_document(&mut state.workspaces, &root.join("workspaces.json"));
             let settings = save(&mut state.settings, &root.join("settings.json"));
             let errors: Vec<_> = [workspaces, settings]
                 .into_iter()
@@ -531,6 +523,55 @@ fn mutate<T: Default>(state: &mut FileState<T>, edit: impl FnOnce(&mut T)) -> Re
         edit(document);
     }
     Ok(())
+}
+
+fn save_workspace_document(
+    state: &mut FileState<WorkspacesFile>,
+    path: &Path,
+) -> Result<(), String> {
+    if let LoadState::Refused(error) = &state.loaded {
+        return Err(error.clone());
+    }
+    if !state.dirty {
+        return Ok(());
+    }
+    let result = (|| {
+        let LoadState::Valid(candidate) = &state.loaded else {
+            return Err(format!("no document loaded for {}", path.display()));
+        };
+        let mut next = serde_json::to_value(candidate).map_err(|e| e.to_string())?;
+        match std::fs::read(path) {
+            Ok(original) => {
+                let raw: serde_json::Value = serde_json::from_slice(&original)
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let decoded: WorkspacesFile = serde_json::from_value(raw.clone())
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let known = serde_json::to_value(decoded).map_err(|e| e.to_string())?;
+                preserve_workspace_unknown(&raw, &known, &mut next);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Read {}: {e}", path.display())),
+        }
+        let typed: WorkspacesFile =
+            serde_json::from_value(next.clone()).map_err(|e| e.to_string())?;
+        // Match Iced's field order when the DTO retains everything; keep raw
+        // unmodeled provider/location fields through retries as well.
+        let bytes = if serde_json::to_value(&typed).map_err(|e| e.to_string())? == next {
+            serde_json::to_vec_pretty(&typed)
+        } else {
+            serde_json::to_vec_pretty(&next)
+        }
+        .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+        crate::atomic_file::write_atomically(path, &bytes)
+    })();
+    match &result {
+        Ok(()) => {
+            state.dirty = false;
+            state.error = None;
+        }
+        Err(error) => state.error = Some(error.clone()),
+    }
+    result
 }
 
 fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), String> {

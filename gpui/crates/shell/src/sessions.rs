@@ -141,10 +141,26 @@ impl crate::Shell {
         }
         if !persisted && live {
             let workspace = state.workspace.id;
-            let save = self
-                .owner
-                .read(cx)
-                .close_live_tab(state.workspace.id, id, requested, cx);
+            // Bottom descriptors have no UID. Their append/restore order is
+            // the local inventory order, independent of dock rearrangements.
+            let bottom_index = state.store.terminals.as_ref().and_then(|terminals| {
+                terminals
+                    .iter()
+                    .filter(|terminal| {
+                        terminal.bottom
+                            && !self.run_tabs.contains_key(&crate::session_pane_id(
+                                crate::SessionId(terminal.id),
+                            ))
+                    })
+                    .position(|terminal| terminal.id == id.0)
+            });
+            let save = self.owner.read(cx).close_live_tab(
+                state.workspace.id,
+                id,
+                requested,
+                bottom_index,
+                cx,
+            );
             match save {
                 Err(error) => {
                     self.owner.update(cx, |owner, cx| {
@@ -2149,6 +2165,7 @@ impl crate::Shell {
                 let pane =
                     self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
                 if pane.read(cx).session.is_none() {
+                    pane.update(cx, |pane, _| pane.imported_tab = Some(tab.clone()));
                     let host = cx
                         .try_global::<crate::task_host::GpuiTaskHost>()
                         .map(|h| h.0.clone());
@@ -2322,6 +2339,7 @@ impl crate::Shell {
             .filter(|id| !self.run_tabs.contains_key(id))
             .filter_map(|id| state.panes.get(&id)?.read(cx).task_folder(cx))
             .map(|dir| gitterm_core::workspace_config::BottomTerminalConfig {
+                extra: Default::default(),
                 dir: dir.to_string_lossy().into_owned(),
             })
             .collect()
@@ -2412,11 +2430,26 @@ impl crate::Shell {
                     tab.task_id = target.task_id;
                     tab.task_session_id = target.task_session_id;
                 }
-                if pane.startup_command.is_some() {
+                let mounted_local_terminal = !saved.is_legacy_remote()
+                    && crate::workspace_config::workspace_remote_id(saved).is_none()
+                    && tab.tab_kind.as_deref() != Some("agent")
+                    && pane.session.is_some();
+                if mounted_local_terminal {
+                    // Iced workspace_config projects a terminal's launch repo,
+                    // including legacy records that had only a cwd, and omits
+                    // the explicit terminal discriminator on its next save.
+                    tab.repo_dir.get_or_insert_with(|| tab.dir.clone());
+                    tab.tab_kind = None;
+                    tab.agent_config = None;
                     tab.startup_command = pane.startup_command.clone();
-                }
-                if pane.chat_session_id.is_some() {
                     tab.chat_session_id = pane.chat_session_id.clone();
+                } else {
+                    if pane.startup_command.is_some() {
+                        tab.startup_command = pane.startup_command.clone();
+                    }
+                    if pane.chat_session_id.is_some() {
+                        tab.chat_session_id = pane.chat_session_id.clone();
+                    }
                 }
                 tab.dir = pane.terminal_saved_dir.as_ref().unwrap_or(&cwd).to_string_lossy().into_owned();
                 if matches!(saved.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) && pane.startup_command.is_some() {
