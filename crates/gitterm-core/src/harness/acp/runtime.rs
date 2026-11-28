@@ -769,6 +769,7 @@ pub(crate) async fn run_session(
     events: EventSink,
 ) {
     let Launch {
+        client_version,
         config,
         program,
         snapshots,
@@ -898,7 +899,7 @@ pub(crate) async fn run_session(
                     "fs": {"readTextFile": false, "writeTextFile": false},
                     "terminal": false,
                 },
-                "clientInfo": {"name": "gitterm", "version": env!("CARGO_PKG_VERSION")},
+                "clientInfo": {"name": "gitterm", "version": client_version},
             }),
             Call::Initialize,
         )

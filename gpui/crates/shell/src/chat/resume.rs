@@ -362,10 +362,6 @@ impl ChatPane {
             pane.configure_acp(config, cx);
             if restoring {
                 pane.history_loading = true;
-                if let Err(error) = pane.launch_acp(cx) {
-                    pane.history_loading = false;
-                    pane.resume_failed(format!("{error:#}"), cx);
-                }
             }
             return Ok(pane);
         }

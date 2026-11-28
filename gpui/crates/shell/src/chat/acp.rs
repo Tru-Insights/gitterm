@@ -27,6 +27,13 @@ impl ChatPane {
                 self.resume_error = Some(error.clone())
             }
             RuntimeEvent::Harness(HarnessEvent::Ready { session_id, .. }) => {
+                if self.history_loading {
+                    let source = self.controller.source.clone();
+                    if let Some(update) = self.controller.apply_acp_history(&source, vec![]) {
+                        self.pending.push(update);
+                    }
+                    self.history_loading = false;
+                }
                 self.resume_error = None;
                 self.awaiting_resume = false;
                 if let Some(id) = session_id {
@@ -73,6 +80,20 @@ impl ChatPane {
         });
     }
 
+    pub(crate) fn load_acp_history(&mut self, cx: &mut Context<Self>) {
+        if !self.history_loading
+            || self.controller.runtime.is_some()
+            || self.resume_error.is_some()
+            || !matches!(self.controller.config.backend(), AgentBackend::Acp(_))
+        {
+            return;
+        }
+        if let Err(error) = self.launch_acp(cx) {
+            self.history_loading = false;
+            self.resume_failed(format!("{error:#}"), cx);
+        }
+    }
+
     pub(super) fn launch_acp(&mut self, cx: &mut Context<Self>) -> Result<()> {
         let launch = self
             .deferred_live
@@ -84,6 +105,12 @@ impl ChatPane {
             .and_then(|source| source.owner.upgrade())
             .and_then(|owner| owner.read(cx).iced_workspace(launch.workspace?).cloned());
         let settings = launch.settings.borrow().clone();
+        self.controller.source = self
+            .controller
+            .adapter
+            .begin_runtime(self.controller.target.clone());
+        self.controller.ready = false;
+        self.controller.correlations.clear();
         self.controller.seed_launch(&settings);
         let config = acp_launch::session_config(
             &self.controller.config,
@@ -186,6 +213,7 @@ pub(super) fn start_live_acp(
         )
         .with_close_token(close);
         Ok(acp_launch::local_launch(
+            env!("GITTERM_DESKTOP_VERSION"),
             config,
             program,
             Box::new(snapshots),

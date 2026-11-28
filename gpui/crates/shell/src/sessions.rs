@@ -1046,7 +1046,7 @@ impl crate::Shell {
         if self.live_chat_enabled(cx) {
             // Iced restores every open agent tab. Register background panes too,
             // so delivery can reach them before they are ever selected. Resume
-            // defers the provider process until a prompt is actually submitted.
+            // loads ACP history only for the selected tab.
             let selected = self.active_workspace(cx).and_then(|workspace| {
                 let state = self
                     .workspaces
@@ -1088,6 +1088,16 @@ impl crate::Shell {
                         cx.notify();
                     });
                 }
+            }
+            if let Some((workspace, id)) = selected
+                && let Some(pane) = self
+                    .workspace(workspace)
+                    .panes
+                    .get(&crate::session_pane_id(id))
+                && let crate::pane::PaneContent::PreviewChat(chat) = &pane.read(cx).content
+            {
+                chat.clone()
+                    .update(cx, |chat, cx| chat.load_acp_history(cx));
             }
             return;
         }

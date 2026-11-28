@@ -147,7 +147,12 @@ async fn run_session(
     )
     .with_close_token(close_token.clone());
     gitterm_core::harness::acp::run_session_harness(
-        local_launch(config, program, Box::new(snapshots)),
+        local_launch(
+            env!("CARGO_PKG_VERSION"),
+            config,
+            program,
+            Box::new(snapshots),
+        ),
         commands,
         events,
     )

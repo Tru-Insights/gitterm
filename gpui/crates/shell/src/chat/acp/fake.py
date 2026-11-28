@@ -2,6 +2,8 @@
 import json, os, sys
 from pathlib import Path
 root = Path(os.getcwd())
+with (root / 'launches').open('a') as out:
+    out.write('launch\n')
 (root / 'child.json').write_text(json.dumps({'argv': sys.argv[1:], 'env': dict(os.environ), 'cwd': str(root)}))
 def emit(frame):
     print(json.dumps(frame), flush=True)
@@ -12,8 +14,11 @@ for line in sys.stdin:
     method, p = f.get('method'), f.get('params', {})
     result = {}
     if method == 'initialize':
-        result = {'protocolVersion': 1, 'agentCapabilities': {'loadSession': True, 'mcpCapabilities': {'http': True}, '_meta': {'antigravity': {'systemPrompt': {'append': True}}}}}
+        result = {'protocolVersion': 1, 'agentCapabilities': {'loadSession': not (root / 'no-load').exists(), 'mcpCapabilities': {'http': True}, '_meta': {'antigravity': {'systemPrompt': {'append': True}}}}}
     elif method in ['session/new', 'session/load']:
+        if method == 'session/load' and (root / 'fail-load').exists():
+            emit({'jsonrpc':'2.0', 'id':f['id'], 'error':{'code':-32000, 'message':'Placeholder load failure'}})
+            continue
         sid = p.get('sessionId', 'placeholder-new-session')
         if method == 'session/load':
             for kind, text in [('user_message_chunk', 'placeholder saved prompt'), ('agent_message_chunk', 'placeholder saved reply')]:
@@ -34,3 +39,5 @@ for line in sys.stdin:
         result = {'stopReason':'end_turn'}
     if 'id' in f:
         emit({'jsonrpc':'2.0','id':f['id'],'result':result})
+        if method == 'session/prompt' and (root / 'exit-after-prompt').exists():
+            break

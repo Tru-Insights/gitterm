@@ -99,7 +99,11 @@ fn wait(
         if pane.read_with(cx, |pane, _| done(pane)) {
             return;
         }
-        assert!(Instant::now() < until, "ACP fixture timed out");
+        assert!(
+            Instant::now() < until,
+            "ACP fixture timed out: {:?}",
+            pane.read_with(cx, |pane, _| pane.resume_error.clone())
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -123,6 +127,7 @@ fn case_saved_acp_restores_and_resumes_recorded_session(cx: &mut gpui::TestAppCo
     let (pane, cx) = cx.add_window_view(|window, cx| {
         ChatPane::resume(shutdown.clone(), preview, workspace, tab, window, cx).unwrap()
     });
+    pane.update(cx, |pane, cx| pane.load_acp_history(cx));
     wait(&pane, cx, |pane| pane.controller.ready);
     pane.read_with(cx, |pane, _| {
         assert_eq!(pane.saved.session_id.as_deref(), Some("placeholder-recorded-session"));
@@ -194,7 +199,7 @@ fn case_saved_acp_restores_and_resumes_recorded_session(cx: &mut gpui::TestAppCo
         && f["params"]["modelId"] == "placeholder-retired-model"));
     assert!(frames.iter().any(|f| f["method"] == "session/prompt"
         && f["params"]["sessionId"] == "placeholder-recorded-session"));
-    pane.update(cx, |pane, cx| pane.shutdown_runtime(cx));
+    pane.update(cx, |pane, cx| pane.close(cx));
     shutdown.drain().unwrap();
 }
 #[gpui::test]
@@ -266,7 +271,7 @@ fn case_new_acp_uses_iced_argv_env_and_chat_config(cx: &mut gpui::TestAppContext
     assert_eq!(new["params"]["cwd"], root.to_string_lossy().as_ref());
     assert_eq!(new["params"]["mcpServers"][0]["name"], "gitterm-tasks");
     assert!(!frames.iter().any(|f| f["method"] == "session/load"));
-    pane.update(cx, |pane, cx| pane.shutdown_runtime(cx));
+    pane.update(cx, |pane, cx| pane.close(cx));
     shutdown.drain().unwrap();
     let document: gitterm_core::workspace_config::WorkspacesFile =
         serde_json::from_slice(&std::fs::read(root.join("state/workspaces.json")).unwrap())
@@ -305,6 +310,7 @@ fn case_missing_acp_reports_iced_message_and_retired_gemini_is_read_only(
         )
         .unwrap()
     });
+    pane.update(cx, |pane, cx| pane.load_acp_history(cx));
     wait(&pane, cx, |pane| {
         pane.resume_error.is_some() && pane.controller.runtime.is_none()
     });
@@ -348,4 +354,284 @@ fn case_preview_keeps_acp_resume_and_persistent_permissions_unavailable(
         assert!(matches!(receipt.state, gitterm_gpui_chat::adapter::ReceiptState::Rejected(error) if error == "Allow and remember · not saved in preview"));
         pane
     });
+}
+
+fn send(pane: &mut ChatPane, text: &str, cx: &mut Context<ChatPane>) -> Receipt {
+    pane.dispatch(
+        ChatIntent::Send {
+            text: text.into(),
+            images: vec![],
+        },
+        cx,
+    )
+}
+
+#[gpui::test]
+fn case_f1_initialize_uses_desktop_client_version(cx: &mut gpui::TestAppContext) {
+    let Some((root, preview, workspace)) = prepare(cx, "f1-version") else {
+        return;
+    };
+    let shutdown = RuntimeShutdown::new();
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        ChatPane::resume(
+            shutdown.clone(),
+            preview,
+            workspace,
+            saved(&root, None),
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    pane.update(cx, |pane, cx| {
+        send(pane, "placeholder version prompt", cx);
+    });
+    wait(&pane, cx, |pane| pane.controller.ready);
+    let desktop: toml::Value =
+        toml::from_str(include_str!("../../../../../../Cargo.toml")).unwrap();
+    let frames = wire(&root);
+    let init = frames
+        .iter()
+        .find(|frame| frame["method"] == "initialize")
+        .unwrap();
+    assert_eq!(
+        init["params"]["clientInfo"]["version"].as_str(),
+        desktop["package"]["version"].as_str()
+    );
+    pane.update(cx, |pane, cx| pane.close(cx));
+    shutdown.drain().unwrap();
+}
+
+fn shell<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    root: &Path,
+    workspaces: serde_json::Value,
+) -> (Entity<crate::Shell>, &'a mut gpui::VisualTestContext) {
+    let state = root.join("state");
+    let document =
+        serde_json::from_value(serde_json::json!({"active_workspace":0, "workspaces":workspaces}))
+            .unwrap();
+    cx.read(|cx| {
+        cx.global::<crate::workspace_config::LiveWorkspaces>()
+            .0
+            .transact_workspaces(move |file| {
+                *file = document;
+                Ok(())
+            })
+            .wait()
+            .unwrap()
+    });
+    let mut store = crate::preview::tests::guarded_store(&root.join("preview"));
+    let model = crate::workspace_config::load_iced_workspaces_from(&mut store, &state);
+    let layout = store.guard.as_ref().unwrap().preview().layout();
+    cx.add_window_view(|window, cx| {
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+        crate::Shell::with_owner(
+            Rc::new(crate::data::LocalData(owner.clone())),
+            owner,
+            &layout,
+            true,
+            window,
+            cx,
+        )
+        .unwrap()
+    })
+}
+fn shell_chat(
+    shell: &Entity<crate::Shell>,
+    workspace: crate::WorkspaceId,
+    index: usize,
+    cx: &gpui::App,
+) -> (crate::data::SessionId, Entity<ChatPane>) {
+    let state = shell.read(cx).workspace(workspace);
+    let id = state.sessions[index].id;
+    let pane = state.panes[&crate::session_pane_id(id)].read(cx);
+    let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+        panic!("saved ACP tab was not registered")
+    };
+    (id, chat.clone())
+}
+fn launches(root: &Path) -> usize {
+    std::fs::read_to_string(root.join("launches"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+#[gpui::test]
+fn case_f2_background_restore_launches_only_selected_acp(cx: &mut gpui::TestAppContext) {
+    let Some((root, _, workspace)) = prepare(cx, "f2-lazy") else {
+        return;
+    };
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let mut other = saved(&second, Some("placeholder-second-session"));
+    other.session_uid = Some("placeholder-second-caller".into());
+    let mut background = workspace.clone();
+    background.name = "Placeholder background".into();
+    background.dir = first.to_string_lossy().into_owned();
+    background.tabs = vec![saved(&first, Some("placeholder-first-session")), other];
+    background.done_at = Some("2026-01-01T00:00:00Z".into());
+    let (shell, cx) = shell(cx, &root, serde_json::json!([workspace, background]));
+    shell.update_in(cx, |shell, window, cx| {
+        shell.restore_live_workspace_sessions(crate::WorkspaceId(2), window, cx)
+    });
+    cx.run_until_parked();
+    let (selected, first_chat) = cx.read(|cx| shell_chat(&shell, crate::WorkspaceId(2), 0, cx));
+    let (_, second_chat) = cx.read(|cx| shell_chat(&shell, crate::WorkspaceId(2), 1, cx));
+    assert!(first_chat.read_with(cx, |pane, _| pane.controller.runtime.is_none()));
+    assert!(second_chat.read_with(cx, |pane, _| pane.controller.runtime.is_none()));
+    assert_eq!(launches(&first) + launches(&second), 0);
+    shell.update_in(cx, |shell, window, cx| {
+        shell.reopen_workspace(crate::WorkspaceId(2), window, cx);
+        shell.select_workspace_id(crate::WorkspaceId(2), window, cx);
+        shell.select_session_id(selected, window, cx);
+    });
+    wait(&first_chat, cx, |pane| pane.controller.ready);
+    assert_eq!(launches(&first), 1);
+    assert_eq!(launches(&second), 0);
+    shell.update_in(cx, |shell, window, cx| {
+        shell.load_active_iced_history(window, cx)
+    });
+    assert_eq!(launches(&first), 1);
+    let shutdown = first_chat.read_with(cx, |pane, _| pane.shutdown.clone());
+    first_chat.update(cx, |pane, cx| pane.close(cx));
+    shutdown.drain().unwrap();
+}
+
+#[gpui::test]
+fn case_f3_startup_selection_resumes_saved_acp(cx: &mut gpui::TestAppContext) {
+    let Some((root, _, mut workspace)) = prepare(cx, "f3-startup") else {
+        return;
+    };
+    let terminal: WorkspaceTabConfig =
+        serde_json::from_value(serde_json::json!({"dir":root})).unwrap();
+    workspace.tabs = vec![terminal, saved(&root, Some("placeholder-startup-session"))];
+    let (shell, cx) = shell(cx, &root, serde_json::json!([workspace]));
+    let selected = shell.read_with(cx, |shell, _| {
+        shell.workspace(crate::WorkspaceId(1)).sessions[1].id
+    });
+    assert_eq!(launches(&root), 0);
+    shell.update_in(cx, |shell, window, cx| {
+        shell.select_session_id(selected, window, cx)
+    });
+    let (_, pane) = cx.read(|cx| shell_chat(&shell, crate::WorkspaceId(1), 1, cx));
+    wait(&pane, cx, |pane| pane.controller.ready);
+    assert_eq!(launches(&root), 1);
+    assert!(wire(&root).iter().any(|f| f["method"] == "session/load"
+        && f["params"]["sessionId"] == "placeholder-startup-session"));
+    assert_eq!(
+        pane.read_with(cx, |pane, _| pane.saved.session_id.clone())
+            .as_deref(),
+        Some("placeholder-startup-session")
+    );
+    let shutdown = pane.read_with(cx, |pane, _| pane.shutdown.clone());
+    pane.update(cx, |pane, cx| pane.close(cx));
+    shutdown.drain().unwrap();
+}
+
+#[gpui::test]
+fn case_f4_resume_fallback_finishes_history_and_accepts_send(cx: &mut gpui::TestAppContext) {
+    let Some((fixture, preview, workspace)) = prepare(cx, "f4-fallback") else {
+        return;
+    };
+    for marker in ["fail-load", "no-load"] {
+        let root = fixture.join(marker);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(marker), "").unwrap();
+        let shutdown = RuntimeShutdown::new();
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let mut pane = ChatPane::resume(
+                shutdown.clone(),
+                preview.clone(),
+                workspace.clone(),
+                saved(&root, Some("placeholder-fallback-session")),
+                window,
+                cx,
+            )
+            .unwrap();
+            pane.load_acp_history(cx);
+            pane
+        });
+        wait(&pane, cx, |pane| pane.controller.ready);
+        pane.update(cx, |pane, cx| {
+            assert!(!pane.history_loading);
+            assert!(pane.resume_error.is_none());
+            assert_eq!(
+                pane.controller.adapter.state().history,
+                gitterm_core::chat::types::HistoryLoad::Loaded
+            );
+            assert!(matches!(
+                send(pane, "placeholder fallback prompt", cx).state,
+                gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+            ));
+        });
+        wait(&pane, cx, |pane| {
+            pane.saved.records.iter().any(|r| matches!(&r.entry, Entry::Harness(HarnessEvent::TextDelta(text)) if text == "placeholder continued reply"))
+        });
+        assert!(wire(&root).iter().any(|f| f["method"] == "session/new"));
+        assert!(wire(&root).iter().any(|f| f["method"] == "session/prompt"
+            && f["params"]["sessionId"] == "placeholder-new-session"));
+        pane.update(cx, |pane, cx| pane.close(cx));
+        shutdown.drain().unwrap();
+    }
+}
+
+#[gpui::test]
+fn case_f5_send_after_exit_resets_runtime_lifecycle(cx: &mut gpui::TestAppContext) {
+    let Some((root, preview, workspace)) = prepare(cx, "f5-replacement") else {
+        return;
+    };
+    std::fs::write(root.join("exit-after-prompt"), "").unwrap();
+    let shutdown = RuntimeShutdown::new();
+    let (pane, cx) = cx.add_window_view(|window, cx| {
+        ChatPane::resume(
+            shutdown.clone(),
+            preview,
+            workspace,
+            saved(&root, None),
+            window,
+            cx,
+        )
+        .unwrap()
+    });
+    pane.update(cx, |pane, cx| {
+        assert!(matches!(
+            send(pane, "placeholder first prompt", cx).state,
+            gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+        ));
+    });
+    wait(&pane, cx, |pane| pane.controller.runtime.is_none());
+    let source = pane.read_with(cx, |pane, _| pane.controller.source.clone());
+    pane.update(cx, |pane, cx| {
+        let receipt = send(pane, "placeholder replacement prompt", cx);
+        assert!(
+            matches!(
+                receipt.state,
+                gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+            ),
+            "{receipt:?}"
+        );
+        assert_ne!(pane.controller.source, source);
+        // An old receiver cannot terminate the replacement.
+        pane.receive_runtime_event(
+            &source,
+            RuntimeEvent::Harness(HarnessEvent::ProcessExited { code: Some(0) }),
+            cx,
+        );
+        assert!(pane.controller.runtime.is_some());
+    });
+    wait(&pane, cx, |pane| pane.controller.runtime.is_none());
+    pane.update(cx, |pane, cx| pane.close(cx));
+    assert_eq!(launches(&root), 2);
+    assert_eq!(
+        wire(&root)
+            .iter()
+            .filter(|f| f["method"] == "session/prompt")
+            .count(),
+        2
+    );
+    shutdown.drain().unwrap();
 }

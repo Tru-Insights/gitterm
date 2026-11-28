@@ -155,17 +155,20 @@ pub fn redact_frame(frame: &Value) -> Value {
 }
 
 pub struct Launch {
+    pub client_version: &'static str,
     pub config: AcpSessionConfig,
     pub program: PathBuf,
     pub snapshots: Box<dyn SnapshotRecorder>,
 }
 
 pub fn local_launch(
+    client_version: &'static str,
     config: AcpSessionConfig,
     program: PathBuf,
     snapshots: Box<dyn SnapshotRecorder>,
 ) -> Launch {
     Launch {
+        client_version,
         config,
         program,
         snapshots,
