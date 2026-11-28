@@ -678,7 +678,7 @@ impl crate::Shell {
             O::OpenReposMenu => self.unavailable("Repos ▾", cx),
             O::OpenReady => self.open_ready_list(window, cx),
             O::OpenParked => self.open_parked_list(window, cx),
-            O::Browser(_) => self.unavailable("Browser", cx),
+            O::Browser(action) => self.browser_action(action, window, cx),
             O::OpenMoreMenu => self.unavailable("Help and browser actions", cx),
             O::ToggleTerminal => self.unavailable("Terminal", cx),
             O::AddWorkspace(key) => {

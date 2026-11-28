@@ -109,6 +109,10 @@ impl Pane {
                     },
                     ..Default::default()
                 };
+                let mut launch = launch;
+                if let Some(target) = &session {
+                    crate::browser::terminal_environment(&mut launch, &target.session_uid, cx);
+                }
                 // Headless fixtures must not run host rc/session-restore scripts.
                 #[cfg(test)]
                 let launch = TerminalLaunch {
