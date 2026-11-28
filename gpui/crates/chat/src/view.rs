@@ -568,6 +568,18 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Live hosts may answer with the provider's offered persistent permission.
+    /// This flag controls permission cards only, not delegation/review actions.
+    pub fn set_live_permissions(&mut self, cx: &mut Context<Self>) {
+        self.preview = false;
+        for card in self.cards.values() {
+            card.update(cx, |card, cx| {
+                card.preview = false;
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
     /// Enable choosing the launch configuration before the first live turn.
     /// Card, resume and persistence fences remain those set by `set_preview`.
     pub fn set_live_prelaunch(&mut self, cx: &mut Context<Self>) {

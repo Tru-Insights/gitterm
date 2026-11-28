@@ -724,6 +724,19 @@ impl TaskHostOwner {
         })
     }
 
+    pub(crate) fn acp_mcp_servers(
+        &self,
+        caller: &str,
+    ) -> Vec<gitterm_core::harness::acp::AcpMcpServer> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            self.host.issue_caller(caller);
+            vec![
+                servers.task_mcp.acp_mcp_server(Some(caller)),
+                servers.browser.acp_mcp_server(Some(caller)),
+            ]
+        })
+    }
+
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }

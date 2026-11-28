@@ -578,6 +578,14 @@ impl ConversationClaim {
         owned.insert(key);
         Ok(())
     }
+    pub(super) fn acp_id(
+        &self,
+        agent: gitterm_core::chat::types::AcpAgent,
+        id: &str,
+    ) -> Result<()> {
+        ensure!(!id.is_empty(), "Empty provider session identity");
+        self.insert(format!("acp:{agent:?}:{id}"))
+    }
     pub(super) fn provider_id(&self, id: &str) -> Result<()> {
         ensure!(!id.is_empty(), "Empty provider session identity");
         // Namespace comes from the effective provider root. Tests never inspect
