@@ -296,7 +296,7 @@ fn golive10_review_f3_closed_imported_cli_stays_closed(cx: &mut TestAppContext) 
             .for_gpui_live(),
     );
     let host = cx
-        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
         .unwrap();
     cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop.clone())));
     let (shell, vcx) = golive10_shell(&fixture, &host, cx);
