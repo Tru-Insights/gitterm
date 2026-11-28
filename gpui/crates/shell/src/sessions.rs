@@ -1864,7 +1864,7 @@ impl crate::Shell {
                     continue;
                 }
                 if let Err(error) =
-                    self.mount_live_chat(workspace, tab, Some(session.id), window, cx)
+                    self.mount_live_chat(workspace, tab, Some(session.id), false, window, cx)
                 {
                     self.owner.update(cx, |owner, cx| {
                         owner.error = Some(format!("Resume chat: {error:#}"));
