@@ -3534,7 +3534,7 @@ mod live_writes {
     #[gpui::test]
     fn only_task_writes_open(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
-        use gitterm_core::preview::service::{RunnerEffect, preview_notice};
+        use gitterm_core::preview::service::RunnerEffect;
         if child("only_task_writes_open") {
             return;
         }
