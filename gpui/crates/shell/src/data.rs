@@ -114,7 +114,7 @@ impl TaskSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkspaceId(pub u64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u64);
 
 #[derive(Clone, Debug)]
@@ -1699,5 +1699,285 @@ mod work_index_tests {
         assert!(full.indexed_chats.is_empty());
         assert_eq!(full.pull_requests.len(), 1);
         assert_eq!(full.pull_requests[0].title, "never-in");
+    }
+}
+
+/// Iced's tab working directory and derived panel context. Only `cwd` is
+/// persisted (as the existing V6 tab `dir`); follow state is runtime-only.
+#[derive(Debug)]
+pub(crate) struct SessionContext {
+    pub cwd: std::path::PathBuf,
+    pub terminal_dir: Option<std::path::PathBuf>,
+    pub repo: std::path::PathBuf,
+    pub task_root: Option<std::path::PathBuf>,
+    pub task_context: bool,
+    pub panel_repo: Option<std::path::PathBuf>,
+    pub follow: gitterm_core::worktree_follow::WorktreeFollow,
+    pub observed_events: usize,
+    pub follow_listing: bool,
+    pub follow_pending: Vec<Vec<std::path::PathBuf>>,
+}
+impl SessionContext {
+    pub(crate) fn panel_root(&self) -> std::path::PathBuf {
+        self.task_root
+            .clone()
+            .or_else(|| self.panel_repo.clone())
+            .or_else(|| self.follow.panel_root().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| self.repo.clone())
+    }
+}
+
+impl crate::WorkspaceOwner {
+    /// Tool inputs use the same streamed-input tracker and worktree decision
+    /// policy as Iced. Git discovery runs off the UI thread.
+    pub fn observe_session_worktree_events(
+        &mut self,
+        workspace: WorkspaceId,
+        session: SessionId,
+        events: &[gitterm_core::chat::state::AgentEvent],
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(tab) = self.model.session_contexts.get_mut(&session) else {
+            return;
+        };
+        if tab.task_context
+            || self
+                .model
+                .workspaces
+                .iter()
+                .any(|w| w.id == workspace && w.remote)
+        {
+            return;
+        }
+        #[cfg(test)]
+        let home: Option<std::path::PathBuf> = None;
+        #[cfg(not(test))]
+        let home = dirs::home_dir();
+        for event in events.iter().skip(tab.observed_events) {
+            if let gitterm_core::chat::state::AgentEvent::Harness(event) = event {
+                let candidates = tab.follow.tracker.observe(event, home.as_deref());
+                if !candidates.is_empty() {
+                    tab.follow_pending.push(candidates);
+                }
+            }
+        }
+        tab.observed_events = events.len();
+        if tab.follow_pending.is_empty() || tab.follow_listing {
+            return;
+        }
+        tab.follow_listing = true;
+        let repo = tab.repo.clone();
+        let read = cx.background_executor().spawn(async move {
+            let worktrees = gitterm_core::worktree_follow::list_worktrees(&repo);
+            (repo, worktrees)
+        });
+        cx.spawn(async move |owner, cx| {
+            let (repo, worktrees) = read.await;
+            _ = owner.update(cx, |owner, cx| {
+                let Some(tab) = owner.model.session_contexts.get_mut(&session) else {
+                    return;
+                };
+                tab.follow_listing = false;
+                let calls = std::mem::take(&mut tab.follow_pending);
+                if tab.task_context {
+                    return;
+                }
+                match worktrees {
+                    Ok(worktrees) => {
+                        let repo = gitterm_core::worktree_follow::resolve_for_match(&repo);
+                        for candidates in calls {
+                            let candidates: Vec<_> = candidates
+                                .iter()
+                                .map(|path| gitterm_core::worktree_follow::resolve_for_match(path))
+                                .collect();
+                            let decision = gitterm_core::worktree_follow::decide_all(
+                                &candidates,
+                                &repo,
+                                &worktrees,
+                            );
+                            let label = match &decision {
+                                gitterm_core::worktree_follow::FollowDecision::Follow(active) => {
+                                    Some(gitterm_core::worktree_follow::short_worktree_label(
+                                        &active.path,
+                                        &worktrees,
+                                        home.as_deref(),
+                                    ))
+                                }
+                                _ => None,
+                            };
+                            tab.follow.apply(decision, label);
+                        }
+                        if owner.model.active_sessions.get(&workspace) == Some(&session) {
+                            let root = tab.panel_root();
+                            owner.dispatch(
+                                crate::workspace_status::Intent::ContextChanged { workspace, root },
+                                std::time::Instant::now(),
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        owner.error = Some(format!("Follow session worktree: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_session_worktree_follow(
+        &mut self,
+        workspace: WorkspaceId,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(id) = self.model.active_sessions.get(&workspace) else {
+            return;
+        };
+        let Some(tab) = self.model.session_contexts.get_mut(id) else {
+            return;
+        };
+        if tab.follow.toggle() {
+            let root = tab.panel_root();
+            self.dispatch(
+                crate::workspace_status::Intent::ContextChanged { workspace, root },
+                std::time::Instant::now(),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tab_context_tests {
+    use super::*;
+    use gitterm_core::chat::{
+        state::AgentEvent,
+        types::{HarnessEvent, ItemKind},
+    };
+    use gpui::{AppContext, TestAppContext};
+    use std::time::{Duration, Instant};
+
+    #[gpui::test]
+    fn tab_context_gap5_tools_follow_worktree_and_toggle_preserves_working_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = gitterm_core::git_status::git_command()
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+            "--allow-empty",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            linked.to_str().unwrap(),
+        ]);
+        let linked = linked.canonicalize().unwrap();
+        let mut model = crate::workspace_status::WorkspaceStatus::default();
+        let workspace = model.add(repo.clone(), Instant::now());
+        let session = SessionId(41);
+        model.active_sessions.insert(workspace, session);
+        model.session_contexts.insert(
+            session,
+            SessionContext {
+                cwd: repo.clone(),
+                terminal_dir: Some(repo.clone()),
+                repo: repo.clone(),
+                task_root: None,
+                task_context: false,
+                panel_repo: None,
+                follow: Default::default(),
+                observed_events: 0,
+                follow_listing: false,
+                follow_pending: Vec::new(),
+            },
+        );
+        let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, None, cx));
+        let events = vec![
+            AgentEvent::Harness(HarnessEvent::ItemStarted {
+                id: "read".into(),
+                kind: ItemKind::ToolCall {
+                    name: "Read".into(),
+                    input: serde_json::json!({"file_path": linked.join("new.txt")}),
+                },
+            }),
+            AgentEvent::Harness(HarnessEvent::ItemCompleted {
+                id: "read".into(),
+                output: String::new(),
+                is_error: false,
+            }),
+        ];
+        owner.update(cx, |owner, cx| {
+            owner.observe_session_worktree_events(workspace, session, &events, cx)
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if !owner.read_with(cx, |owner, _| {
+                owner.model.session_contexts[&session].follow_listing
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worktree discovery did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        owner.read_with(cx, |owner, _| {
+            assert_eq!(owner.model.workspaces[0].root, linked);
+            assert_eq!(owner.model.session_contexts[&session].cwd, repo);
+        });
+        owner.update(cx, |owner, cx| {
+            owner.toggle_session_worktree_follow(workspace, cx)
+        });
+        owner.read_with(cx, |owner, _| {
+            assert_eq!(owner.model.workspaces[0].root, repo)
+        });
+        owner.update(cx, |owner, cx| {
+            owner.toggle_session_worktree_follow(workspace, cx)
+        });
+        owner.read_with(cx, |owner, _| {
+            assert_eq!(owner.model.workspaces[0].root, linked)
+        });
+        owner.update(cx, |owner, cx| {
+            owner.observe_session_worktree_events(workspace, session, &events, cx)
+        });
+        owner.read_with(cx, |owner, _| {
+            assert!(
+                !owner.model.session_contexts[&session].follow_listing,
+                "replaying unchanged events must not run discovery again"
+            )
+        });
     }
 }

@@ -32,6 +32,11 @@ pub enum Intent {
         workspace: WorkspaceId,
         root: PathBuf,
     },
+    SelectSession {
+        workspace: WorkspaceId,
+        session: crate::data::SessionId,
+        root: PathBuf,
+    },
     Completed(GitStatusSnapshot),
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +55,12 @@ pub struct WorkspaceStatus {
     // Samples use the same selection reducer without creating status owners.
     sample_roster: Vec<WorkspaceFact>,
     next_id: u64,
+    /// A completion from a context we left cannot re-root the current tab.
+    context_roots: std::collections::HashMap<WorkspaceId, std::collections::HashSet<PathBuf>>,
+    session_status: std::collections::HashMap<crate::data::SessionId, (GitStatusState, bool)>,
+    pub(crate) active_sessions: std::collections::HashMap<WorkspaceId, crate::data::SessionId>,
+    pub(crate) session_contexts:
+        std::collections::HashMap<crate::data::SessionId, crate::data::SessionContext>,
 }
 impl WorkspaceStatus {
     pub fn sample(ids: impl Iterator<Item = WorkspaceId>) -> Self {
@@ -90,10 +101,40 @@ impl WorkspaceStatus {
         let mut model = Self::default();
         for (index, saved) in catalog.workspaces.iter().enumerate() {
             let folder = PathBuf::from(&saved.dir);
+            let workspace = WorkspaceId(index as u64 + 1);
+            let sessions = crate::data::iced_sessions_with_key(
+                saved,
+                &crate::workspace_config::iced_layout_key(saved),
+            );
+            for (session, tab) in sessions.iter().zip(&saved.tabs) {
+                model.session_contexts.insert(
+                    session.id,
+                    crate::data::SessionContext {
+                        cwd: tab.dir.clone().into(),
+                        terminal_dir: Some(tab.dir.clone().into()),
+                        repo: tab.repo_dir.as_ref().unwrap_or(&tab.dir).into(),
+                        task_root: None,
+                        task_context: tab.task_id.is_some(),
+                        panel_repo: None,
+                        follow: Default::default(),
+                        observed_events: 0,
+                        follow_listing: false,
+                        follow_pending: Vec::new(),
+                    },
+                );
+            }
+            let active = sessions.get(crate::data::iced_active_tab(saved));
+            if let Some(active) = active {
+                model.active_sessions.insert(workspace, active.id);
+            }
+            let root = active
+                .and_then(|session| model.session_contexts.get(&session.id))
+                .map(|tab| tab.panel_root())
+                .unwrap_or_else(|| folder.clone());
             model.workspaces.push(LocalWorkspace {
                 id: WorkspaceId(index as u64 + 1),
                 name: saved.name.clone(),
-                root: folder.clone(),
+                root,
                 folder,
                 status: GitStatusState::new(saved.name.clone(), false, now),
                 checked: false,
@@ -181,6 +222,14 @@ impl WorkspaceStatus {
                 else {
                     return vec![];
                 };
+                if workspace.root != snapshot.repo_path
+                    && self
+                        .context_roots
+                        .get(&workspace.id)
+                        .is_some_and(|roots| roots.contains(&snapshot.repo_path))
+                {
+                    return vec![];
+                }
                 // Plain local roots may adopt the collector's discovered toplevel;
                 // the explicitly seeded folder remains the persisted identity.
                 if snapshot.error.is_none() && workspace.root != snapshot.repo_path {
@@ -193,11 +242,60 @@ impl WorkspaceStatus {
                     .reduce(StatusEvent::Completed(snapshot), now);
                 vec![]
             }
+            Intent::SelectSession {
+                workspace,
+                session,
+                root,
+            } => {
+                let previous = self.active_sessions.insert(workspace, session);
+                let Some(local) = self
+                    .workspaces
+                    .iter_mut()
+                    .find(|local| local.id == workspace)
+                else {
+                    return vec![];
+                };
+                let mut first = false;
+                if previous != Some(session) {
+                    if let Some(previous) = previous {
+                        self.session_status
+                            .insert(previous, (local.status.clone(), local.checked));
+                    }
+                    if let Some((status, checked)) = self.session_status.get(&session) {
+                        local.status = status.clone();
+                        local.checked = *checked;
+                    } else {
+                        local.status = GitStatusState::new(local.name.clone(), false, now);
+                        local.checked = false;
+                        first = true;
+                    }
+                }
+                let changed = local.root != root;
+                if first && !changed {
+                    return Self::status_commands(
+                        local,
+                        StatusEvent::Request {
+                            root,
+                            prelude: RequestPrelude::TabOpened,
+                        },
+                        now,
+                    );
+                }
+                self.dispatch(Intent::ContextChanged { workspace, root }, now)
+            }
             Intent::ContextChanged { workspace, root } => {
                 let Some(workspace) = self.workspaces.iter_mut().find(|w| w.id == workspace) else {
                     return vec![];
                 };
+                if workspace.root == root {
+                    return vec![];
+                }
+                self.context_roots
+                    .entry(workspace.id)
+                    .or_default()
+                    .extend([workspace.root.clone(), root.clone()]);
                 workspace.root = root.clone();
+                workspace.checked = false;
                 workspace.status.reduce(StatusEvent::Reset, now);
                 Self::status_commands(
                     workspace,
@@ -262,3 +360,105 @@ impl WorkspaceStatus {
 #[cfg(test)]
 #[path = "workspace_status_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod tab_context_tests {
+    use super::*;
+
+    #[test]
+    fn tab_context_gap2_late_status_cannot_restore_the_previous_tabs_checkout() {
+        let now = Instant::now();
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add("/tmp/fixture-main".into(), now);
+        model.dispatch(
+            Intent::ContextChanged {
+                workspace,
+                root: "/tmp/fixture-task".into(),
+            },
+            now,
+        );
+        model.dispatch(
+            Intent::Completed(GitStatusSnapshot {
+                tab_id: workspace.0 as usize,
+                repo_path: "/tmp/fixture-main".into(),
+                repo_name: "main".into(),
+                branch_name: "main".into(),
+                is_git_repo: true,
+                staged: vec![],
+                unstaged: vec![],
+                untracked: vec![],
+                error: None,
+            }),
+            now,
+        );
+        assert_eq!(model.workspaces[0].root, PathBuf::from("/tmp/fixture-task"));
+        assert!(!model.workspaces[0].checked);
+        assert!(
+            model
+                .dispatch(
+                    Intent::ContextChanged {
+                        workspace,
+                        root: "/tmp/fixture-task".into()
+                    },
+                    now
+                )
+                .is_empty(),
+            "ordinary same-root tab switches retain the poll cadence"
+        );
+    }
+    #[test]
+    fn tab_context_gap2_git_status_and_poll_clock_return_with_each_session() {
+        let now = Instant::now();
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add("/tmp/fixture-main".into(), now);
+        let first = crate::data::SessionId(41);
+        let second = crate::data::SessionId(42);
+        let first_root = PathBuf::from("/tmp/fixture-main");
+        let second_root = PathBuf::from("/tmp/fixture-task");
+        model.dispatch(
+            Intent::SelectSession {
+                workspace,
+                session: first,
+                root: first_root.clone(),
+            },
+            now,
+        );
+        model.workspaces[0].status.branch_name = "first".into();
+        model.workspaces[0].checked = true;
+        model.workspaces[0].status.git_poll_interval_ms = 8000;
+        model.dispatch(
+            Intent::SelectSession {
+                workspace,
+                session: second,
+                root: second_root.clone(),
+            },
+            now,
+        );
+        assert!(!model.workspaces[0].checked);
+        model.workspaces[0].status.branch_name = "second".into();
+        model.workspaces[0].checked = true;
+        model.dispatch(
+            Intent::SelectSession {
+                workspace,
+                session: first,
+                root: first_root,
+            },
+            now,
+        );
+        assert_eq!(model.workspaces[0].status.branch_name, "first");
+        // Cross-root switches reset cadence, as Iced refresh_panels_for_context does.
+        assert_eq!(
+            model.workspaces[0].status.git_poll_interval_ms,
+            GitStatusState::new("fixture".into(), false, now).git_poll_interval_ms
+        );
+        model.dispatch(
+            Intent::SelectSession {
+                workspace,
+                session: second,
+                root: second_root,
+            },
+            now,
+        );
+        assert_eq!(model.workspaces[0].status.branch_name, "second");
+    }
+}

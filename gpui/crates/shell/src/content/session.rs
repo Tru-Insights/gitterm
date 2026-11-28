@@ -16,6 +16,8 @@ pub(super) struct ViewerVisit {
     pub(super) pane: String,
     session: Option<SessionId>,
     line: Option<usize>,
+    review: Option<Entity<gitterm_gpui_review::ReviewView>>,
+    file: Option<FileOpen>,
 }
 
 fn page_pane_id(workspace: WorkspaceId) -> String {
@@ -31,6 +33,235 @@ enum AggregateReview {
 }
 
 impl Shell {
+    pub(crate) fn workspace_mut_for_context(
+        &mut self,
+        workspace: WorkspaceId,
+    ) -> &mut crate::WorkspaceDock {
+        self.workspaces
+            .iter_mut()
+            .find(|state| state.workspace.id == workspace)
+            .unwrap()
+    }
+
+    /// Iced launch_session_tab reads current_dir, including Files browsing,
+    /// without following an agent into its derived panel root.
+    pub(crate) fn session_working_directory(
+        &self,
+        workspace: WorkspaceId,
+        cx: &App,
+    ) -> Option<std::path::PathBuf> {
+        let state = self
+            .workspaces
+            .iter()
+            .find(|state| state.workspace.id == workspace)?;
+        let id = state.active_session?;
+        let pane = state.panes.get(&crate::session_pane_id(id))?.read(cx);
+        let terminal_dir = pane
+            .terminal_saved_dir
+            .clone()
+            .or_else(|| pane.task_folder(cx));
+        if let Some(tab) = self.owner.read(cx).model.session_contexts.get(&id) {
+            return terminal_dir
+                .filter(|dir| Some(dir) != tab.terminal_dir.as_ref())
+                .or_else(|| Some(tab.cwd.clone()));
+        }
+        terminal_dir.or_else(|| pane.imported_tab.as_ref().map(|tab| tab.dir.clone().into()))
+    }
+
+    /// Iced TabSelect + refresh_panels_for_context: switch only the tab's
+    /// navigation state; retain workspace geometry and global preferences.
+    pub(crate) fn activate_session_context(
+        &mut self,
+        workspace: WorkspaceId,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.workspace(workspace).active_session;
+        if let Some(previous) = previous
+            && let Some(pane) = self
+                .workspace(workspace)
+                .panes
+                .get(&crate::session_pane_id(previous))
+                .cloned()
+        {
+            let reported = {
+                let pane = pane.read(cx);
+                pane.terminal_saved_dir
+                    .clone()
+                    .or_else(|| pane.task_folder(cx))
+            };
+            let cwd = self.owner.update(cx, |owner, _| {
+                let tab = owner.model.session_contexts.get_mut(&previous)?;
+                if let Some(reported) = reported
+                    && Some(&reported) != tab.terminal_dir.as_ref()
+                {
+                    tab.cwd = reported;
+                }
+                tab.terminal_dir = Some(tab.cwd.clone());
+                Some(tab.cwd.clone())
+            });
+            if let Some(cwd) = cwd {
+                pane.update(cx, |pane, _| pane.terminal_saved_dir = Some(cwd));
+            }
+        }
+        let state = self.workspace_mut_for_context(workspace);
+        if let Some(previous) = previous {
+            state
+                .store
+                .regions
+                .session_modes
+                .insert(previous, state.store.regions.sidebar_mode);
+        }
+        state.store.regions.sidebar_mode = state
+            .store
+            .regions
+            .session_modes
+            .get(&id)
+            .copied()
+            .unwrap_or_default();
+        let pane = state.panes.get(&crate::session_pane_id(id)).cloned();
+        let saved_tab = pane
+            .as_ref()
+            .and_then(|pane| pane.read(cx).imported_tab.clone())
+            .or_else(|| {
+                let owner = self.owner.read(cx);
+                let saved = owner.iced_workspace(workspace)?;
+                owner
+                    .iced_sessions(saved)
+                    .iter()
+                    .position(|session| session.id == id)
+                    .and_then(|i| saved.tabs.get(i))
+                    .cloned()
+            });
+        let cwd = pane
+            .as_ref()
+            .and_then(|pane| {
+                let pane = pane.read(cx);
+                pane.terminal_saved_dir
+                    .clone()
+                    .or_else(|| pane.task_folder(cx))
+            })
+            .or_else(|| saved_tab.as_ref().map(|tab| tab.dir.clone().into()))
+            .or_else(|| self.data.terminal_cwd(workspace, cx));
+        let task = self.session_task(id, cx);
+        let task_root = task
+            .as_ref()
+            .and_then(|id| {
+                self.task_records(cx)
+                    .into_iter()
+                    .find(|task| &task.task_id == id)
+            })
+            .and_then(|task| task.worktree.path)
+            .filter(|path| path.is_dir());
+        if let Some(cwd) = cwd {
+            let repo = saved_tab
+                .as_ref()
+                .and_then(|tab| tab.repo_dir.clone())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| cwd.clone());
+            self.owner.update(cx, |owner, cx| {
+                let tab = owner.model.session_contexts.entry(id).or_insert_with(|| {
+                    crate::data::SessionContext {
+                        terminal_dir: Some(cwd.clone()),
+                        cwd,
+                        repo,
+                        task_root: None,
+                        task_context: false,
+                        panel_repo: None,
+                        follow: Default::default(),
+                        observed_events: 0,
+                        follow_listing: false,
+                        follow_pending: Vec::new(),
+                    }
+                });
+                tab.task_root = task_root;
+                tab.task_context = task.is_some();
+                let root = tab.panel_root();
+                owner.dispatch(
+                    crate::workspace_status::Intent::SelectSession {
+                        workspace,
+                        session: id,
+                        root,
+                    },
+                    std::time::Instant::now(),
+                    cx,
+                );
+                cx.notify();
+            });
+        }
+        self.selected_files.remove(&workspace);
+        self.content.update(cx, |content, cx| {
+            content.visits.activate(workspace, Some(id));
+            cx.notify();
+        });
+        if let Some(file) = self
+            .content
+            .read(cx)
+            .visits
+            .get(&workspace)
+            .and_then(|visit| visit.file.clone())
+        {
+            self.selected_files.insert(workspace, file);
+        }
+        if let Some(visit) = self.content.read(cx).visits.get(&workspace).cloned()
+            && let Some(review) = visit.review
+            && let Some(pane) = self.workspace(workspace).panes.get(&visit.pane)
+        {
+            pane.update(cx, |pane, _| {
+                pane.content = pane::PaneContent::Review(review.clone())
+            });
+            self.owner.update(cx, |owner, cx| {
+                owner.reviews.insert(workspace, review);
+                owner.reload_review(workspace, cx);
+            });
+        }
+    }
+
+    fn tab_viewer_pane_id(&self, workspace: WorkspaceId, base: String, cx: &App) -> String {
+        let session = self.workspace(workspace).active_session;
+        let suffix = format!("{base}-session-{}", session.map(|id| id.0).unwrap_or(0));
+        let visits = &self.content.read(cx).visits;
+        if visits
+            .get(&workspace)
+            .is_some_and(|visit| visit.pane == suffix)
+            || visits
+                .values()
+                .any(|visit| visit.session != session && visit.pane == base)
+        {
+            suffix
+        } else {
+            base
+        }
+    }
+
+    pub(crate) fn session_viewer_pane(&self, workspace: WorkspaceId, cx: &App) -> Option<String> {
+        self.content
+            .read(cx)
+            .visits
+            .get(&workspace)
+            .map(|visit| visit.pane.clone())
+    }
+
+    pub(crate) fn session_worktree_follow(
+        &self,
+        cx: &App,
+    ) -> Option<crate::session_strip::WorktreeFollow> {
+        let workspace = self.active_workspace(cx)?;
+        let id = self
+            .workspaces
+            .iter()
+            .find(|state| state.workspace.id == workspace)?
+            .active_session?;
+        let follow = &self.owner.read(cx).model.session_contexts.get(&id)?.follow;
+        let active = follow.active.as_ref()?;
+        Some(crate::session_strip::WorktreeFollow {
+            following: follow.follow,
+            path: active.path.clone(),
+            label: follow.label.clone(),
+            branch: active.branch.clone(),
+        })
+    }
+
     /// Iced `open_page_in_store`: show a PR or issue in the workspace's
     /// embedded Page, in GPUI's own copy of the selected login store.
     pub(crate) fn open_page(
@@ -53,7 +284,7 @@ impl Shell {
             .visits
             .get(&workspace)
             .map(|visit| visit.session);
-        let id = page_pane_id(workspace);
+        let id = self.tab_viewer_pane_id(workspace, page_pane_id(workspace), cx);
         let (content, data) = (self.content.clone(), self.data.clone());
         let state = self
             .workspaces
@@ -102,6 +333,8 @@ impl Shell {
                     pane: id.clone(),
                     session,
                     line: None,
+                    review: None,
+                    file: None,
                 },
             );
             cx.notify();
@@ -210,6 +443,14 @@ impl Shell {
             AggregateReview::Edit(open) => &open.target.checkout,
         };
         let host = self.review_host(workspace, cx);
+        let id = self.tab_viewer_pane_id(
+            workspace,
+            format!(
+                "{}-branch-review",
+                crate::content_pane_id(workspace, checkout)
+            ),
+            cx,
+        );
         let Some(state) = self
             .workspaces
             .iter_mut()
@@ -225,10 +466,6 @@ impl Shell {
             .map(|visit| visit.session)
             .unwrap_or(state.active_session);
         // Keep branch review separate from the workspace's status-driven review.
-        let id = format!(
-            "{}-branch-review",
-            crate::content_pane_id(workspace, checkout)
-        );
         let pane = state
             .panes
             .entry(id.clone())
@@ -276,6 +513,8 @@ impl Shell {
                     pane: id.clone(),
                     session,
                     line: None,
+                    review: None,
+                    file: None,
                 },
             );
             cx.notify();
@@ -359,11 +598,12 @@ impl Shell {
     ) {
         self.open_file_viewer(event, window, cx);
         self.content.update(cx, |content, cx| {
-            if let Some(visit) = content
-                .visits
-                .get_mut(&event.workspace)
-                .filter(|visit| visit.pane == crate::content_pane_id(event.workspace, &event.path))
-            {
+            if let Some(visit) = content.visits.get_mut(&event.workspace).filter(|visit| {
+                visit
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.path == event.path)
+            }) {
                 visit.line = line;
             }
             cx.notify();
@@ -396,6 +636,26 @@ impl Shell {
         if event.from_files {
             self.open_viewer_file(event, window, cx);
         } else {
+            // The status review's pane is shared by the dock, but its body is
+            // tab-owned, just as Iced keeps the diff state on TabState.
+            let key = format!("workspace-{}-review", state.workspace.layout_key);
+            let covered = self
+                .content
+                .read(cx)
+                .visits
+                .get(&event.workspace)
+                .is_some_and(|visit| visit.pane == key);
+            if !covered && let Some(pane) = state.panes.get(&key).cloned() {
+                let review = cx
+                    .new(|cx| gitterm_gpui_review::ReviewView::new(Default::default(), window, cx));
+                pane.update(cx, |pane, _| {
+                    pane.content = pane::PaneContent::Review(review.clone())
+                });
+                self.owner.update(cx, |owner, cx| {
+                    owner.reviews.insert(event.workspace, review);
+                    owner.reload_review(event.workspace, cx);
+                });
+            }
             self.open_review(event, window, cx);
         }
         let state = self
@@ -404,11 +664,19 @@ impl Shell {
             .find(|w| w.workspace.id == event.workspace)
             .unwrap();
         let id = if event.from_files {
-            crate::content_pane_id(event.workspace, &event.path)
+            self.tab_viewer_pane_id(
+                event.workspace,
+                crate::content_pane_id(event.workspace, &event.path),
+                cx,
+            )
         } else {
             format!("workspace-{}-review", state.workspace.layout_key)
         };
         if state.panes.contains_key(&id) {
+            let review = match &state.panes[&id].read(cx).content {
+                pane::PaneContent::Review(view) => Some(view.clone()),
+                _ => None,
+            };
             self.content.update(cx, |content, cx| {
                 content.visits.insert(
                     event.workspace,
@@ -416,6 +684,8 @@ impl Shell {
                         pane: id,
                         session,
                         line: None,
+                        review,
+                        file: Some(event.clone()),
                     },
                 );
                 cx.notify();
@@ -437,6 +707,11 @@ impl Shell {
         }
         // Agent configuration files live in the agent's home config folder.
         let agent_root = self.agent_file_root(event.workspace, &event.path, cx);
+        let id = self.tab_viewer_pane_id(
+            event.workspace,
+            crate::content_pane_id(event.workspace, &event.path),
+            cx,
+        );
         let Some(state) = self
             .workspaces
             .iter_mut()
@@ -449,17 +724,28 @@ impl Shell {
         let root = self
             .owner
             .read(cx)
-            .iced_workspace(event.workspace)
-            .and_then(|saved| {
-                saved
-                    .repos
-                    .iter()
-                    .map(std::path::PathBuf::from)
-                    .chain(std::iter::once(
-                        std::path::PathBuf::from(&saved.dir).join("docs"),
-                    ))
-                    .filter(|root| event.path.starts_with(root))
-                    .max_by_key(|root| root.components().count())
+            .model
+            .workspaces
+            .iter()
+            .find(|local| {
+                local.id == event.workspace && !local.remote && event.path.starts_with(&local.root)
+            })
+            .map(|local| local.root.clone())
+            .or_else(|| {
+                self.owner
+                    .read(cx)
+                    .iced_workspace(event.workspace)
+                    .and_then(|saved| {
+                        saved
+                            .repos
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .chain(std::iter::once(
+                                std::path::PathBuf::from(&saved.dir).join("docs"),
+                            ))
+                            .filter(|root| event.path.starts_with(root))
+                            .max_by_key(|root| root.components().count())
+                    })
             })
             // The shared guidelines file lives in Iced's config dir, not a
             // workspace root; only that one file is opened from there.
@@ -483,7 +769,6 @@ impl Shell {
             });
             return;
         };
-        let id = crate::content_pane_id(event.workspace, &event.path);
         if !state.panes.contains_key(&id) {
             let pane = cx.new(|cx| {
                 Pane::new(
@@ -545,7 +830,13 @@ impl Shell {
         else {
             return;
         };
-        if let Some(pane) = state.panes.get(&visit.pane).cloned() {
+        let retained = self
+            .content
+            .read(cx)
+            .visits
+            .values()
+            .any(|other| other.pane == visit.pane);
+        if !retained && let Some(pane) = state.panes.get(&visit.pane).cloned() {
             state
                 .dock
                 .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
@@ -748,7 +1039,49 @@ impl Shell {
     }
 }
 
-pub(super) type ViewerVisits = HashMap<WorkspaceId, ViewerVisit>;
+/// The active cover plus covers retained by hidden tabs. The workspace-facing
+/// map keeps existing content routing independent of tab identity.
+#[derive(Default)]
+pub(super) struct ViewerVisits {
+    visible: HashMap<WorkspaceId, ViewerVisit>,
+    hidden: HashMap<(WorkspaceId, Option<SessionId>), ViewerVisit>,
+}
+impl std::ops::Deref for ViewerVisits {
+    type Target = HashMap<WorkspaceId, ViewerVisit>;
+    fn deref(&self) -> &Self::Target {
+        &self.visible
+    }
+}
+impl std::ops::DerefMut for ViewerVisits {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.visible
+    }
+}
+impl ViewerVisits {
+    pub(crate) fn activate(&mut self, workspace: WorkspaceId, session: Option<SessionId>) {
+        if self
+            .visible
+            .get(&workspace)
+            .is_some_and(|visit| visit.session == session)
+        {
+            return;
+        }
+        if let Some(visit) = self.visible.remove(&workspace) {
+            self.hidden.insert((workspace, visit.session), visit);
+        }
+        if let Some(visit) = self.hidden.remove(&(workspace, session)) {
+            self.visible.insert(workspace, visit);
+        }
+    }
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&WorkspaceId, &mut ViewerVisit) -> bool) {
+        self.visible.retain(&mut keep);
+        self.hidden
+            .retain(|(workspace, _), visit| keep(workspace, visit));
+    }
+    pub(crate) fn values(&self) -> impl Iterator<Item = &ViewerVisit> {
+        self.visible.values().chain(self.hidden.values())
+    }
+}
 
 /// The review sends an overlay against Iced. Reconstitute this pane's desired
 /// marks before applying its edits to the latest shared file.
@@ -804,5 +1137,317 @@ mod marks_tests {
             ViewedMarks::load(dir.path()).unwrap().checkouts["/tmp/checkout"],
             std::collections::BTreeMap::from([("iced".into(), "hash".into())])
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_context_tests {
+    use super::*;
+    use crate::{
+        WorkspaceOwner, data::LocalData, layout::SidebarMode, workspace_status::WorkspaceStatus,
+    };
+    use ::core::prelude::v1::test;
+    use std::{path::Path, rc::Rc, time::Instant};
+
+    fn fixture(
+        folder: &Path,
+        config: &Path,
+        window: &mut Window,
+        cx: &mut Context<Shell>,
+    ) -> Shell {
+        let mut model = WorkspaceStatus::default();
+        model.add(folder.to_path_buf(), Instant::now());
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let mut shell = Shell::with_owner(
+            Rc::new(LocalData(owner.clone())),
+            owner,
+            config,
+            true,
+            window,
+            cx,
+        )
+        .unwrap();
+        shell.new_terminal(window, cx);
+        shell
+    }
+
+    #[gpui::test]
+    fn tab_context_gap1_switching_restores_file_and_diff_covers(cx: &mut TestAppContext) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(root.join("file.txt"), "fixture").unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| fixture(&root, config.path(), window, cx));
+        let first = cx.read(|cx| shell.read(cx).active(cx).active_session.unwrap());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.select_session_id(first, window, cx);
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace: WorkspaceId(1),
+                        path: root.join("file.txt"),
+                        from_files: true,
+                        changed: None,
+                    },
+                    window,
+                    cx,
+                );
+                shell.new_terminal(window, cx);
+            })
+        });
+        let second = cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert!(shell.session_viewer_pane(WorkspaceId(1), cx).is_none());
+            shell.active(cx).active_session.unwrap()
+        });
+        assert_ne!(first, second);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace: WorkspaceId(1),
+                        path: root.join("file.txt"),
+                        from_files: true,
+                        changed: None,
+                    },
+                    window,
+                    cx,
+                );
+                assert_ne!(
+                    shell.session_viewer_pane(WorkspaceId(1), cx),
+                    Some(crate::content_pane_id(
+                        WorkspaceId(1),
+                        &root.join("file.txt")
+                    ))
+                );
+                shell.close_file_viewer(WorkspaceId(1), window, cx);
+            })
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace: WorkspaceId(1),
+                        path: root.join("file.txt"),
+                        from_files: false,
+                        changed: Some(crate::data::ChangedFile {
+                            path: "file.txt".into(),
+                            status: "M".into(),
+                            staged: false,
+                        }),
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        let diff = cx.read(|cx| {
+            shell.read(cx).content.read(cx).visits[&WorkspaceId(1)]
+                .review
+                .as_ref()
+                .unwrap()
+                .entity_id()
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.select_session_id(first, window, cx))
+        });
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let id = crate::content_pane_id(WorkspaceId(1), &root.join("file.txt"));
+            assert_eq!(
+                shell.session_viewer_pane(WorkspaceId(1), cx),
+                Some(id.clone())
+            );
+            assert_eq!(shell.content.read(cx).selected, Some(id));
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.select_session_id(second, window, cx))
+        });
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(
+                shell.content.read(cx).visits[&WorkspaceId(1)]
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .entity_id(),
+                diff
+            );
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.select_session_id(first, window, cx);
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace: WorkspaceId(1),
+                        path: root.join("file.txt"),
+                        from_files: false,
+                        changed: Some(crate::data::ChangedFile {
+                            path: "file.txt".into(),
+                            status: "M".into(),
+                            staged: false,
+                        }),
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        let first_diff = cx.read(|cx| {
+            shell.read(cx).content.read(cx).visits[&WorkspaceId(1)]
+                .review
+                .as_ref()
+                .unwrap()
+                .entity_id()
+        });
+        assert_ne!(first_diff, diff);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.select_session_id(second, window, cx);
+                shell.close_file_viewer(WorkspaceId(1), window, cx);
+                shell.select_session_id(first, window, cx);
+            })
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).content.read(cx).visits[&WorkspaceId(1)]
+                    .review
+                    .as_ref()
+                    .unwrap()
+                    .entity_id(),
+                first_diff
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn tab_context_gap2_git_changes_follows_the_selected_checkout(cx: &mut TestAppContext) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let checkout = checkout.path().canonicalize().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| fixture(&root, config.path(), window, cx));
+        let first = cx.read(|cx| shell.read(cx).active(cx).active_session.unwrap());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.select_session_id(first, window, cx);
+                shell.new_terminal_at(
+                    gpui_component::dock::DockPlacement::Center,
+                    Some(checkout.clone()),
+                    window,
+                    cx,
+                );
+            })
+        });
+        let second = cx.read(|cx| {
+            let shell = shell.read(cx);
+            assert_eq!(shell.owner.read(cx).model.workspaces[0].root, checkout);
+            shell.active(cx).active_session.unwrap()
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.select_session_id(first, window, cx))
+        });
+        cx.read(|cx| assert_eq!(shell.read(cx).owner.read(cx).model.workspaces[0].root, root));
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.select_session_id(second, window, cx))
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).owner.read(cx).model.workspaces[0].root,
+                checkout
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn tab_context_gap3_sidebar_mode_is_owned_by_each_tab(cx: &mut TestAppContext) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| fixture(root.path(), config.path(), window, cx));
+        let first = cx.read(|cx| shell.read(cx).active(cx).active_session.unwrap());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.select_session_id(first, window, cx);
+                shell.update_regions(|regions| regions.sidebar_mode = SidebarMode::Files, cx);
+                shell.new_terminal(window, cx);
+            })
+        });
+        let second = cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).active(cx).store.regions.sidebar_mode,
+                SidebarMode::Work
+            );
+            shell.read(cx).active(cx).active_session.unwrap()
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.update_regions(|regions| regions.sidebar_mode = SidebarMode::Git, cx);
+                shell.select_session_id(first, window, cx);
+            })
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).active(cx).store.regions.sidebar_mode,
+                SidebarMode::Files
+            )
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| shell.select_session_id(second, window, cx))
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                shell.read(cx).active(cx).store.regions.sidebar_mode,
+                SidebarMode::Git
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn tab_context_gap4_new_plain_session_inherits_active_working_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let child = root.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let (shell, cx) =
+            cx.add_window_view(|window, cx| fixture(&root, config.path(), window, cx));
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                let first = shell.active(cx).active_session.unwrap();
+                shell.select_session_id(first, window, cx);
+                let pane = shell.active(cx).panes[&crate::session_pane_id(first)].clone();
+                pane.update(cx, |pane, _| pane.terminal_saved_dir = Some(child.clone()));
+                shell.new_terminal(window, cx);
+            })
+        });
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let id = shell.active(cx).active_session.unwrap();
+            assert_eq!(
+                shell.active(cx).panes[&crate::session_pane_id(id)]
+                    .read(cx)
+                    .terminal_cwd
+                    .as_ref(),
+                Some(&child)
+            );
+        });
     }
 }

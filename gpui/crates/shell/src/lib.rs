@@ -1065,13 +1065,18 @@ impl Shell {
         else {
             return;
         };
-        state.active_session = Some(id);
+        let workspace = state.workspace.id;
+        self.activate_session_context(workspace, id, cx);
+        self.workspace_mut_for_context(workspace).active_session = Some(id);
         self.selected_task = self.session_task(id, cx);
         self.remember_context(self.selected_task.clone());
         if let Some(task) = &self.selected_task {
             self.task_last_session.insert(task.clone(), id);
         }
         self.show_pane(&session_pane_id(id), window, cx);
+        if let Some(pane) = self.session_viewer_pane(workspace, cx) {
+            self.show_workspace_pane(workspace, &pane, window, cx);
+        }
         self.load_active_iced_history(window, cx);
     }
     fn new_claude_chat(
@@ -1186,13 +1191,10 @@ impl Shell {
                 return;
             }
             // Iced NewPlainTab falls back to a local plain terminal for legacy SSH.
-            let cwd = self
-                .active(cx)
-                .active_session
-                .and_then(|id| self.active(cx).panes.get(&session_pane_id(id)))
-                .and_then(|pane| pane.read(cx).task_folder(cx))
-                .unwrap_or_else(|| saved.dir.clone().into());
             let workspace = self.active(cx).workspace.id;
+            let cwd = self
+                .session_working_directory(workspace, cx)
+                .unwrap_or_else(|| saved.dir.clone().into());
             self.new_terminal_at(DockPlacement::Center, Some(cwd), window, cx);
             self.persist_remote_tabs(workspace, cx);
             return;
@@ -1257,12 +1259,19 @@ impl Shell {
             .iter()
             .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
             .collect();
+        let inherited = (placement == DockPlacement::Center && launch.is_none())
+            .then(|| self.session_working_directory(workspace, cx))
+            .flatten();
+        let previous = self.workspace(workspace).active_session;
         let state = self
             .workspaces
             .iter_mut()
             .find(|w| w.workspace.id == workspace)
             .unwrap();
-        let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
+        let Some(cwd) = cwd
+            .or(inherited)
+            .or_else(|| self.data.terminal_cwd(state.workspace.id, cx))
+        else {
             self.owner.update(cx, |owner, cx| {
                 owner.error =
                     Some("Remote workspace sessions are read-only in this preview".into());
@@ -1391,6 +1400,11 @@ impl Shell {
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
             None => {}
+        }
+        if placement == DockPlacement::Center {
+            self.workspace_mut_for_context(workspace).active_session = previous;
+            self.activate_session_context(workspace, SessionId(id), cx);
+            self.workspace_mut_for_context(workspace).active_session = Some(SessionId(id));
         }
         if self.workspace(workspace).on_bar() {
             self.show_workspace_pane(workspace, &pane_id, window, cx);
@@ -2656,7 +2670,7 @@ impl Shell {
                 .unwrap_or_default(),
             pulse_bright: false,
             mic: self.dictation_indicator(cx),
-            worktree_follow: None,
+            worktree_follow: self.session_worktree_follow(cx),
         }
     }
     fn spine(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {

@@ -592,3 +592,124 @@ fn files_hidden_entries_follow_saved_show_hidden_setting(cx: &mut TestAppContext
         );
     }
 }
+
+#[gpui::test]
+fn tab_context_gap3_files_directory_and_selection_return_with_the_tab(cx: &mut TestAppContext) {
+    let _app = crate::test_app::Cleanup::new(cx);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("child")).unwrap();
+    fs::write(root.path().join("child/file.txt"), "fixture").unwrap();
+    let (view, owner, cx) = setup(cx, root.path(), config.path());
+    let first = crate::data::SessionId(41);
+    let second = crate::data::SessionId(42);
+    let workspace = crate::data::WorkspaceId(1);
+    owner.update(cx, |owner, cx| {
+        for id in [first, second] {
+            owner.model.session_contexts.insert(
+                id,
+                crate::data::SessionContext {
+                    cwd: root.path().into(),
+                    terminal_dir: Some(root.path().into()),
+                    repo: root.path().into(),
+                    task_root: None,
+                    task_context: false,
+                    panel_repo: None,
+                    follow: Default::default(),
+                    observed_events: 0,
+                    follow_listing: false,
+                    follow_pending: Vec::new(),
+                },
+            );
+        }
+        owner.model.active_sessions.insert(workspace, first);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        view.navigate(root.path().join("child"), cx);
+        view.selected_file = Some(root.path().join("child/file.txt"));
+    });
+    owner.update(cx, |owner, cx| {
+        assert_eq!(
+            owner.model.session_contexts[&first].cwd,
+            root.path().join("child")
+        );
+        owner.model.active_sessions.insert(workspace, second);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.directory, root.path());
+        assert!(view.selected_file.is_none());
+    });
+    owner.update(cx, |owner, cx| {
+        owner.model.active_sessions.insert(workspace, first);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.directory, root.path().join("child"));
+        assert_eq!(view.selected_file, Some(root.path().join("child/file.txt")));
+    });
+}
+
+#[gpui::test]
+fn tab_context_gap3_directory_uses_v6_dir_in_live_and_never_writes_source_in_preview(
+    cx: &mut TestAppContext,
+) {
+    let _app = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let repo = root.path().join("repo");
+    let child = repo.join("child");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir_all(&child).unwrap();
+    let document = serde_json::json!({
+        "future_document": true, "active_workspace": 0,
+        "workspaces": [{ "name": "Fixture", "abbrev": "F", "color": "blue", "dir": repo,
+            "future_workspace": 7, "tabs": [{"dir": repo, "repo_dir": repo, "session_uid": "fixture-caller", "future_tab": "kept"}] }]
+    });
+    let path = source.join("workspaces.json");
+    fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let catalog = crate::workspace_config::IcedCatalog::read(&source).unwrap();
+    let model = WorkspaceStatus::from_iced(&catalog);
+    let workspace = crate::data::WorkspaceId(1);
+    let mut store = WorkspaceStore::new(&root.path().join("preview"));
+    store.iced = Some(catalog);
+    let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+    let (view, cx) = cx
+        .add_window_view(|_, cx| FilesView::new(workspace, Rc::new(LocalData(owner.clone())), cx));
+    cx.run_until_parked();
+    // Browsing in Preview changes the runtime tab without touching Iced's bytes.
+    view.update(cx, |view, cx| view.navigate(child.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    view.update(cx, |view, cx| view.navigate(repo.clone(), cx));
+    let desktop = gitterm_core::desktop_store::DesktopStore::open(&source).unwrap();
+    cx.update(|_, cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
+    view.update(cx, |view, cx| view.navigate(child.clone(), cx));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if saved["workspaces"][0]["tabs"][0]["dir"] == child.to_str().unwrap() {
+            assert_eq!(saved["future_document"], true);
+            assert_eq!(saved["workspaces"][0]["future_workspace"], 7);
+            assert_eq!(saved["workspaces"][0]["tabs"][0]["future_tab"], "kept");
+            assert_eq!(
+                saved["workspaces"][0]["tabs"][0]["repo_dir"],
+                repo.to_str().unwrap()
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "directory save did not finish");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|_, cx| {
+        cx.remove_global::<crate::workspace_config::LiveWorkspaces>();
+    });
+}

@@ -197,7 +197,7 @@ impl ContentWindow {
         });
         Self {
             entries: HashMap::new(),
-            visits: HashMap::new(),
+            visits: Default::default(),
             selected: None,
             covered: [false; 3],
             picker: false,

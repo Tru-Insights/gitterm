@@ -114,3 +114,5 @@ pub mod desktop_store;
 pub mod editor;
 
 pub mod terminal;
+
+pub mod worktree_follow;
