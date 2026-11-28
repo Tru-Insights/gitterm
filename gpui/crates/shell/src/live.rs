@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,7 +147,7 @@ fn admit_with_progress(
     root: &Path,
     prefs: &Path,
     backup_parent: &Path,
-    progress: Option<&Arc<Mutex<ActivationProgress>>>,
+    progress: Option<&Arc<ActivationProgress>>,
 ) -> Result<Admission> {
     let checked = crate::lifetime::Lifetime::check_live(root)?;
     let root = checked.lock.root();
@@ -159,10 +162,9 @@ fn admit_with_progress(
     gitterm_core::tasks::TaskStore::load(root.join("tasks.json"))?;
     let old = read_activation(&prefs)?;
     let old = old.filter(|a| a.root == root);
-    let created = old.is_none();
-    let backup = if let Some(recorded) = old {
+    let (backup, created) = if let Some(recorded) = old {
         backup::verify(&recorded.backup, root).context("verify recorded Live backup")?;
-        recorded.backup
+        (recorded.backup, None)
     } else {
         if !backup_parent.exists() {
             let mut builder = std::fs::DirBuilder::new();
@@ -175,37 +177,26 @@ fn admit_with_progress(
                 .create(backup_parent)
                 .context("create Live backup directory")?;
         }
-        backup::create_with_progress(root, backup_parent, true, |a, b, c, d| {
+        let created = backup::create_with_progress(root, backup_parent, true, |a, b, c, d| {
             if let Some(progress) = progress {
-                let mut progress = progress.lock().unwrap();
-                progress.counts = (a, b, c, d);
-                if progress.cancel {
+                *progress.counts.lock().unwrap() = (a, b, c, d);
+                if progress.phase.load(Ordering::SeqCst) == CANCELLED {
                     return ControlFlow::Break(());
                 }
             }
             ControlFlow::Continue(())
         })
-        .context("create verified Live backup")?
+        .context("create verified Live backup")?;
+        (created.path().to_owned(), Some(created))
     };
     let activation = Activation {
         root: root.to_owned(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         backup,
     };
-    // Serialize the final activation record with a quit cancellation request.
-    // Once this short commit starts, there is no partial backup left to cancel.
-    let progress = progress.map(|progress| progress.lock().unwrap());
-    if progress.as_ref().is_some_and(|p| p.cancel) {
-        if created {
-            std::fs::remove_dir_all(&activation.backup).with_context(|| {
-                format!("remove cancelled backup {}", activation.backup.display())
-            })?;
-        }
-        anyhow::bail!("V6 backup cancelled");
-    }
-    // A record failure can happen after rename (e.g. directory fsync failure).
-    // Retain a completed backup in that case, so published prefs cannot dangle.
-    record(&prefs, &activation).context("record GPUI activation after verified backup")?;
+    finish_activation(progress, created, || {
+        record(&prefs, &activation).context("record GPUI activation after verified backup")
+    })?;
     Ok(Admission {
         checked,
         store,
@@ -213,10 +204,35 @@ fn admit_with_progress(
         activation,
     })
 }
+fn finish_activation(
+    progress: Option<&Arc<ActivationProgress>>,
+    created: Option<backup::CreatedBackup>,
+    record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Atomically order cancellation and commit without holding a progress lock
+    // across cleanup or the activation record's potentially slow full fsyncs.
+    if progress.is_some_and(|progress| {
+        progress
+            .phase
+            .compare_exchange(COPYING, COMMITTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    }) {
+        if let Some(created) = created {
+            let path = created.path().to_owned();
+            created
+                .remove()
+                .with_context(|| format!("remove cancelled backup {}", path.display()))?;
+        }
+        anyhow::bail!("V6 backup cancelled");
+    }
+    // A record failure can happen after rename (e.g. directory fsync failure).
+    // Retain a completed backup in that case, so published prefs cannot dangle.
+    record()
+}
 pub(crate) fn prepare() -> Result<Admission> {
     prepare_with_progress(None)
 }
-fn prepare_with_progress(progress: Option<&Arc<Mutex<ActivationProgress>>>) -> Result<Admission> {
+fn prepare_with_progress(progress: Option<&Arc<ActivationProgress>>) -> Result<Admission> {
     let root = selected_root()?;
     let backup_parent = root
         .parent()
@@ -231,12 +247,28 @@ const QUIT_BACKUP: &str =
 
 #[derive(Default)]
 struct ActivationProgress {
-    counts: (u64, u64, u64, u64),
-    cancel: bool,
+    counts: Mutex<(u64, u64, u64, u64)>,
+    phase: AtomicU8,
+}
+const COPYING: u8 = 0;
+const CANCELLED: u8 = 1;
+const COMMITTING: u8 = 2;
+impl ActivationProgress {
+    fn request_cancel(&self) {
+        let _ = self
+            .phase
+            .compare_exchange(COPYING, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    fn text(&self) -> Option<String> {
+        self.counts
+            .try_lock()
+            .ok()
+            .map(|counts| progress_text(*counts))
+    }
 }
 #[derive(Clone)]
 struct RunningActivation {
-    progress: Arc<Mutex<ActivationProgress>>,
+    progress: Arc<ActivationProgress>,
     window: gpui::WindowHandle<ActivationMessage>,
 }
 #[derive(Default)]
@@ -305,7 +337,7 @@ pub(crate) fn install_activation(cx: &mut gpui::App) {
                 return;
             }
         };
-        let progress = Arc::new(Mutex::new(ActivationProgress::default()));
+        let progress = Arc::new(ActivationProgress::default());
         cx.global_mut::<ActivationState>().running = Some(RunningActivation {
             progress: progress.clone(),
             window,
@@ -325,7 +357,9 @@ pub(crate) fn install_activation(cx: &mut gpui::App) {
                     {
                         return false;
                     }
-                    let text = progress_text(observed.lock().unwrap().counts);
+                    let Some(text) = observed.text() else {
+                        return true;
+                    };
                     let _ = window.update(cx, |view, _, cx| {
                         view.0 = text;
                         cx.notify();
@@ -420,7 +454,7 @@ pub(crate) fn defer_quit_for_backup(cx: &mut gpui::App) -> bool {
                     state.prompt_pending = false;
                     if quit {
                         if let Some(running) = &state.running {
-                            running.progress.lock().unwrap().cancel = true;
+                            running.progress.request_cancel();
                             state.quit_confirmed = true;
                         } else {
                             // Completion raced the native prompt: use normal shutdown.
@@ -463,7 +497,7 @@ mod tests {
     #[gpui::test]
     fn quit_during_backup_prompts_and_cancel_keeps_running(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let progress = Arc::new(Mutex::new(ActivationProgress::default()));
+        let progress = Arc::new(ActivationProgress::default());
         cx.update(|cx| {
             let window = open_progress(cx).unwrap();
             cx.set_global(ActivationState {
@@ -480,21 +514,78 @@ mod tests {
         assert_eq!(cx.pending_prompt().unwrap().0, QUIT_BACKUP);
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
-        assert!(!progress.lock().unwrap().cancel);
+        assert_eq!(progress.phase.load(Ordering::SeqCst), COPYING);
         cx.update(|cx| {
             assert!(cx.global::<ActivationState>().running.is_some());
             assert!(!cx.global::<ActivationState>().prompt_pending);
             crate::lifetime::quit(cx);
         });
         assert!(cx.has_pending_prompt());
+        let _held_counts = progress.counts.lock().unwrap();
+        assert!(progress.text().is_none());
         cx.simulate_prompt_answer("Quit Anyway");
         cx.run_until_parked();
-        assert!(progress.lock().unwrap().cancel);
+        assert_eq!(progress.phase.load(Ordering::SeqCst), CANCELLED);
         cx.update(|cx| {
             // Shutdown waits for the backup worker to acknowledge and clean up.
             assert!(cx.global::<ActivationState>().running.is_some());
             assert!(cx.global::<ActivationState>().quit_confirmed);
         });
+    }
+
+    #[test]
+    fn slow_activation_record_leaves_progress_readable_and_orders_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let prefs = base.join("gpui/live-activation.json");
+        let progress = Arc::new(ActivationProgress::default());
+        let observed = progress.clone();
+        let (began, begun) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            finish_activation(Some(&progress), None, || {
+                // Simulate slow filesystem work at the record's full fsync.
+                assert!(progress.counts.try_lock().is_ok());
+                began.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                record(
+                    &prefs,
+                    &Activation {
+                        root: base.join("v6"),
+                        app_version: "fixture".into(),
+                        backup: base.join("backup"),
+                    },
+                )
+            })
+        });
+        begun
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(observed.text().is_some());
+        observed.request_cancel();
+        assert_eq!(observed.phase.load(Ordering::SeqCst), COMMITTING);
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+
+        let root = temp.path().join("v6");
+        let backups = temp.path().join("backups");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&backups).unwrap();
+        let created = backup::create_with_progress(&root, &backups, true, |_, _, _, _| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        let progress = Arc::new(ActivationProgress::default());
+        progress.request_cancel();
+        let error = finish_activation(Some(&progress), Some(created), || {
+            panic!("record after cancellation")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(std::fs::read_dir(backups).unwrap().count(), 0);
+        assert!(progress.text().is_some());
     }
 
     #[test]
@@ -505,10 +596,10 @@ mod tests {
         std::fs::write(root.join("settings.json"), b"{}").unwrap();
         let prefs = temp.path().join("gpui/live-activation.json");
         let backups = temp.path().join("backups");
-        let progress = Arc::new(Mutex::new(ActivationProgress {
-            cancel: true,
+        let progress = Arc::new(ActivationProgress {
+            phase: AtomicU8::new(CANCELLED),
             ..Default::default()
-        }));
+        });
         let error = admit_with_progress(&root, &prefs, &backups, Some(&progress))
             .err()
             .unwrap();
