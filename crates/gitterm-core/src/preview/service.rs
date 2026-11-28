@@ -378,9 +378,9 @@ impl ServiceContext {
         })
     }
 
-    /// Live admits task/merge-plan writes, guarded PR actions and worker,
-    /// review and consult execution, browser control and HTML previews. Delivery,
-    /// restore and other later-slice effects retain the Preview notices.
+    /// Live admits task/merge-plan writes, guarded PR actions, task execution,
+    /// result delivery, browser control and HTML previews. General restore and
+    /// notify ingress stay closed; current workers have scoped notify admission.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
@@ -600,6 +600,8 @@ impl ServiceContext {
                     | "Queue session"
                     | "Worker notify"
                     | "merge_plan_set"
+                    | "Dismiss delegation"
+                    | "Save delivery"
             );
         let live_task_process = access == Access::Process
             && matches!(
@@ -614,6 +616,8 @@ impl ServiceContext {
                     | "Start queued delegation"
                     | "Start delegation"
                     | "Stop delegation"
+                    | "Automatic delivery"
+                    | "Deliver results"
             );
         let live_pr_action =
             access == Access::Outside && matches!(label, "Approve" | "Merge" | "Ready for review");
@@ -1003,11 +1007,11 @@ mod live_tests {
         assert!(preview.browser_read_only());
         assert!(live.runner(RunnerEffect::HtmlPreview, None).is_ok());
         assert!(preview.runner(RunnerEffect::HtmlPreview, None).is_err());
-        assert!(live.runner(RunnerEffect::AutomaticDelivery, None).is_err());
+        assert!(live.runner(RunnerEffect::AutomaticDelivery, None).is_ok());
     }
 
     #[test]
-    fn gpui_live_keeps_production_identity_but_closes_later_slice_effects() {
+    fn live_pr_integration_keeps_production_identity_but_closes_later_slice_effects() {
         let temp = tempfile::tempdir().unwrap();
         let production = ServiceContext::production(temp.path(), "274").unwrap();
         let live = production.clone().for_gpui_live();
@@ -1037,14 +1041,18 @@ mod live_tests {
         ] {
             assert!(live.authorize(class(label, Access::Process), None).is_ok());
         }
-        for label in ["notify", "Save delivery"] {
-            assert_eq!(
-                live.authorize(class(label, Access::Write), None)
-                    .unwrap_err()
-                    .notice(),
-                preview_notice(label)
-            );
+        for label in ["merge_plan_set", "Dismiss delegation", "Save delivery"] {
+            assert!(live.authorize(class(label, Access::Write), None).is_ok());
         }
+        for label in ["Automatic delivery", "Deliver results"] {
+            assert!(live.authorize(class(label, Access::Process), None).is_ok());
+        }
+        assert_eq!(
+            live.authorize(class("notify", Access::Write), None)
+                .unwrap_err()
+                .notice(),
+            preview_notice("notify")
+        );
         for access in [Access::Write, Access::Process, Access::Outside] {
             let class = Class {
                 label: "Live gated effect",

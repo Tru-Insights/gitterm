@@ -1,14 +1,16 @@
 //! GPUI owns the shared task host on Preview copies or an admitted Live root.
 //!
 //! Live takes its already-locked TaskStore directly, shares one restricted
-//! production service context, and never seeds, reseeds, restores or delivers.
+//! production service context, and never seeds or reseeds. Startup reconciles
+//! saved execution state without adopting its processes; results use core's
+//! delivery reducer and the same chat send path as the composer.
 //! Live workers use core's Iced terminal command and process identity; headless
 //! reviews/consults use core's production Codex environment. A separate worker
 //! tick persists identities, enforces time limits, promotes queues and closes
-//! final workers after identity-checked TERM/grace. Delivery stays closed.
+//! final workers after identity-checked TERM/grace.
 //! Live creates tasks and saves handoffs through core on the locked V6 store.
 //! Live merge plans use the same root and the watch owned by `crate::pr_live`.
-//! Later-slice writes, restore and delivery retain the Preview notices.
+//! Live delivers saved and current results; general process restore stays closed.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
 //! before anything is seeded or bound, the task store is a seeded copy of
@@ -185,8 +187,12 @@ impl HostConfig {
 pub(crate) use gitterm_core::state_lock::StateLock as HostLock;
 
 fn direct_store(lock: &HostLock) -> Result<TaskStore> {
-    TaskStore::load(TaskStore::path_for_config_root(lock.root()))
-        .context("load Live task store directly")
+    gitterm_core::task_host::load_task_store_for_startup(
+        TaskStore::path_for_config_root(lock.root()),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .map(|(store, _)| store)
+    .context("load and reconcile Live task store directly")
 }
 
 /// Iced's file identity for re-seeding: its mtime, `None` while missing.
@@ -282,6 +288,7 @@ pub(crate) struct TaskHostOwner {
     host: TaskHost,
     /// The shell's panes holding task sessions, as last pushed.
     panes: Vec<TaskPane>,
+    pub(crate) terminal_callers: Vec<gitterm_core::delegation_state::Caller>,
     /// Iced's steady-state tab label for each pane folder: `None` while its
     /// background read runs. Held only while a pane has the folder.
     pub(crate) folder_labels: std::collections::HashMap<PathBuf, Option<String>>,
@@ -320,6 +327,9 @@ pub(crate) struct TaskHostOwner {
     pub(crate) delegation_waiting_counts: std::collections::HashMap<String, usize>,
     /// Launched terminals no pane has adopted yet, by task session.
     terminals: std::collections::HashMap<String, launch::HostTerminal>,
+    /// Conversation ownership includes terminals already adopted by a pane.
+    terminal_conversations:
+        std::collections::HashMap<String, gpui::WeakEntity<gitterm_terminal::TerminalView>>,
     /// Every launched task session, adopted or not.
     launched: std::collections::HashMap<String, launch::Launched>,
     /// Runs on a prepared worktree path before its post-preparation recheck.
@@ -342,8 +352,8 @@ pub(crate) struct TaskHostOwner {
     pub(crate) submit_hook: Option<SubmitHook>,
     _pump: Task<()>,
     _reseed: Option<Task<()>>,
-    /// Fixture mode's delivery and queue-promotion tick; none in plain
-    /// preview.
+    /// Live/fixture delivery tick; fixture mode also promotes its queue.
+    /// None in plain Preview.
     _deliver: Option<Task<()>>,
     _workers: Option<Task<()>>,
     /// Failed publications must finish their TERM/KILL grace even at quit.
@@ -597,7 +607,7 @@ impl TaskHostOwner {
                     }
                 })
             });
-            let deliver = (!fixtures.is_empty()).then(|| {
+            let deliver = (live || !fixtures.is_empty()).then(|| {
                 cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
                     loop {
                         cx.background_executor()
@@ -608,8 +618,10 @@ impl TaskHostOwner {
                         if owner
                             .update(cx, |owner, cx| {
                                 owner.deliver_results(cx);
-                                owner.close_final_workers(cx);
-                                owner.promote_queued_tasks(cx);
+                                if !owner.is_live() {
+                                    owner.close_final_workers(cx);
+                                    owner.promote_queued_tasks(cx);
+                                }
                             })
                             .is_err()
                         {
@@ -642,6 +654,7 @@ impl TaskHostOwner {
             Self {
                 host,
                 panes: Vec::new(),
+                terminal_callers: Vec::new(),
                 folder_labels: std::collections::HashMap::new(),
                 roots,
                 plan_limits: live
@@ -669,6 +682,7 @@ impl TaskHostOwner {
                 own_tasks,
                 delegation_waiting_counts: Default::default(),
                 terminals: Default::default(),
+                terminal_conversations: Default::default(),
                 launched: Default::default(),
                 #[cfg(test)]
                 before_recheck: None,
@@ -1011,15 +1025,15 @@ impl TaskHostOwner {
     /// reducer and `record_handoff`, so done/blocked for an open worker
     /// delegation is accepted only from the pane (a chat or a launched
     /// terminal) hosting its task session, then the task's lifecycle
-    /// mirrors it. Iced's tab, attention, parent
-    /// and PR-lookup steps are UI and are not run; the report reaches the
+    /// mirrors it. Live also raises the parent's notification attention;
+    /// PR-lookup remains separate. The report reaches the
     /// parent chat through the delivery tick ([`delivery`]), as in Iced.
     fn update_handoff(
         &mut self,
         request: UpdateTaskHandoffRequest,
         caller: Option<&str>,
         label: &'static str,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
         self.authorize_write(label, &self.task_worktree(&request.task_id))?;
         if !self.host.services().is_preview() {
@@ -1099,6 +1113,17 @@ impl TaskHostOwner {
             if let Some(session) = hosted_session.as_deref() {
                 self.worker_reported_live(session, status == HandoffStatus::Done);
             }
+        }
+        if self.is_live()
+            && let Some(parent) = report_to.as_deref().and_then(|id| {
+                self.host
+                    .store()
+                    .as_ref()?
+                    .delegation(id)
+                    .map(|d| d.parent.session_uid.clone())
+            })
+        {
+            cx.defer(move |cx| crate::notifications::worker_reported(&parent, status, cx));
         }
         let mut value = self.task_value(&task)?;
         value["handoff_status"] = serde_json::Value::String(status.label().to_string());
@@ -2115,12 +2140,19 @@ mod live_tests {
             assert_eq!(owner.host.services().task_mcp().token(), token);
             assert!(!owner.host.services().is_preview());
             assert!(owner._reseed.is_none());
-            assert!(owner._deliver.is_none());
+            assert!(owner._deliver.is_some());
             assert!(owner.fixtures.is_empty());
-            for effect in [
-                gitterm_core::preview::service::RunnerEffect::RestoreSession,
-                gitterm_core::preview::service::RunnerEffect::AutomaticDelivery,
-            ] {
+            assert!(
+                owner
+                    .host
+                    .services()
+                    .runner(
+                        gitterm_core::preview::service::RunnerEffect::AutomaticDelivery,
+                        None
+                    )
+                    .is_ok()
+            );
+            for effect in [gitterm_core::preview::service::RunnerEffect::RestoreSession] {
                 assert!(
                     owner
                         .host

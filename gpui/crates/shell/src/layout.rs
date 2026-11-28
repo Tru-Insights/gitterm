@@ -116,6 +116,13 @@ pub struct TerminalSession {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_session_id: Option<String>,
+    /// Derived from the saved dock tree; never adds bytes to the layout.
+    #[serde(skip)]
+    pub bottom: bool,
 }
 
 pub struct LayoutStore {
@@ -160,12 +167,23 @@ impl LayoutStore {
                 Err(e) => return Err(e.into()),
             };
             let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let layout = value
+                .get("center")
+                .map(|_| serde_json::from_value::<DockAreaState>(value.clone()))
+                .transpose()?;
+            let bottom: HashSet<String> = layout
+                .and_then(|state| state.bottom_dock)
+                .map(|dock| panel_order(dock.panel()).into_iter().collect())
+                .unwrap_or_default();
             let Some(value) = value.get("terminal_sessions") else {
                 return Ok(None);
             };
             let mut sessions: Vec<TerminalSession> = serde_json::from_value(value.clone())?;
             let mut seen = HashSet::new();
             sessions.retain(|session| seen.insert(session.id));
+            for session in &mut sessions {
+                session.bottom = bottom.contains(&format!("session-{}", session.id));
+            }
             ensure!(
                 sessions.iter().all(|s| s.cwd.is_absolute()),
                 "terminal cwd must be absolute"
@@ -404,7 +422,7 @@ fn prune_unknown(
     true
 }
 
-pub fn pane_order(state: &DockAreaState) -> Vec<String> {
+fn panel_order(node: &PanelState) -> Vec<String> {
     fn visit(node: &PanelState, ids: &mut Vec<String>) {
         if let PanelInfo::Panel(value) = &node.info
             && let Some(id) = value.as_str()
@@ -416,12 +434,18 @@ pub fn pane_order(state: &DockAreaState) -> Vec<String> {
         }
     }
     let mut ids = vec![];
-    visit(&state.center, &mut ids);
+    visit(node, &mut ids);
+    ids
+}
+
+pub fn pane_order(state: &DockAreaState) -> Vec<String> {
+    let mut ids = vec![];
+    ids.extend(panel_order(&state.center));
     for dock in [&state.left_dock, &state.right_dock, &state.bottom_dock]
         .into_iter()
         .flatten()
     {
-        visit(dock.panel(), &mut ids);
+        ids.extend(panel_order(dock.panel()));
     }
     ids
 }
@@ -534,6 +558,9 @@ mod tests {
             startup_command: Some("codex".into()),
             task_id: Some("task-1".into()),
             task_session_id: Some("session-1".into()),
+            bottom: false,
+            session_uid: Some("caller-1".into()),
+            chat_session_id: Some("conversation-1".into()),
         };
         store.terminals = Some(vec![session.clone()]);
         std::fs::write(&store.path, store.bytes(&fixture()).unwrap()).unwrap();

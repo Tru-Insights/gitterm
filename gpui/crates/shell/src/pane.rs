@@ -17,6 +17,7 @@ pub enum PaneKind {
     IcedSession(String),
     Terminal,
     CenterTerminal(std::path::PathBuf),
+    BottomTerminal(std::path::PathBuf),
     StoppedTerminal(std::path::PathBuf, bool),
     Chat,
     PreviewChat(Entity<crate::chat::ChatPane>),
@@ -48,12 +49,19 @@ pub struct Pane {
     pub(crate) session: Option<gitterm_core::session::Target>,
     pub id: String,
     pub title: String,
+    pub(crate) notification_chat_title: Option<String>,
     pub content: PaneContent,
+    /// Imported DTO owned by this runtime pane, including unmounted native agents.
+    pub(crate) imported_tab: Option<gitterm_core::workspace_config::WorkspaceTabConfig>,
+    pub(crate) startup_command: Option<String>,
+    pub(crate) chat_session_id: Option<String>,
     pub(crate) terminal_title: Option<String>,
     center_terminal: bool,
     pub(crate) exited: bool,
     pub(crate) exit_pending: bool,
     pub(crate) terminal_cwd: Option<std::path::PathBuf>,
+    /// Iced's restored tracked cwd, until the local shell reports a new cwd.
+    pub(crate) terminal_saved_dir: Option<std::path::PathBuf>,
     workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
@@ -76,15 +84,20 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session = matches!(kind, PaneKind::Terminal | PaneKind::CenterTerminal(_))
-            .then(crate::sessions::fresh_target);
+        let session = matches!(
+            kind,
+            PaneKind::Terminal | PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_)
+        )
+        .then(crate::sessions::fresh_target);
         let content = match kind.clone() {
             PaneKind::IcedSession(text) => PaneContent::IcedSession(text),
             PaneKind::StoppedTerminal(..) => PaneContent::Error("Terminal stopped".into()),
-            PaneKind::Terminal | PaneKind::CenterTerminal(_) => {
+            PaneKind::Terminal | PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_) => {
                 let launch = TerminalLaunch {
                     cwd: match &kind {
-                        PaneKind::CenterTerminal(cwd) => Some(cwd.clone()),
+                        PaneKind::CenterTerminal(cwd) | PaneKind::BottomTerminal(cwd) => {
+                            Some(cwd.clone())
+                        }
                         _ => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
                     },
                     ..Default::default()
@@ -99,6 +112,41 @@ impl Pane {
                     program: "/bin/zsh".into(),
                     args: vec!["-d".into(), "-f".into(), "-i".into()],
                     ..launch
+                };
+                let launch = if let Some(host) = cx
+                    .try_global::<crate::task_host::GpuiTaskHost>()
+                    .map(|h| h.0.clone())
+                    .filter(|h| h.read(cx).is_live())
+                {
+                    let name = data
+                        .workspaces(cx)
+                        .into_iter()
+                        .find(|w| w.id == workspace)
+                        .map(|w| w.name)
+                        .unwrap_or_default();
+                    match host.read(cx).live_terminal_launch(
+                        &name,
+                        launch.cwd.as_deref().expect("local cwd"),
+                        None,
+                        session.as_ref().expect("terminal identity"),
+                        matches!(kind, PaneKind::BottomTerminal(_)),
+                        cx,
+                    ) {
+                        Ok(launch) => launch,
+                        Err(error) => {
+                            return Self::new(
+                                id,
+                                title,
+                                PaneKind::IcedSession(format!("Terminal: {error}")),
+                                workspace,
+                                data,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                } else {
+                    launch
                 };
                 let preview = data
                     .local_owner()
@@ -147,6 +195,7 @@ impl Pane {
                                         return;
                                     }
                                     pane.terminal_cwd = Some(cwd.to_path_buf());
+                                    pane.terminal_saved_dir = None;
                                     cx.notify();
                                 });
                             })
@@ -168,14 +217,19 @@ impl Pane {
             PaneKind::Review(view) => PaneContent::Review(view),
         };
         let terminal_cwd = match &kind {
-            PaneKind::CenterTerminal(cwd) | PaneKind::StoppedTerminal(cwd, _) => Some(cwd.clone()),
+            PaneKind::CenterTerminal(cwd)
+            | PaneKind::BottomTerminal(cwd)
+            | PaneKind::StoppedTerminal(cwd, _) => Some(cwd.clone()),
             PaneKind::Terminal => data.terminal_cwd(workspace, cx).or_else(dirs::home_dir),
             _ => None,
         };
         if let PaneContent::Error(error) = &content {
             eprintln!("{error}");
         }
-        let terminal_events = if matches!(kind, PaneKind::CenterTerminal(_) | PaneKind::Terminal) {
+        let terminal_events = if matches!(
+            kind,
+            PaneKind::CenterTerminal(_) | PaneKind::BottomTerminal(_) | PaneKind::Terminal
+        ) {
             if let PaneContent::Terminal(view) = &content {
                 Some(cx.observe_in(view, window, |_, view, window, cx| {
                     let view = view.clone();
@@ -219,6 +273,10 @@ impl Pane {
             title,
             content,
             terminal_title: None,
+            imported_tab: None,
+            startup_command: None,
+            chat_session_id: None,
+            notification_chat_title: None,
             center_terminal: matches!(
                 kind,
                 PaneKind::CenterTerminal(_) | PaneKind::StoppedTerminal(_, true)
@@ -226,6 +284,7 @@ impl Pane {
             exited: false,
             exit_pending: false,
             terminal_cwd,
+            terminal_saved_dir: None,
             workspace,
             data: data.clone(),
             focus: cx.focus_handle(),
@@ -275,6 +334,9 @@ impl Pane {
     fn revoke_caller(&self, cx: &App) {
         if let Some(target) = &self.session {
             crate::task_host::revoke_caller(&target.session_uid, cx);
+            if let Some(session) = &target.task_session_id {
+                crate::task_host::revoke_caller(session, cx);
+            }
         }
     }
     /// An adopted terminal's child exited: as the exit callback of a pane's
@@ -320,7 +382,7 @@ impl Pane {
             if self.center_terminal {
                 PaneKind::CenterTerminal(cwd)
             } else {
-                PaneKind::Terminal
+                PaneKind::BottomTerminal(cwd)
             },
             self.workspace,
             self.data.clone(),
@@ -331,6 +393,9 @@ impl Pane {
     #[cfg(test)]
     pub(crate) fn status_view(&self, cx: &App) -> crate::data::GitStatus {
         self.data.status(self.workspace, cx)
+    }
+    pub(crate) fn notification_terminal_title(&self) -> Option<&str> {
+        self.terminal_title.as_deref()
     }
     pub(crate) fn tab_title(&self) -> String {
         if matches!(self.content, PaneContent::Terminal(_)) {
