@@ -724,6 +724,31 @@ impl TaskHostOwner {
         })
     }
 
+    /// The chrome uses exactly the MCP host's context, engine and runtime.
+    pub(crate) fn browser_host(&self) -> Option<crate::browser::Host> {
+        let servers = self.servers.as_ref()?;
+        if servers
+            .jobs
+            .iter()
+            .any(tokio::task::JoinHandle::is_finished)
+        {
+            return None;
+        }
+        Some(crate::browser::Host {
+            admission: servers.browser.ui_admission(),
+            browser: servers.browser.browser(),
+            engine: servers.browser.engine(),
+            runtime: servers.runtime.handle().clone(),
+            services: Arc::new(self.host.services().clone()),
+        })
+    }
+
+    pub(crate) fn browser_environment(&self, caller: &str) -> Vec<(String, String)> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            servers.browser.terminal_environment(Some(caller)).into()
+        })
+    }
+
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }
@@ -2128,20 +2153,18 @@ mod live_tests {
                     )
                     .is_ok()
             );
-            for effect in [
-                gitterm_core::preview::service::RunnerEffect::HtmlPreview,
-                gitterm_core::preview::service::RunnerEffect::RestoreSession,
-            ] {
-                assert!(
-                    owner
-                        .host
-                        .services()
-                        .runner(effect, None)
-                        .unwrap_err()
-                        .notice()
-                        .ends_with("not available in preview")
-                );
-            }
+            assert!(
+                owner
+                    .host
+                    .services()
+                    .runner(
+                        gitterm_core::preview::service::RunnerEffect::RestoreSession,
+                        None
+                    )
+                    .unwrap_err()
+                    .notice()
+                    .ends_with("not available in preview")
+            );
         });
         owner.update(cx, |owner, _| owner.shutdown());
         assert_eq!(std::fs::read(&source).unwrap(), bytes);

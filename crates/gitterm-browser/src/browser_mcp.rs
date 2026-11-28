@@ -113,6 +113,7 @@ pub fn browser_tool_access(tool: &str) -> BrowserAccess {
 struct Requests {
     state: std::sync::Mutex<(bool, usize)>,
     changed: tokio::sync::Notify,
+    ui_cancelled: CancellationToken,
 }
 impl Requests {
     fn enter(self: &Arc<Self>) -> Option<RequestGuard> {
@@ -125,6 +126,7 @@ impl Requests {
     }
     fn close(&self) {
         self.state.lock().unwrap().0 = true;
+        self.ui_cancelled.cancel();
     }
     async fn drain(&self) {
         loop {
@@ -166,13 +168,44 @@ async fn shutdown_browser(
     disconnect: impl Future<Output = Result<(), String>>,
 ) -> Result<(), String> {
     requests.close();
-    shutdown_phase("browser-mcp-requests", timeout, async {
+    let drained = shutdown_phase("browser-mcp-requests", timeout, async {
         requests.drain().await;
         Ok(())
     })
-    .await?;
-    shutdown_phase("browser-engine-sessions", timeout, sessions).await?;
-    shutdown_phase("browser-disconnect-profile", timeout, disconnect).await
+    .await;
+    let sessions = shutdown_phase("browser-engine-sessions", timeout, sessions).await;
+    // Cleanup must run even when an earlier phase failed. The controller bounds
+    // its CDP/profile waits; a shorter outer timeout would abandon that cleanup.
+    let disconnected = disconnect
+        .await
+        .map_err(|error| format!("shutdown phase browser-disconnect-profile: {error}"));
+    let errors: Vec<_> = [drained, sessions, disconnected]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// UI operations share MCP admission, and quit cancels them before draining
+/// requests and releasing the profile. This grants no new browser identity.
+#[derive(Clone)]
+pub struct BrowserUiAdmission(Arc<Requests>);
+impl BrowserUiAdmission {
+    pub async fn run<T>(&self, work: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        let _request = self
+            .0
+            .enter()
+            .ok_or_else(|| "GitTerm's browser has shut down".to_string())?;
+        tokio::select! {
+            biased;
+            _ = self.0.ui_cancelled.cancelled() => Err("GitTerm's browser has shut down".into()),
+            result = work => result,
+        }
+    }
 }
 
 /// Connection data retained by the app and inherited by local terminals.
@@ -210,6 +243,10 @@ impl BrowserMcpConnection {
             },
         )
         .await
+    }
+
+    pub fn ui_admission(&self) -> BrowserUiAdmission {
+        BrowserUiAdmission(self.requests.clone())
     }
 
     pub fn endpoint(&self) -> &str {
@@ -1734,14 +1771,19 @@ mod tests {
             *events.lock().unwrap(),
             ["request-completed", "sessions", "disconnect-profile"]
         );
-        // A failed drain must not run later phases.
+        // Failures are reported, but must never bypass profile cleanup.
         let requests = Arc::new(Requests::default());
         let _accepted = requests.enter().unwrap();
+        events.lock().unwrap().clear();
         let error = shutdown_browser(
             &requests,
             Duration::from_millis(10),
-            async { panic!("sessions ran before request completion") },
-            async { panic!("profile released before request completion") },
+            async { Err("fixture session failure".into()) },
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                events.lock().unwrap().push("disconnect-profile");
+                Ok(())
+            },
         )
         .await
         .unwrap_err();
@@ -1749,6 +1791,8 @@ mod tests {
             error.contains("browser-mcp-requests") && error.contains("timeout"),
             "{error}"
         );
+        assert!(error.contains("fixture session failure"), "{error}");
+        assert_eq!(*events.lock().unwrap(), ["disconnect-profile"]);
     }
 
     #[test]
@@ -2469,6 +2513,261 @@ mod tests {
         )
         .unwrap();
         devtools
+    }
+
+    fn live_services(root: &Path) -> Arc<ServiceContext> {
+        Arc::new(
+            ServiceContext::production(root, "fixture-live-browser")
+                .unwrap()
+                .for_gpui_live(),
+        )
+    }
+
+    #[tokio::test]
+    async fn live_browser_mcp_two_callers_write_and_refuse_foreign_owner_and_bearer() {
+        let root = tempdir().unwrap();
+        let services = live_services(root.path());
+        let devtools = fake_chrome_in(&services.browser_profile_dir().unwrap()).await;
+        let (connection, server) =
+            prepare_scoped(services, ListenerBind::LoopbackEphemeral, TEST_VERSION).unwrap();
+        let (a, task) = serve_and_connect(&connection, server, "fixture-chat-a").await;
+        let descriptor = connection.claude_mcp_server(Some("fixture-chat-b"));
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(caller_endpoint(
+                connection.endpoint(),
+                Some("fixture-chat-b"),
+            ))
+            .auth_header(
+                descriptor
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == BROWSER_MCP_TOKEN_ENV)
+                    .unwrap()
+                    .1
+                    .clone(),
+            ),
+        );
+        let b = ().serve(transport).await.unwrap();
+        let opened = call(&a, "browser_open", serde_json::json!({})).await;
+        assert_eq!(opened.is_error, Some(false), "{opened:?}");
+        for (client, name) in [(&a, "design"), (&b, "implementation")] {
+            let result = call(
+                client,
+                "browser_target_open",
+                serde_json::json!({"name": name, "url": "https://example.com/fixture"}),
+            )
+            .await;
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+        }
+        let a_targets = call(&a, "browser_targets", serde_json::json!({}))
+            .await
+            .structured_content
+            .unwrap();
+        let b_targets = call(&b, "browser_targets", serde_json::json!({}))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(a_targets["result"].as_array().unwrap().len(), 1);
+        assert_eq!(b_targets["result"].as_array().unwrap().len(), 1);
+        assert_ne!(
+            a_targets["result"][0]["targetId"],
+            b_targets["result"][0]["targetId"]
+        );
+        let before = devtools.calls.lock().unwrap().clone();
+        for (client, foreign) in [(&a, "implementation"), (&b, "design")] {
+            let denied = call(
+                client,
+                "browser_target_close",
+                serde_json::json!({"target": foreign}),
+            )
+            .await;
+            assert_eq!(denied.is_error, Some(true), "{denied:?}");
+        }
+        assert_eq!(*devtools.calls.lock().unwrap(), before);
+        // Reusing a target label in another chat still creates an independent page.
+        let same_label = call(
+            &b,
+            "browser_target_open",
+            serde_json::json!({"name":"design","url":"https://example.com/fixture"}),
+        )
+        .await;
+        assert_eq!(same_label.is_error, Some(false), "{same_label:?}");
+        assert_ne!(
+            same_label.structured_content.unwrap()["targetId"],
+            a_targets["result"][0]["targetId"]
+        );
+        let before = devtools.calls.lock().unwrap().clone();
+
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(caller_endpoint(
+                connection.endpoint(),
+                Some("fixture-chat-a"),
+            ))
+            .auth_header("foreign-fixture-bearer"),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), ().serve(transport))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(*devtools.calls.lock().unwrap(), before);
+        let transport = StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(connection.endpoint().to_string())
+                .auth_header(connection.token.clone()),
+        );
+        let unscoped = ().serve(transport).await.unwrap();
+        let denied = call(
+            &unscoped,
+            "browser_target_close",
+            serde_json::json!({"target":"design"}),
+        )
+        .await;
+        assert!(error_text(&denied).contains("calling GitTerm tab's identity"));
+        assert_eq!(*devtools.calls.lock().unwrap(), before);
+        unscoped.cancel().await.unwrap();
+        assert_eq!(devtools.pages.lock().unwrap().len(), 4);
+        a.cancel().await.unwrap();
+        b.cancel().await.unwrap();
+        drop(connection);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_browser_admission_keeps_preview_write_denial() {
+        use gitterm_core::preview::service::preview_notice;
+        let root = tempdir().unwrap();
+        let live = live_services(root.path());
+        assert!(live.browser("browser_open", BrowserAccess::Launch).is_ok());
+        assert!(!live.browser_read_only());
+        let preview = preview_services(root.path());
+        let devtools = fake_chrome_in(&preview.browser_profile_dir().unwrap()).await;
+        let (connection, server) =
+            prepare_scoped(preview, ListenerBind::LoopbackEphemeral, TEST_VERSION).unwrap();
+        let (client, task) = serve_and_connect(&connection, server, "fixture-chat").await;
+        let result = call(&client, "browser_open", serde_json::json!({})).await;
+        assert_eq!(error_text(&result), preview_notice("browser_open"));
+        assert!(devtools.calls.lock().unwrap().is_empty());
+        client.cancel().await.unwrap();
+        drop(connection);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_browser_configured_engine_and_html_runner_use_production_context() {
+        use crate::browser_control::gate_html_preview;
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path()
+                .join(crate::browser_engine::BROWSER_ENGINE_CONFIG_FILE),
+            r#"{"engine":"agent-browser"}"#,
+        )
+        .unwrap();
+        let services = live_services(root.path());
+        let (connection, _) = prepare_scoped(
+            services.clone(),
+            ListenerBind::LoopbackEphemeral,
+            TEST_VERSION,
+        )
+        .unwrap();
+        assert_eq!(
+            connection.engine().kind(),
+            Some(BrowserEngineKind::AgentBrowser)
+        );
+        assert_eq!(
+            connection.browser().profile_dir().await,
+            root.path().join("browser-profile")
+        );
+        let runner = gate_html_preview(
+            &services,
+            Arc::new(|_| Box::pin(async { Ok(serde_json::json!({"fixture":true})) })),
+        );
+        let request = gitterm_core::content::html_render::HtmlPreviewRequest {
+            html: "<p>fixture</p>".into(),
+            width: None,
+            theme: None,
+        };
+        assert_eq!(runner(request).await.unwrap()["fixture"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_browser_quit_cancels_pending_open_and_releases_owned_profile_for_iced() {
+        let root = tempdir().unwrap();
+        let services = live_services(root.path());
+        let profile = services.browser_profile_dir().unwrap();
+        let devtools = fake_chrome_in(&profile).await;
+        let (connection, server) =
+            prepare_scoped(services, ListenerBind::LoopbackEphemeral, TEST_VERSION).unwrap();
+        let server_task = tokio::spawn(server.run());
+        // The owned startup child exits only when fake CDP receives Browser.close.
+        // Open has not verified its endpoint yet, and must not launch Chrome.
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read fixture"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let port_file = profile.join("DevToolsActivePort");
+        *devtools.on_close.lock().unwrap() = Some(Box::new(move || {
+            drop(stdin);
+            std::fs::remove_file(port_file).unwrap();
+        }));
+        connection.browser().own_test_child(child).await;
+        let admission = connection.ui_admission();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *devtools.next_list_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+        let browser = connection.browser();
+        assert!(profile.join("DevToolsActivePort").exists());
+        let opening_admission = admission.clone();
+        let opening = tokio::spawn(async move {
+            opening_admission
+                .run(async {
+                    browser
+                        .launch(Default::default())
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            !opening.is_finished(),
+            "fake Open must still be pending at quit"
+        );
+        let shutdown = tokio::spawn(async move { connection.shutdown().await });
+        // Shorter than the request-drain timeout: success must come from UI
+        // cancellation, never a manually completed fake Open or an expired drain.
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(opening.await.unwrap().unwrap_err().contains("shut down"));
+        assert!(admission
+            .run::<()>(async { panic!("new UI work admitted during quit") })
+            .await
+            .is_err());
+        release.notify_one();
+        server_task.await.unwrap().unwrap();
+        assert!(devtools
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "Browser.close"));
+        assert!(!profile.join("DevToolsActivePort").exists());
+        crate::browser_control::verify_profile_released(&profile).unwrap();
+        let (iced, _) = prepare(root.path(), "fixture-iced-after-live", TEST_VERSION).unwrap();
+        assert_eq!(iced.browser().profile_dir().await, profile);
+        assert_eq!(
+            iced.browser().status().await.unwrap().state,
+            crate::browser_control::BrowserState::Stopped
+        );
     }
 
     /// The tool → access table covers exactly the tools either engine
