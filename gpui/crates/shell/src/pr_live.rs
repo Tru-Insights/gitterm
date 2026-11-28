@@ -841,7 +841,8 @@ pub(crate) mod tests {
             number: 54,
             url: "https://github.com/owner/repo/pull/54".into(),
         };
-        live.note_live_prs("root", &[pr.clone()]).unwrap();
+        live.note_live_prs("root", std::slice::from_ref(&pr))
+            .unwrap();
         assert_eq!(
             live.merge_plan("root", &[])["unplanned_prs"][0]["number"],
             54

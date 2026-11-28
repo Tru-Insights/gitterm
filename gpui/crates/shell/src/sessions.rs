@@ -2297,6 +2297,38 @@ impl crate::Shell {
     }
 }
 
+impl crate::Shell {
+    fn new_acp_chat(
+        &mut self,
+        agent: gitterm_core::chat::types::AcpAgent,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !gitterm_core::chat::types::AcpAgent::ALL.contains(&agent)
+        {
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
+            return;
+        };
+        let mut tab = crate::chat::resume::tab(&cwd, fresh_target().session_uid, None);
+        tab.agent_config = Some(gitterm_core::harness::acp_launch::new_chat_config(
+            &self.chat_defaults,
+            agent,
+        ));
+        if let Err(error) = self.mount_live_chat(workspace, tab, None, true, window, cx) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!("New {} chat: {error:#}", agent.label()));
+                cx.notify();
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2901,38 +2933,6 @@ mod tests {
         for shown in [0, 51] {
             let selector = Box::leak(format!("transcript-row-{shown}").into_boxed_str());
             assert!(cx.debug_bounds(selector).is_some(), "row {shown} shown");
-        }
-    }
-}
-
-impl crate::Shell {
-    fn new_acp_chat(
-        &mut self,
-        agent: gitterm_core::chat::types::AcpAgent,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if self.owner.read(cx).workspace_save_pending
-            || !gitterm_core::chat::types::AcpAgent::ALL.contains(&agent)
-        {
-            return;
-        }
-        let Some(workspace) = self.active_workspace(cx) else {
-            return;
-        };
-        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
-            return;
-        };
-        let mut tab = crate::chat::resume::tab(&cwd, fresh_target().session_uid, None);
-        tab.agent_config = Some(gitterm_core::harness::acp_launch::new_chat_config(
-            &self.chat_defaults,
-            agent,
-        ));
-        if let Err(error) = self.mount_live_chat(workspace, tab, None, true, window, cx) {
-            self.owner.update(cx, |owner, cx| {
-                owner.error = Some(format!("New {} chat: {error:#}", agent.label()));
-                cx.notify();
-            });
         }
     }
 }

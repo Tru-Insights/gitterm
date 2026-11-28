@@ -1,4 +1,4 @@
-//! Local chat process supervision, independent of a frontend executor.
+//! Chat process supervision, independent of a frontend executor.
 //! The process loop owns initialization, commands, shutdown and child wait.
 //! Its thread stays alive through snapshot cleanup after ProcessExited.
 use crate::chat::types::{HarnessCommand, HarnessEvent};
@@ -81,6 +81,7 @@ pub struct Session {
     pid: Arc<AtomicU32>,
     completion: Option<oneshot::Receiver<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    thread_error: &'static str,
 }
 
 impl Session {
@@ -181,6 +182,7 @@ impl Session {
             pid,
             completion: Some(completion),
             thread,
+            thread_error: "the Claude session thread panicked",
         }
     }
 
@@ -243,13 +245,13 @@ impl Session {
                 pid: Default::default(),
                 completion: Some(completion),
                 thread,
+                thread_error: "the ACP session thread panicked",
             },
             events,
         )
     }
 
-    /// Explicit root transport port. Remote attach/reconnect remains in the
-    /// host, which owns its executor and completion. No local process is owned.
+    /// Host-owned transport port. No local process or executor is owned.
     pub fn from_port(
         commands: mpsc::UnboundedSender<HarnessCommand>,
         shutdown_on_drop: bool,
@@ -262,7 +264,20 @@ impl Session {
             pid: Default::default(),
             completion: None,
             thread: None,
+            thread_error: "the Claude session thread panicked",
         }
+    }
+
+    /// Core remote supervision shares the detach-on-drop command port and
+    /// joins on the host's existing off-UI shutdown worker.
+    pub(crate) fn from_remote_port(
+        commands: mpsc::UnboundedSender<HarnessCommand>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        let mut session = Self::from_port(commands, false);
+        session.thread = thread;
+        session.thread_error = "remote Claude session thread panicked";
+        session
     }
 
     /// Ok means channel acceptance only. It is never a stdin write receipt.
@@ -326,7 +341,7 @@ impl Session {
         self.completed().await
     }
 
-    /// Wait for the entire local loop, final snapshot cleanup, and runtime
+    /// Wait for the entire session loop, final snapshot cleanup, and runtime
     /// teardown. ProcessExited alone does not establish this boundary.
     /// Drop sends shutdown but never blocks a frontend on this join.
     pub async fn completed(&mut self) -> Result<(), String> {
@@ -335,9 +350,7 @@ impl Session {
         }
         self.completion = None;
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| "the Claude session thread panicked".to_string())?;
+            thread.join().map_err(|_| self.thread_error.to_string())?;
         }
         Ok(())
     }
@@ -428,6 +441,7 @@ mod shutdown_tests {
             pid: Default::default(),
             completion: Some(completion),
             thread: Some(thread),
+            thread_error: "the Claude session thread panicked",
         };
         session.shutdown().await.unwrap();
         assert!(reader_done.load(Ordering::SeqCst));
