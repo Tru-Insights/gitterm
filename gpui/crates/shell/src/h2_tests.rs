@@ -146,6 +146,7 @@ pub(crate) fn fixture_with(
 fn chrome_uses_catalog_order_and_workspace_selection_opens_its_active_history(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let before = std::fs::read(root.path().join("iced/workspaces.json")).unwrap();
     cx.read(|cx| {
@@ -228,6 +229,7 @@ fn chrome_uses_catalog_order_and_workspace_selection_opens_its_active_history(
 
 #[gpui::test]
 fn strip_titles_resolve_inactive_facts_tabs_and_preserve_saved_titles(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let facts_dir = root.path().join("iced/chat-meta");
     std::fs::create_dir(&facts_dir).unwrap();
@@ -263,6 +265,7 @@ fn strip_titles_resolve_inactive_facts_tabs_and_preserve_saved_titles(cx: &mut T
 
 #[gpui::test]
 fn bottom_plus_opens_sheet_create_keeps_draft_and_existing_work_selects(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     click(cx, "pstrip-new-work");
     assert!(cx.debug_bounds("workspace-sheet-card").is_some());
@@ -293,6 +296,7 @@ fn bottom_plus_opens_sheet_create_keeps_draft_and_existing_work_selects(cx: &mut
 
 #[gpui::test]
 fn a12b_new_workspace_menu_entry_opens_the_bar_plus_sheet(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     click(cx, "pstrip-repos");
     click(cx, "pstrip-repo-action-0-0");
@@ -311,6 +315,7 @@ fn a12b_new_workspace_menu_entry_opens_the_bar_plus_sheet(cx: &mut TestAppContex
 
 #[gpui::test]
 fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let repo = root.path().join("picked-repo");
     std::fs::create_dir(&repo).unwrap();
@@ -349,6 +354,7 @@ fn sheet_folder_picker_returns_selection_and_cancel_without_creating_work(cx: &m
 
 #[gpui::test]
 fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     // Iced labels; the preview reports them (I6, interaction map A02/A14).
     let selector = "pstrip-browser";
@@ -382,6 +388,7 @@ fn missing_host_controls_keep_iced_controls_and_report_unavailable(cx: &mut Test
 
 #[gpui::test]
 fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_gpui_chat::review::{ReviewKind, ReviewOutcome};
     cx.update(install_app_menus);
     let (root, shell, cx) = fixture(cx);
@@ -465,6 +472,7 @@ fn review_consult_shell_shortcuts_reject_in_preview_and_keep_the_draft(cx: &mut 
 
 #[gpui::test]
 fn catalog_bar_renders_repos_folder_badge_plus_and_real_counts_read_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture_catalog(cx, true);
     cx.simulate_resize(size(px(1600.), px(800.)));
     draw(cx);

@@ -525,6 +525,7 @@ mod tests {
     fn quit_action_prepares_entities_and_drains_before_platform_quit(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let dir = tempfile::tempdir().unwrap();
         let roots = roots(dir.path());

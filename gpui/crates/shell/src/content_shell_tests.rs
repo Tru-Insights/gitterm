@@ -4,6 +4,7 @@ use gpui::TestAppContext;
 
 #[gpui::test]
 fn files_open_content_reopen_focus_close_and_refuse_outside_root(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -113,6 +114,7 @@ fn local_shell(
 fn zoomed_split_selects_its_content_and_non_content_zoom_hides_all_surfaces(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let root = tempfile::tempdir().unwrap();
@@ -214,6 +216,7 @@ fn zoomed_split_selects_its_content_and_non_content_zoom_hides_all_surfaces(
 
 #[gpui::test]
 fn file_and_diff_visits_cover_and_return_to_same_session_entity(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();

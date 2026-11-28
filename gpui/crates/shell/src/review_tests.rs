@@ -18,11 +18,13 @@ fn wait(cx: &mut VisualTestContext, predicate: impl Fn(&App) -> bool) {
 
 #[gpui::test]
 fn git_status_opens_review(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     exercise_review(cx, true);
 }
 
 #[gpui::test]
 fn files_open_text_then_git_review(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     exercise_review(cx, false);
 }
 

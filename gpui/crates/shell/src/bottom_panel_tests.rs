@@ -244,6 +244,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn rendered_controls_emit_every_outcome_and_menus_dismiss(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, input());
     for (selector, expected) in [
         ("bottom-control-1", Outcome::SelectTab { id: 4 }),
@@ -287,6 +288,7 @@ fn rendered_controls_emit_every_outcome_and_menus_dismiss(cx: &mut TestAppContex
 
 #[gpui::test]
 fn dimensions_slot_focus_and_hidden_panel(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, input());
     let calls = Rc::new(Cell::new(0));
     let count = calls.clone();
@@ -364,6 +366,7 @@ fn dimensions_slot_focus_and_hidden_panel(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn divider_drag_emits_clamped_height_even_outside_the_panel(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, input());
     let start = cx
         .debug_bounds("standalone-bottom-divider")
@@ -414,6 +417,7 @@ fn chevron_follows_expansion_even_though_collapsed_header_is_hidden() {
 
 #[gpui::test]
 fn tab_click_closes_repo_picker_without_launch_outcome(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, input());
     click("bottom-control-8", cx);
     cx.read(|cx| assert!(view.read(cx).repo_picker_open));
@@ -426,6 +430,7 @@ fn tab_click_closes_repo_picker_without_launch_outcome(cx: &mut TestAppContext) 
 fn escape_dismisses_quick_picker_before_focused_content_and_keeps_repo_picker(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, input());
     let received = Rc::new(Cell::new(0));
     let keys = received.clone();
@@ -477,6 +482,7 @@ fn escape_dismisses_quick_picker_before_focused_content_and_keeps_repo_picker(
 
 #[gpui::test]
 fn host_escape_routes_quick_picker_before_plans_and_search(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let dir = tempfile::tempdir().unwrap();
