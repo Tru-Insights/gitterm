@@ -6,16 +6,17 @@ use std::{collections::HashMap, path::Path};
 use gitterm_core::{
     checkout_name::repo_name,
     settings::WorkspaceColor,
-    workspace_config::{RepoConfig, WorkspaceConfig, WorkspaceTarget},
+    workspace_config::{RepoConfig, WorkspaceConfig, WorkspaceTabConfig, WorkspaceTarget},
     workspace_settings::{Edit, EnvEdit},
 };
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px, rgb, rgba,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, rgb, rgba,
 };
 use gpui_component::{
-    IndexPath, Sizable as _,
+    Disableable as _, IndexPath, Sizable as _,
     button::Button,
     checkbox::Checkbox,
     input::{Input, InputEvent, InputState},
@@ -69,7 +70,12 @@ pub struct SheetModel {
 impl SheetModel {
     /// Reads like Iced's `view_workspace_settings_modal`. `repos` is the
     /// catalog's repo list (for repo env); `config_dir` is Iced's config dir.
-    pub fn read(ws: &WorkspaceConfig, repos: &[RepoConfig], config_dir: &Path) -> Self {
+    pub fn read(
+        ws: &WorkspaceConfig,
+        repos: &[RepoConfig],
+        config_dir: &Path,
+        current_tab: Option<&WorkspaceTabConfig>,
+    ) -> Self {
         let home = ws.home_dir();
         // A legacy remote workspace keeps its settings in its own fields.
         let base: HashMap<String, String> = if ws.is_legacy_remote() {
@@ -95,10 +101,7 @@ impl SheetModel {
         ) && !ws.is_legacy_remote();
         let guidelines_repo = local
             .then(|| {
-                let tab = ws
-                    .tabs
-                    .get(ws.active_tab.unwrap_or(0))
-                    .or_else(|| ws.tabs.first())?;
+                let tab = current_tab?;
                 let repo = gitterm_core::guidelines::repo_key(Path::new(
                     tab.repo_dir.as_deref().unwrap_or(&tab.dir),
                 ));
@@ -203,6 +206,7 @@ pub struct WorkspaceSettingsSheet {
     value: Entity<InputState>,
     rename: Option<Entity<InputState>>,
     notice: Option<String>,
+    save_pending: bool,
     decisions: Entity<SelectState<Vec<DecisionsChoice>>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -271,6 +275,7 @@ impl WorkspaceSettingsSheet {
             value,
             rename: None,
             notice: None,
+            save_pending: false,
             decisions,
             _subscriptions: subscriptions,
         }
@@ -295,6 +300,9 @@ impl WorkspaceSettingsSheet {
     }
 
     fn edit(&mut self, label: &str, edit: Edit, cx: &mut Context<Self>) {
+        if self.save_pending {
+            return;
+        }
         if cx
             .try_global::<crate::workspace_config::LiveWorkspaces>()
             .is_none()
@@ -305,7 +313,10 @@ impl WorkspaceSettingsSheet {
         }
     }
 
-    fn add_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_env(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.save_pending {
+            return;
+        }
         if cx
             .try_global::<crate::workspace_config::LiveWorkspaces>()
             .is_none()
@@ -318,14 +329,13 @@ impl WorkspaceSettingsSheet {
             self.value.read(cx).value().as_ref(),
         ) {
             self.edit("Add environment variable", Edit::Env(edit), cx);
-            self.key
-                .update(cx, |input, cx| input.set_value("", window, cx));
-            self.value
-                .update(cx, |input, cx| input.set_value("", window, cx));
         }
     }
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.save_pending {
+            return;
+        }
         let name = self.model.name.clone();
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx).placeholder("Workspace name");
@@ -334,7 +344,7 @@ impl WorkspaceSettingsSheet {
             input
         });
         let sub = cx.subscribe(&input, |this, input, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+            if matches!(event, InputEvent::PressEnter { .. }) && !this.save_pending {
                 let draft = input.read(cx).value().to_string();
                 this.rename = None;
                 if cx
@@ -364,12 +374,13 @@ impl Render for WorkspaceSettingsSheet {
         let dark = p.base == 0x1e1e2e;
         let accent = p.blue;
         let model = self.model.clone();
+        let saving = self.save_pending;
         let spacer = |h: f32| div().h(px(h));
 
         let title = match &self.rename {
             Some(input) => div()
                 .w(px(260.))
-                .child(Input::new(input).small())
+                .child(Input::new(input).small().disabled(saving))
                 .into_any_element(),
             None => div()
                 .flex()
@@ -390,9 +401,13 @@ impl Render for WorkspaceSettingsSheet {
                         .py(px(2.))
                         .text_size(px(12.))
                         .text_color(rgb(accent))
-                        .cursor_pointer()
+                        .opacity(if saving { 0.5 } else { 1.0 })
                         .child("\u{270E} Rename")
-                        .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
+                        .when(!saving, |control| {
+                            control.cursor_pointer().on_click(
+                                cx.listener(|this, _, window, cx| this.start_rename(window, cx)),
+                            )
+                        }),
                 )
                 .into_any_element(),
         };
@@ -413,10 +428,14 @@ impl Render for WorkspaceSettingsSheet {
                     .bg(rgb(crate::session_picker::preset_color(color, dark)))
                     .border_2()
                     .border_color(if selected { rgb(accent) } else { rgba(0) })
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.edit("Color", Edit::Color(color), cx)
-                    })),
+                    .opacity(if saving { 0.5 } else { 1.0 })
+                    .when(!saving, |control| {
+                        control
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit("Color", Edit::Color(color), cx)
+                            }))
+                    }),
             );
         }
 
@@ -445,10 +464,14 @@ impl Render for WorkspaceSettingsSheet {
                             .border_color(rgb(if *active { accent } else { p.border }))
                             .bg(if *active { rgb(accent) } else { rgba(0) })
                             .text_color(rgb(if *active { p.base } else { p.text }))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit(&label, Edit::Profile(name_to_apply.clone()), cx)
-                            })),
+                            .opacity(if saving { 0.5 } else { 1.0 })
+                            .when(!saving, |control| {
+                                control.cursor_pointer().on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.edit(&label, Edit::Profile(name_to_apply.clone()), cx)
+                                    },
+                                ))
+                            }),
                     );
                 }
             }
@@ -468,9 +491,13 @@ impl Render for WorkspaceSettingsSheet {
                      edit: Edit,
                      cx: &mut Context<Self>| {
             div().debug_selector(move || id.into()).child(
-                Checkbox::new(id).label(label).checked(checked).on_click(
-                    cx.listener(move |this, _, _, cx| this.edit(notice, edit.clone(), cx)),
-                ),
+                Checkbox::new(id)
+                    .label(label)
+                    .checked(checked)
+                    .disabled(saving)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.edit(notice, edit.clone(), cx)),
+                    ),
             )
         };
         let mut guidelines = div()
@@ -562,7 +589,7 @@ impl Render for WorkspaceSettingsSheet {
                     .child(
                         div().debug_selector(|| "settings-decisions".into()).flex_1().min_w_0()
                             .child(if cx.try_global::<crate::workspace_config::LiveWorkspaces>().is_some() {
-                                Select::new(&self.decisions).accessibility_label("Decisions repo").small().text_size(px(12.)).w_full().into_any_element()
+                                Select::new(&self.decisions).disabled(saving).accessibility_label("Decisions repo").small().text_size(px(12.)).w_full().into_any_element()
                             } else {
                                 mono(model.decisions.clone()).id("settings-decisions-preview")
                                     .px(px(8.)).py(px(4.)).text_size(px(12.)).text_color(rgb(p.text))
@@ -625,17 +652,21 @@ impl Render for WorkspaceSettingsSheet {
                             .py(px(1.))
                             .text_size(px(10.))
                             .text_color(rgb(p.red))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit(
-                                    &label,
-                                    Edit::Env(EnvEdit::Set {
-                                        key: remove_key.clone(),
-                                        value: None,
-                                    }),
-                                    cx,
-                                )
-                            })),
+                            .opacity(if saving { 0.5 } else { 1.0 })
+                            .when(!saving, |control| {
+                                control.cursor_pointer().on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.edit(
+                                            &label,
+                                            Edit::Env(EnvEdit::Set {
+                                                key: remove_key.clone(),
+                                                value: None,
+                                            }),
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            }),
                     ),
             );
         }
@@ -667,8 +698,12 @@ impl Render for WorkspaceSettingsSheet {
                         .border_1()
                         .border_color(rgb(accent))
                         .rounded(px(3.))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, window, cx| this.add_env(window, cx))),
+                        .opacity(if saving { 0.5 } else { 1.0 })
+                        .when(!saving, |control| {
+                            control.cursor_pointer().on_click(
+                                cx.listener(|this, _, window, cx| this.add_env(window, cx)),
+                            )
+                        }),
                 ),
         );
 
@@ -680,7 +715,19 @@ impl Render for WorkspaceSettingsSheet {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(p.muted))
-                    .child("Changes apply to new terminal sessions"),
+                    .debug_selector(move || {
+                        if saving {
+                            "settings-saving"
+                        } else {
+                            "settings-save-status"
+                        }
+                        .into()
+                    })
+                    .child(if saving {
+                        "Saving… Write controls are disabled"
+                    } else {
+                        "Changes apply to new terminal sessions"
+                    }),
             )
             .child(
                 Button::new("settings-close")
@@ -761,6 +808,36 @@ impl Render for WorkspaceSettingsSheet {
 }
 
 impl crate::Shell {
+    fn settings_sheet_model(&self, id: crate::WorkspaceId, cx: &App) -> Option<SheetModel> {
+        let owner = self.owner.read(cx);
+        let ws = owner.iced_workspace(id)?;
+        let catalog = owner.iced_catalog()?;
+        let current_tab = self
+            .workspaces
+            .iter()
+            .find(|state| state.workspace.id == id)
+            .and_then(|state| state.active_session)
+            .and_then(|session| self.session_tab(session, cx));
+        Some(SheetModel::read(
+            ws,
+            &catalog.repos,
+            &catalog.source,
+            current_tab,
+        ))
+    }
+
+    pub(crate) fn sync_settings_sheet_pending(&mut self, cx: &mut Context<Self>) {
+        if let Some(sheet) = &self.settings_sheet {
+            let pending = self.owner.read(cx).workspace_save_pending;
+            sheet.update(cx, |sheet, cx| {
+                if sheet.save_pending != pending {
+                    sheet.save_pending = pending;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
     pub(crate) fn open_settings_sheet(
         &mut self,
         id: crate::data::WorkspaceId,
@@ -770,15 +847,7 @@ impl crate::Shell {
         if self.settings_sheet.is_some() {
             return;
         }
-        let model = {
-            let owner = self.owner.read(cx);
-            match (owner.iced_workspace(id), owner.iced_catalog()) {
-                (Some(ws), Some(catalog)) => {
-                    Some(SheetModel::read(ws, &catalog.repos, &catalog.source))
-                }
-                _ => None,
-            }
-        };
+        let model = self.settings_sheet_model(id, cx);
         let Some(model) = model else {
             // Not a workspace from Iced's config: there are no settings to show.
             self.chrome_unavailable("Workspace settings", cx);
@@ -795,6 +864,7 @@ impl crate::Shell {
         let sheet = cx.new(|cx| {
             let mut sheet = WorkspaceSettingsSheet::new(model, window, cx);
             sheet.workspace_id = Some(id);
+            sheet.save_pending = self.owner.read(cx).workspace_save_pending;
             sheet
         });
         self.settings_subscription = Some(cx.subscribe_in(
@@ -843,10 +913,22 @@ impl crate::Shell {
             return;
         };
         let target = WorkspaceTarget::of(saved);
+        let draft = matches!(edit, Edit::Env(EnvEdit::Set { value: Some(_), .. }))
+            .then(|| {
+                self.settings_sheet.as_ref().map(|sheet| {
+                    let sheet = sheet.read(cx);
+                    (
+                        sheet.key.read(cx).value().to_string(),
+                        sheet.value.read(cx).value().to_string(),
+                    )
+                })
+            })
+            .flatten();
         self.owner.update(cx, |owner, cx| {
             owner.workspace_save_pending = true;
             cx.notify();
         });
+        self.sync_settings_sheet_pending(cx);
         let root = store.0.root().to_path_buf();
         let result = cx
             .background_executor()
@@ -861,14 +943,7 @@ impl crate::Shell {
                 match result {
                     Ok(file) => {
                         shell.repo_document_saved(&root, file, cx);
-                        let model = {
-                            let owner = shell.owner.read(cx);
-                            owner.iced_workspace(id).zip(owner.iced_catalog()).map(
-                                |(ws, catalog)| {
-                                    SheetModel::read(ws, &catalog.repos, &catalog.source)
-                                },
-                            )
-                        };
+                        let model = shell.settings_sheet_model(id, cx);
                         if let Some(sheet) = &shell.settings_sheet
                             && sheet.read(cx).workspace_id == Some(id)
                         {
@@ -891,6 +966,17 @@ impl crate::Shell {
                                         select.set_selected_value(&selected, window, cx);
                                     });
                                     sheet.model = model;
+                                }
+                                if let Some((key, value)) = &draft
+                                    && sheet.key.read(cx).value().as_ref() == key
+                                    && sheet.value.read(cx).value().as_ref() == value
+                                {
+                                    sheet
+                                        .key
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                    sheet
+                                        .value
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
                                 }
                                 sheet.notice = None;
                                 cx.notify();
@@ -925,6 +1011,7 @@ impl crate::Shell {
                         });
                     }
                 }
+                shell.sync_settings_sheet_pending(cx);
                 cx.notify();
             });
         })

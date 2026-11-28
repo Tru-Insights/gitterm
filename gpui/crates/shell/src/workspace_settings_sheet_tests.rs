@@ -65,7 +65,8 @@ fn fixture(cx: &mut TestAppContext, guidelines_file: bool) -> (Fixture, &mut Vis
                 "env": {"FIXTURE_KEY":"one", "ZED":"last", "AAA":"first"},
                 "claude_in_chrome": true, "guidelines_off": true,
                 "env_overrides": {"AAA": "first"}, "future_workspace": {"keep": 3},
-                "tabs": [{"dir": work, "future_tab": {"keep": 4}}]
+                "active_tab":0,
+                "tabs": [{"dir": work, "future_tab": {"keep": 4}}, {"dir": other.join("sub"), "repo_dir":other}]
             }]
         })
         .to_string(),
@@ -552,4 +553,193 @@ fn live_failed_save_keeps_sheet_and_owner_at_acknowledged_settings(cx: &mut Test
                 .claude_in_chrome
         );
     });
+}
+
+#[gpui::test]
+fn live_guidelines_repo_follows_current_session_and_survives_model_refresh(
+    cx: &mut TestAppContext,
+) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (f, cx) = live_fixture(cx);
+    let expected = saved(&f);
+    let repo_b = gitterm_core::guidelines::repo_key(Path::new(&expected.workspaces[0].repos[1]));
+    f.shell.update_in(cx, |shell, window, cx| {
+        shell.close_settings_sheet(window, cx);
+        let session = shell.active(cx).sessions[1].id;
+        shell.select_session_id(session, window, cx);
+        assert_eq!(
+            shell
+                .owner
+                .read(cx)
+                .iced_workspace(WorkspaceId(1))
+                .unwrap()
+                .active_tab,
+            Some(0)
+        );
+        shell.open_settings_sheet(WorkspaceId(1), window, cx);
+    });
+    draw(cx);
+    // An unrelated save rebuilds the model too: it must still use B.
+    click(cx, "settings-chrome");
+    wait_saved(&f, cx);
+    cx.read(|cx| {
+        let sheet = f.shell.read(cx).settings_sheet.as_ref().unwrap().read(cx);
+        assert_eq!(
+            sheet.model.guidelines_repo.as_ref().unwrap().0,
+            repo_b.display().to_string()
+        );
+    });
+    click(cx, "settings-guidelines-repo");
+    wait_saved(&f, cx);
+    assert_eq!(
+        gitterm_core::guidelines::load_settings(&f.source).off_repos,
+        vec![repo_b]
+    );
+}
+
+fn set_env_draft(f: &Fixture, cx: &mut VisualTestContext, key: &str, value: &str) {
+    let sheet = cx.read(|cx| f.shell.read(cx).settings_sheet.clone().unwrap());
+    sheet.update_in(cx, |sheet, window, cx| {
+        sheet
+            .key
+            .update(cx, |input, cx| input.set_value(key.to_owned(), window, cx));
+        sheet.value.update(cx, |input, cx| {
+            input.set_value(value.to_owned(), window, cx)
+        });
+        sheet.key.update(cx, |input, cx| input.focus(window, cx));
+    });
+    draw(cx);
+}
+
+fn assert_env_draft(f: &Fixture, cx: &mut VisualTestContext, key: &str, value: &str) {
+    cx.read(|cx| {
+        let sheet = f.shell.read(cx).settings_sheet.as_ref().unwrap().read(cx);
+        assert_eq!(sheet.key.read(cx).value().as_ref(), key);
+        assert_eq!(sheet.value.read(cx).value().as_ref(), value);
+    });
+}
+
+#[gpui::test]
+fn live_failed_env_add_retains_draft_for_successful_retry(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (f, cx) = live_fixture(cx);
+    set_env_draft(&f, cx, " NEW ", " value ");
+    let before = std::fs::read(f.source.join("workspaces.json")).unwrap();
+    std::fs::set_permissions(&f.source, std::fs::Permissions::from_mode(0o555)).unwrap();
+    click(cx, "settings-env-add");
+    wait_complete(&f, cx);
+    std::fs::set_permissions(&f.source, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(notice(&f, cx).unwrap().contains("workspaces.json"));
+    assert_eq!(
+        std::fs::read(f.source.join("workspaces.json")).unwrap(),
+        before
+    );
+    assert_env_draft(&f, cx, " NEW ", " value ");
+    click(cx, "settings-env-add");
+    wait_saved(&f, cx);
+    assert_env_draft(&f, cx, "", "");
+    assert_eq!(saved(&f).workspaces[0].env["NEW"], "value");
+}
+
+#[gpui::test]
+fn live_pending_save_visibly_disables_writes_and_preserves_env_draft(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (f, cx) = live_fixture(cx);
+    set_env_draft(&f, cx, "NEW", "value");
+    // Model an in-flight owner save (including saves started outside the sheet).
+    // Its blocking receipt must not run on GPUI's deterministic test executor.
+    f.shell.update(cx, |shell, cx| {
+        shell.owner.update(cx, |owner, cx| {
+            owner.workspace_save_pending = true;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("settings-saving").is_some());
+    for selector in [
+        "settings-guidelines-all",
+        "settings-guidelines-workspace",
+        "settings-guidelines-repo",
+        "settings-chrome",
+        "settings-color-Blue",
+        "settings-profile-beta",
+        "settings-env-remove-ZED",
+        "settings-env-add",
+        "settings-rename",
+        "settings-decisions",
+    ] {
+        click(cx, selector);
+    }
+    cx.simulate_keystrokes("enter");
+    draw(cx);
+    assert_env_draft(&f, cx, "NEW", "value");
+    cx.read(|cx| {
+        let sheet = f.shell.read(cx).settings_sheet.as_ref().unwrap().read(cx);
+        assert!(sheet.save_pending);
+        assert!(sheet.rename.is_none());
+        assert_eq!(
+            sheet.model.color,
+            gitterm_core::settings::WorkspaceColor::Peach
+        );
+    });
+    f.shell.update(cx, |shell, cx| {
+        shell.owner.update(cx, |owner, cx| {
+            owner.workspace_save_pending = false;
+            cx.notify();
+        })
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("settings-saving").is_none());
+    click(cx, "settings-chrome");
+    wait_saved(&f, cx);
+    let actual = saved(&f);
+    assert!(!actual.workspaces[0].claude_in_chrome);
+    assert!(actual.workspaces[0].guidelines_off);
+    assert!(!actual.workspaces[0].env.contains_key("NEW"));
+    assert!(actual.workspaces[0].env.contains_key("ZED"));
+    assert!(!gitterm_core::guidelines::load_settings(&f.source).enabled);
+    // The same controls work after acknowledgement.
+    click(cx, "settings-guidelines-all");
+    wait_saved(&f, cx);
+    click(cx, "settings-env-add");
+    wait_saved(&f, cx);
+    assert_eq!(saved(&f).workspaces[0].env["NEW"], "value");
+    assert_env_draft(&f, cx, "", "");
+}
+
+#[gpui::test]
+fn live_env_add_acknowledgement_preserves_a_newer_draft(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (f, cx) = live_fixture(cx);
+    set_env_draft(&f, cx, "FIRST", "one");
+    // Start the real save and edit the draft before yielding to the executor.
+    f.shell.update_in(cx, |shell, window, cx| {
+        shell.save_sheet_edit(
+            WorkspaceId(1),
+            super::Edit::Env(super::EnvEdit::Set {
+                key: "FIRST".into(),
+                value: Some("one".into()),
+            }),
+            window,
+            cx,
+        );
+        let sheet = shell.settings_sheet.clone().unwrap();
+        sheet.update(cx, |sheet, cx| {
+            assert_eq!(sheet.key.read(cx).value().as_ref(), "FIRST");
+            sheet
+                .key
+                .update(cx, |input, cx| input.set_value("SECOND", window, cx));
+            sheet
+                .value
+                .update(cx, |input, cx| input.set_value("two", window, cx));
+        });
+    });
+    wait_saved(&f, cx);
+    assert_env_draft(&f, cx, "SECOND", "two");
+    assert_eq!(saved(&f).workspaces[0].env["FIRST"], "one");
+    click(cx, "settings-env-add");
+    wait_saved(&f, cx);
+    assert_eq!(saved(&f).workspaces[0].env["SECOND"], "two");
+    assert_env_draft(&f, cx, "", "");
 }

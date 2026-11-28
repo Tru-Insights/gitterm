@@ -10375,6 +10375,7 @@ impl App {
                 })
                 .collect(),
             env: self.workspace_repo_env(ws, ws.home),
+            legacy_env_base: None,
             active: true,
             chats: ws.chats.clone(),
             parked: None,
@@ -55243,6 +55244,7 @@ mod tests {
             run_command: None,
             bottom_terminals: Vec::new(),
             env: HashMap::new(),
+            legacy_env_base: None,
             active: false,
             chats: Vec::new(),
             parked: parked_at.map(|at| ParkedInfo {

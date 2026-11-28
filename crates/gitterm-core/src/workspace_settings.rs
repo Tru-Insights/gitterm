@@ -98,8 +98,9 @@ impl<C> WorkspacesFile<C> {
         let ws = &mut self.workspaces[index];
         let key = ws.repo_key(ws.home_dir());
         if ws.is_legacy_remote() {
-            edit.apply(&mut ws.env_overrides, Some(&mut ws.env));
-            ws.env = layered_env(&ws.env, &ws.env_overrides);
+            let base = ws.legacy_env_base.get_or_insert_with(|| ws.env.clone());
+            edit.apply(&mut ws.env_overrides, Some(base));
+            ws.env = layered_env(base, &ws.env_overrides);
         } else {
             let base = self
                 .repos
@@ -190,5 +191,62 @@ mod document_tests {
             file.workspaces[1].env,
             HashMap::from([("OTHER".into(), "keep".into())])
         );
+    }
+}
+
+#[cfg(all(test, feature = "runtime"))]
+mod legacy_tests {
+    use super::*;
+    use crate::desktop_store::DesktopStore;
+
+    #[test]
+    fn workspace_settings_legacy_remote_keeps_base_across_acknowledged_saves() {
+        let root = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({
+            "active_workspace":0,
+            "workspaces":[{"name":"Remote fixture","abbrev":"RF","color":"blue",
+                "dir":root.path().join("stand-in"),"tabs":[],
+                "remote_session":{"label":"fixture","host_name":"fixture.invalid",
+                    "ssh_target":"fixture.invalid","identity_file":"",
+                    "session_name":"fixture","remote_dir":"/fixture"},
+                "env":{"KEY":"old"},"env_overrides":{"KEY":"old"}}]
+        });
+        std::fs::write(root.path().join("workspaces.json"), input.to_string()).unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let mut expected: WorkspacesFile = serde_json::from_value(input).unwrap();
+        let target = WorkspaceTarget::of(&expected.workspaces[0]);
+        expected.normalize_repos();
+        // Iced set_workspace_env edits runtime overrides/home repo independently;
+        // workspace_config emits their layered env, never feeding it back as base.
+        let mut iced_home_env = expected.workspaces[0].env.clone();
+        for edit in [
+            env_add("KEY", "new").unwrap(),
+            EnvEdit::Set {
+                key: "KEY".into(),
+                value: None,
+            },
+            EnvEdit::Profile(HashMap::from([("KEY".into(), "profile".into())])),
+            env_add("KEY", "base edit").unwrap(),
+            EnvEdit::Set {
+                key: "KEY".into(),
+                value: None,
+            },
+        ] {
+            edit.clone().apply(
+                &mut expected.workspaces[0].env_overrides,
+                Some(&mut iced_home_env),
+            );
+            expected.workspaces[0].env =
+                layered_env(&iced_home_env, &expected.workspaces[0].env_overrides);
+            let acknowledged = store
+                .edit_workspace_settings(target.clone(), Edit::Env(edit))
+                .wait()
+                .unwrap();
+            assert_eq!(acknowledged.workspaces[0].env, expected.workspaces[0].env);
+            assert_eq!(
+                std::fs::read(root.path().join("workspaces.json")).unwrap(),
+                serde_json::to_vec_pretty(&expected).unwrap()
+            );
+        }
     }
 }

@@ -190,6 +190,10 @@ pub struct WorkspaceConfig<C = WorkspaceColor> {
     /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Iced keeps a legacy remote's home env in its runtime repo, separate
+    /// from the effective compatibility copy written to `env` on each save.
+    #[serde(skip)]
+    pub legacy_env_base: Option<HashMap<String, String>>,
     /// Whether this workspace is currently open. Closed workspaces are kept in
     /// workspaces.json so their env vars and settings are preserved for reopening.
     #[serde(default = "default_true")]

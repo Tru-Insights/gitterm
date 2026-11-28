@@ -1212,6 +1212,7 @@ fn new_work_config(
         run_command: None,
         bottom_terminals: vec![],
         env: Default::default(),
+        legacy_env_base: None,
         active: true,
         chats: vec![],
         parked: None,
