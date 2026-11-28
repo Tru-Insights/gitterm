@@ -1,7 +1,7 @@
 //! Iced's remote terminal launch contract. Saved commands are replayed verbatim;
 //! attaching is a local PTY bridge, never a request to start another agent session.
 use super::{
-    config::{RemoteAgentAuthConfig, RemoteAgentConfig},
+    config::{RemoteAgentAuthConfig, RemoteAgentConfig, WorkspaceLocationConfig},
     ssh_sessions::RemoteHostConfig,
 };
 use std::path::{Path, PathBuf};
@@ -29,6 +29,30 @@ impl From<&crate::workspace_config::RemoteSessionConfig> for RemoteSessionDefini
             claude_command: config.claude_command.clone(),
         }
     }
+}
+
+/// Iced's legacy session host matches an agent id or name (names ignore case).
+pub fn remote_agent_for_session<'a>(
+    definitions: &'a [RemoteAgentConfig],
+    session: &RemoteSessionDefinition,
+) -> Option<&'a RemoteAgentConfig> {
+    definitions.iter().find(|agent| {
+        agent.id == session.host.name
+            || agent.name == session.host.name
+            || agent.name.eq_ignore_ascii_case(&session.host.name)
+    })
+}
+
+pub fn remote_agent_location_for_session(
+    definitions: &[RemoteAgentConfig],
+    session: &RemoteSessionDefinition,
+) -> Option<WorkspaceLocationConfig> {
+    let agent = remote_agent_for_session(definitions, session)?;
+    Some(WorkspaceLocationConfig::RemoteAgent {
+        remote_id: agent.id.clone(),
+        workspace_id: session.session_name.clone(),
+        root: session.remote_dir.clone(),
+    })
 }
 
 pub fn shell_quote(value: &str) -> String {

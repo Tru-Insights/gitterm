@@ -1125,16 +1125,25 @@ impl Shell {
         if self.launch_remote_agent_terminal(None, window, cx) {
             return;
         }
-        if self
+        if let Some(saved) = self
             .active_workspace(cx)
             .and_then(|id| self.owner.read(cx).iced_workspace(id))
-            .is_some_and(|saved| saved.is_legacy_remote())
+            .filter(|saved| saved.is_legacy_remote())
         {
-            self.open_remote_session_terminal(
-                gitterm_core::remote::launch::SessionKind::Shell,
-                window,
-                cx,
-            );
+            if !self.live_chat_enabled(cx) {
+                self.preview_unavailable("Remote terminal", cx);
+                return;
+            }
+            // Iced NewPlainTab falls back to a local plain terminal for legacy SSH.
+            let cwd = self
+                .active(cx)
+                .active_session
+                .and_then(|id| self.active(cx).panes.get(&session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).task_folder(cx))
+                .unwrap_or_else(|| saved.dir.clone().into());
+            let workspace = self.active(cx).workspace.id;
+            self.new_terminal_at(DockPlacement::Center, Some(cwd), window, cx);
+            self.persist_remote_tabs(workspace, cx);
             return;
         }
         self.new_terminal_in(DockPlacement::Center, window, cx);
@@ -1164,10 +1173,30 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.owner.read(cx).workspace_save_pending {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        self.new_terminal_launch_in(workspace, placement, cwd, launch, window, cx);
+    }
+    fn new_terminal_launch_in(
+        &mut self,
+        workspace: WorkspaceId,
+        placement: DockPlacement,
+        cwd: Option<std::path::PathBuf>,
+        launch: Option<PaneStart>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| {
+                state.workspace.id == workspace
+                    && (state.on_bar() || state.parked.as_ref().is_some_and(|p| p.running))
+            })
+        {
             return;
         }
         let transient_run =
@@ -1177,11 +1206,10 @@ impl Shell {
             .iter()
             .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
             .collect();
-        let active = self.active_workspace(cx);
         let state = self
             .workspaces
             .iter_mut()
-            .find(|w| Some(w.workspace.id) == active)
+            .find(|w| w.workspace.id == workspace)
             .unwrap();
         let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
             self.owner.update(cx, |owner, cx| {
@@ -1285,16 +1313,25 @@ impl Shell {
         }
         match launch {
             Some(PaneStart::Launch(launch)) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.launch_run_terminal(&pane, launch, window, cx);
             }
             Some(PaneStart::Adopt { view, target, .. }) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
             None => {}
         }
-        self.show_pane(&pane_id, window, cx);
+        if self.workspace(workspace).on_bar() {
+            self.show_workspace_pane(workspace, &pane_id, window, cx);
+        } else {
+            // Keep-running workspaces receive their tab without taking focus.
+            let state = self.workspace(workspace);
+            let pane = state.panes[&pane_id].clone();
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
+            });
+        }
     }
     /// Iced opens a tab for a launched task session; GPUI adopts the task
     /// host's terminal into a new center pane of the active workspace. A
@@ -1307,14 +1344,31 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        self.adopt_task_terminal_in(workspace, host, launched, window, cx);
+    }
+    fn adopt_task_terminal_in(
+        &mut self,
+        workspace: WorkspaceId,
+        host: &Entity<task_host::TaskHostOwner>,
+        launched: &task_host::TerminalLaunched,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.local {
             return;
         }
         let Some(view) = host.update(cx, |host, _| host.take_terminal(&launched.session_id)) else {
             return;
         };
         let target = launched.target.clone();
-        self.new_terminal_launch(
+        self.new_terminal_launch_in(
+            workspace,
             DockPlacement::Center,
             Some(launched.cwd.clone()),
             Some(PaneStart::Adopt {
@@ -1326,13 +1380,13 @@ impl Shell {
             cx,
         );
         if let Some(id) = self
-            .active(cx)
+            .workspace(workspace)
             .sessions
             .last()
             .map(|session| session_pane_id(session.id))
         {
             let title = launched.title.clone();
-            self.active(cx).panes[&id].update(cx, |pane, cx| {
+            self.workspace(workspace).panes[&id].update(cx, |pane, cx| {
                 pane.startup_command = launched.startup_command.clone();
                 pane.chat_session_id = launched.chat_session_id.clone();
                 pane.title = title;

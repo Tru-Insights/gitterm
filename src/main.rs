@@ -8613,23 +8613,21 @@ fn remote_agent_for_session<'a>(
     definitions: &'a [RemoteAgentConfig],
     session: &RemoteSessionDefinition,
 ) -> Option<&'a RemoteAgentConfig> {
-    definitions.iter().find(|agent| {
-        agent.id == session.host.name
-            || agent.name == session.host.name
-            || agent.name.eq_ignore_ascii_case(&session.host.name)
-    })
+    gitterm_core::remote::launch::remote_agent_for_session(definitions, session)
 }
 
 fn remote_agent_location_for_session(
     definitions: &[RemoteAgentConfig],
     session: &RemoteSessionDefinition,
 ) -> Option<WorkspaceLocation> {
-    let agent = remote_agent_for_session(definitions, session)?;
-    Some(WorkspaceLocation::RemoteAgent {
-        remote_id: agent.id.clone(),
-        workspace_id: session.session_name.clone(),
-        root: session.remote_dir.clone(),
-    })
+    let location =
+        gitterm_core::remote::launch::remote_agent_location_for_session(definitions, session)?;
+    Some(workspace_location_from_config(
+        Some(&location),
+        Path::new("."),
+        None,
+        definitions,
+    ))
 }
 
 /// Cached chat index for one remote machine (TRU-78 slice 4).

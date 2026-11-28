@@ -50,6 +50,8 @@ pub struct Pane {
     pub id: String,
     pub title: String,
     pub content: PaneContent,
+    /// Imported DTO owned by this runtime pane, including unmounted native agents.
+    pub(crate) imported_tab: Option<gitterm_core::workspace_config::WorkspaceTabConfig>,
     pub(crate) startup_command: Option<String>,
     pub(crate) chat_session_id: Option<String>,
     pub(crate) terminal_title: Option<String>,
@@ -266,6 +268,7 @@ impl Pane {
             title,
             content,
             terminal_title: None,
+            imported_tab: None,
             startup_command: None,
             chat_session_id: None,
             center_terminal: matches!(

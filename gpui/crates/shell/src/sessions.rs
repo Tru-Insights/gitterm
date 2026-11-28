@@ -2120,6 +2120,9 @@ impl crate::Shell {
                             .find(|tab| tab.session_uid.as_deref() == Some(&target.session_uid))
                     })
                     .cloned()
+                    // Index-derived legacy ids change after closing an earlier tab.
+                    // The original DTO stays owned by its runtime pane.
+                    .or_else(|| pane.imported_tab.clone())
                     .or_else(|| {
                         imported
                             .iter()

@@ -132,29 +132,52 @@ struct RemoteTabSave {
     active_tab: Option<usize>,
 }
 
+fn remote_workspace_index(
+    file: &gitterm_core::workspace_config::WorkspacesFile,
+    key: &gitterm_core::park::Key,
+    location: &Option<WorkspaceLocationConfig>,
+) -> Result<usize, String> {
+    let indices: Vec<_> = file
+        .workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| key.matches(w))
+        .map(|(i, _)| i)
+        .collect();
+    if indices.len() != 1 {
+        return Err(format!(
+            "Remote workspace {} is missing or ambiguous",
+            key.name
+        ));
+    }
+    let index = indices[0];
+    if file.workspaces[index].location != *location {
+        return Err("Remote workspace changed before saving its terminals".into());
+    }
+    Ok(index)
+}
+
+fn validate_remote_launch(
+    store: &gitterm_core::desktop_store::DesktopStore,
+    key: &gitterm_core::park::Key,
+    location: &Option<WorkspaceLocationConfig>,
+) -> Result<(), String> {
+    use gitterm_core::desktop_store::LoadState;
+    match store.snapshot().wait()?.workspaces.loaded {
+        LoadState::Valid(file) => remote_workspace_index(&file, key, location).map(|_| ()),
+        LoadState::Missing => Err(format!("Remote workspace {} is missing", key.name)),
+        LoadState::Refused(error) => Err(error),
+    }
+}
+
 fn save_remote_tabs(
     store: &gitterm_core::desktop_store::DesktopStore,
     save: RemoteTabSave,
 ) -> Result<crate::workspace_config::LiveWorkspaceSaved, String> {
     store
         .transact_workspaces(move |file| {
-            let indices: Vec<_> = file
-                .workspaces
-                .iter()
-                .enumerate()
-                .filter(|(_, w)| save.key.matches(w))
-                .map(|(i, _)| i)
-                .collect();
-            if indices.len() != 1 {
-                return Err(format!(
-                    "Remote workspace {} is missing or ambiguous",
-                    save.key.name
-                ));
-            }
-            let workspace = &mut file.workspaces[indices[0]];
-            if workspace.location != save.location {
-                return Err("Remote workspace changed before saving its terminals".into());
-            }
+            let index = remote_workspace_index(file, &save.key, &save.location)?;
+            let workspace = &mut file.workspaces[index];
             workspace.tabs = save.tabs;
             workspace.active_tab = save.active_tab;
             Ok(crate::workspace_config::LiveWorkspaceSaved {
@@ -869,6 +892,20 @@ impl Shell {
         .detach();
     }
 
+    /// Resolve Iced's legacy host inference without rewriting saved location bytes.
+    fn remote_agent_location(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> Option<WorkspaceLocationConfig> {
+        saved.location.clone().or_else(|| {
+            let session = saved.remote_session.as_ref()?;
+            gitterm_core::remote::launch::remote_agent_location_for_session(
+                self.configured_remotes(),
+                &gitterm_core::remote::launch::RemoteSessionDefinition::from(session),
+            )
+        })
+    }
+
     /// The active workspace's legacy SSH remote session, if it is one.
     fn active_remote_session(
         &self,
@@ -879,6 +916,12 @@ impl Shell {
         saved
             .is_legacy_remote()
             .then(|| saved.remote_session.clone())
+            .filter(|_| {
+                !matches!(
+                    self.remote_agent_location(saved),
+                    Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+            })
             .flatten()
     }
 
@@ -893,7 +936,7 @@ impl Shell {
         let saved = self.owner.read(cx).iced_workspace(workspace)?;
         if !saved.is_legacy_remote()
             && !matches!(
-                saved.location,
+                self.remote_agent_location(saved),
                 Some(WorkspaceLocationConfig::RemoteAgent { .. })
             )
         {
@@ -1032,11 +1075,19 @@ impl Shell {
             return;
         }
         let cwd = launch::attach_cwd(true, Path::new(&config.remote_dir), dirs::home_dir());
-        self.open_remote_attach_terminal(command, cwd, title.into(), window, cx);
+        self.open_remote_attach_terminal(
+            self.active(cx).workspace.id,
+            command,
+            cwd,
+            title.into(),
+            window,
+            cx,
+        );
     }
 
     fn open_remote_attach_terminal(
         &mut self,
+        workspace: crate::WorkspaceId,
         command: String,
         cwd: PathBuf,
         title: String,
@@ -1062,14 +1113,14 @@ impl Shell {
             worker_shutdown_refused: false,
             session_uid: None,
         };
-        let name = self.active(cx).workspace.name.clone();
+        let name = self.workspace(workspace).workspace.name.clone();
         match host.update(cx, |host, cx| {
             host.open_remote_terminal(&name, &tab, cwd, cx)
         }) {
             Ok(mut launched) => {
                 launched.title = title;
-                self.adopt_task_terminal(&host, &launched, window, cx);
-                self.persist_remote_tabs(self.active(cx).workspace.id, cx);
+                self.adopt_task_terminal_in(workspace, &host, &launched, window, cx);
+                self.persist_remote_tabs(workspace, cx);
             }
             Err(error) => self.owner.update(cx, |owner, cx| {
                 owner.error = Some(format!("Remote terminal: {error}"));
@@ -1097,7 +1148,7 @@ impl Shell {
             remote_id,
             workspace_id,
             root,
-        }) = &saved.location
+        }) = self.remote_agent_location(&saved)
         else {
             return false;
         };
@@ -1119,7 +1170,7 @@ impl Shell {
             });
             return true;
         }
-        let Some(remote) = self.fresh_remote_launch_config(remote_id, cx) else {
+        let Some(remote) = self.fresh_remote_launch_config(&remote_id, cx) else {
             self.owner.update(cx, |owner, cx| {
                 owner.error = Some("Remote agent configuration unavailable".into());
                 cx.notify();
@@ -1142,7 +1193,7 @@ impl Shell {
         let launch = launch::agent_session_launch(
             preset,
             Some(&remote),
-            root,
+            &root,
             remote_dir,
             saved.claude_in_chrome,
         );
@@ -1150,10 +1201,20 @@ impl Shell {
         let runtime_uid = state.runtime_uid;
         let workspace_id = workspace_id.clone();
         let client = self.remote.client.clone();
+        let store = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|s| s.0.clone());
+        let key = gitterm_core::park::Key {
+            name: saved.name.clone(),
+            dir: saved.dir.clone(),
+        };
+        let location = saved.location.clone();
         cx.spawn_in(window, async move |shell, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let store = store.ok_or_else(|| "Live workspace store unavailable".to_string())?;
+                    validate_remote_launch(&store, &key, &location)?;
                     client
                         .start_session(&remote, workspace_id, launch)
                         .map(|id| (remote, id))
@@ -1166,7 +1227,7 @@ impl Shell {
                     if !shell.workspaces.iter().any(|state| {
                         state.workspace.id == workspace
                             && state.runtime_uid == runtime_uid
-                            && state.on_bar()
+                            && (state.on_bar() || state.parked.as_ref().is_some_and(|p| p.running))
                     }) {
                         return true;
                     }
@@ -1181,7 +1242,9 @@ impl Shell {
                                 });
                                 return true;
                             };
-                            shell.select_workspace_id(workspace, window, cx);
+                            if shell.workspace(workspace).on_bar() {
+                                shell.select_workspace_id(workspace, window, cx);
+                            }
                             let command = launch::remote_session_attach_command(
                                 &launch::agent_binary(),
                                 &remote,
@@ -1193,6 +1256,7 @@ impl Shell {
                             }
                             label = format!("{label} @ {}", remote.name);
                             shell.open_remote_attach_terminal(
+                                workspace,
                                 command,
                                 dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
                                 label,
@@ -1235,7 +1299,7 @@ impl Shell {
             return;
         };
         let remote_agent = matches!(
-            saved.location,
+            self.remote_agent_location(saved),
             Some(WorkspaceLocationConfig::RemoteAgent { .. })
         );
         let imported = crate::data::iced_sessions(saved);
@@ -1251,6 +1315,7 @@ impl Shell {
             let Some(tab) = saved.tabs.get(index) else {
                 continue;
             };
+            pane.update(cx, |pane, _| pane.imported_tab = Some(tab.clone()));
             if (remote_agent && tab.startup_command.is_none())
                 || (!remote_agent
                     && tab.tab_kind.as_deref() == Some("agent")
