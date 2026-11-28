@@ -744,6 +744,7 @@ mod tests {
                     crate::data::WorkspaceId(1),
                     crate::data::SessionId(0),
                     &target,
+                    None,
                     cx,
                 )
             })

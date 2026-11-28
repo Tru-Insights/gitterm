@@ -26,7 +26,7 @@ fn find_sidebar_live_resume_session_chat_and_rescue_match_iced(cx: &mut TestAppC
     std::fs::create_dir(&cwd).unwrap();
     let rescue = git.repo.join("deleted/nested");
     golive10_workspace(&fixture, &git.repo, json!([]), json!([]));
-    let (host, _) = start(&fixture, cx);
+    let host = sidebar_review_start(&fixture, cx);
     let (shell, vcx) = golive10_shell(&fixture, &host, cx);
     let entries = vec![sidebar_entry("placeholder-cli", &cwd, ChatBackend::Codex), sidebar_entry("placeholder-chat", &cwd, ChatBackend::Claude), sidebar_entry("placeholder-rescue", &rescue, ChatBackend::Claude)];
     shell.update_in(vcx, |shell, window, cx| {
@@ -221,11 +221,19 @@ fn work_sidebar_review_f2_done_owner_discards_old_sessions_on_chat_resume(cx: &m
         shell.open_saved_live_chat(workspace, "placeholder-stale-native", Some(entry), window, cx).unwrap();
         shell.new_terminal_at(gpui_component::dock::DockPlacement::Bottom, Some(git.repo.clone()), window, cx);
         assert!(!crate::bottom_pane_ids(shell.active(cx), cx).is_empty());
+    });
+    // Local tabs now save through the Live owner; close only after admission
+    // reopens, so this scenario actually reaches Done before resuming the chat.
+    wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+    shell.update_in(vcx, |shell, window, cx| {
         let target = shell.active(cx).park_target(cx);
         shell.park_intent(Some(&target), gitterm_core::park::Intent::Close(target.uid), window, cx);
     });
     wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
     shell.update_in(vcx, |shell, window, cx| {
+        assert!(shell.owner.read(cx).error.is_none(), "{:?}", shell.owner.read(cx).error);
+        let done = shell.workspaces.iter().find(|w| w.workspace.name == "Done owner").unwrap();
+        assert!(done.parked.as_ref().is_some_and(|parked| parked.done));
         shell.go_to_chat_owner(&ChatRef::local("placeholder-requested"), window, cx);
     });
     wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));

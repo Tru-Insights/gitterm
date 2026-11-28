@@ -1943,8 +1943,10 @@ fn owner_catalog_supplies_mounted_sidebar_read_authority_without_a_gui(
     let files = Rc::new(RefCell::new(Vec::new()));
     let received = files.clone();
     cx.update(|cx| {
-        cx.subscribe(&owner, move |_, event: &crate::FileOpen, _| {
-            received.borrow_mut().push(event.path.clone())
+        cx.subscribe(&sidebar, move |_, event: &WorkSidebarOutcome, _| {
+            if let WorkSidebarOutcome::OpenDocument { path, .. } = event {
+                received.borrow_mut().push(path.clone());
+            }
         })
         .detach();
     });

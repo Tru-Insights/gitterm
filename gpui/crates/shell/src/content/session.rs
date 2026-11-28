@@ -712,8 +712,22 @@ impl Shell {
             });
             return;
         }
+        let remote = match self.owner.read(cx).remote_source(event.workspace, cx) {
+            Ok(source) => source,
+            Err(error) => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(error);
+                    cx.notify();
+                });
+                return;
+            }
+        };
         // Agent configuration files live in the agent's home config folder.
-        let agent_root = self.agent_file_root(event.workspace, &event.path, cx);
+        let agent_root = if remote.is_none() {
+            self.agent_file_root(event.workspace, &event.path, cx)
+        } else {
+            None
+        };
         let id = self.tab_viewer_pane_id(
             event.workspace,
             crate::content_pane_id(event.workspace, &event.path),
@@ -762,7 +776,11 @@ impl Shell {
                     .then(|| source.clone())
             })
             .or_else(|| self.data.terminal_cwd(event.workspace, cx));
-        let root = agent_root.or(root);
+        let root = remote
+            .as_ref()
+            .map(|source| std::path::PathBuf::from(&source.spec.root))
+            .or(agent_root)
+            .or(root);
         let Some(root) = root else {
             return;
         };
@@ -803,6 +821,7 @@ impl Shell {
             content.open(
                 id.clone(),
                 super::window::ContentRequest {
+                    remote,
                     root: root.clone(),
                     relative: relative.to_owned(),
                     workspace: event.workspace.0,

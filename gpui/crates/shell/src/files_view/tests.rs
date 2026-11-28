@@ -953,3 +953,53 @@ fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut Tes
     });
     assert_eq!(fs::read(source.join("workspaces.json")).unwrap(), before);
 }
+
+#[gpui::test]
+fn remote_parity_live_files_view_navigation_preserves_terminal_context(cx: &mut TestAppContext) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    let (_root, owner, _fake) = crate::remote_client::source::tests::fixture(cx, true);
+    let workspace = crate::data::WorkspaceId(1);
+    let before = owner.read_with(cx, |owner, _| {
+        owner
+            .model
+            .session_contexts
+            .values()
+            .next()
+            .unwrap()
+            .cwd
+            .clone()
+    });
+    let view = cx.new(|cx| {
+        FilesView::new(
+            workspace,
+            Rc::new(crate::data::LocalData(owner.clone())),
+            cx,
+        )
+    });
+    crate::remote_client::source::tests::wait(cx, |cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .any(|row| matches!(row, Row::Entry {entry, ..} if entry.name == "src"))
+    });
+    view.update(cx, |view, cx| view.navigate(before.join("src"), cx));
+    crate::remote_client::source::tests::wait(cx, |cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .any(|row| matches!(row, Row::Entry {entry, ..} if entry.name == "example.rs"))
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.parent(), Some(before.clone()));
+        assert_eq!(
+            view.remote_navigation.as_ref().unwrap().display,
+            "project/src/"
+        );
+    });
+    owner.read_with(cx, |owner, _| {
+        assert_eq!(
+            owner.model.session_contexts.values().next().unwrap().cwd,
+            before
+        )
+    });
+}

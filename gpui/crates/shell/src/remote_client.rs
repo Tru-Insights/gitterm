@@ -3,6 +3,8 @@
 //! `RemoteClient`, which the real app backs with core's agent client and
 //! token lookup, the same calls Iced makes. Tests install a fake.
 
+pub(crate) mod source;
+
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
@@ -22,6 +24,36 @@ use gitterm_core::{
 /// Blocking calls, run on the background executor. Errors are user-facing.
 pub trait RemoteClient: Send + Sync {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String>;
+    fn source_list(
+        &self,
+        _source: &source::Spec,
+        _dir: String,
+        _hidden: bool,
+    ) -> Result<SourceDirListing, String> {
+        Err("Remote directory listing unavailable".into())
+    }
+    fn source_read(
+        &self,
+        _source: &source::Spec,
+        _path: String,
+    ) -> Result<gitterm_core::content::source::SourceFileContent, String> {
+        Err("Remote file preview unavailable".into())
+    }
+    fn source_status(
+        &self,
+        _source: &source::Spec,
+    ) -> Result<gitterm_core::content::source::SourceGitStatus, String> {
+        Err("Remote Git status unavailable".into())
+    }
+    fn source_diff(
+        &self,
+        _source: &source::Spec,
+        _path: String,
+        _staged: bool,
+    ) -> Result<Vec<gitterm_core::git_diff::FileDiffLine>, String> {
+        Err("Remote Git diff unavailable".into())
+    }
+
     /// Live only; Preview callers never enter this route. Default fakes stay offline.
     fn start_session(
         &self,
@@ -113,6 +145,43 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T, String
 }
 
 impl RemoteClient for AgentClient {
+    fn source_list(
+        &self,
+        source: &source::Spec,
+        dir: String,
+        hidden: bool,
+    ) -> Result<SourceDirListing, String> {
+        block_on(
+            source
+                .workspace_source()
+                .list_dir(0, SourcePath::Remote(dir), hidden),
+        )
+    }
+    fn source_read(
+        &self,
+        source: &source::Spec,
+        path: String,
+    ) -> Result<gitterm_core::content::source::SourceFileContent, String> {
+        block_on(source.workspace_source().read_file(
+            &SourcePath::Remote(path),
+            gitterm_core::content::MAX_INLINE_WEBVIEW_BYTES,
+        ))?
+    }
+    fn source_status(
+        &self,
+        source: &source::Spec,
+    ) -> Result<gitterm_core::content::source::SourceGitStatus, String> {
+        block_on(source.workspace_source().git_status())?
+    }
+    fn source_diff(
+        &self,
+        source: &source::Spec,
+        path: String,
+        staged: bool,
+    ) -> Result<Vec<gitterm_core::git_diff::FileDiffLine>, String> {
+        block_on(source.workspace_source().git_diff(path, staged))?
+    }
+
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String> {
         let backend = PreviewSourceHost::backend(remote.clone().into());
         block_on(backend.handshake())?.map_err(|error| error.to_string())

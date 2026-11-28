@@ -276,3 +276,91 @@ fn worktree_root_omission_is_relative_to_the_explicit_owner_root() {
         assert!(serde_json::from_str::<DesktopSettings>(input).is_err());
     }
 }
+
+#[test]
+fn tru274_live_local_sessions_and_selection_match_actual_iced_dto_bytes() {
+    use gitterm_core::workspace_config::{
+        BottomTerminalConfig, DesktopSessionEdit, WorkspaceTabConfig, WorkspaceTarget,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let mut iced: config::WorkspacesFile = serde_json::from_value(json!({
+        "active_workspace":0,"workspaces":[
+            {"name":"First","abbrev":"F","dir":"/fixture/first","color":"blue",
+             "tabs":[{"dir":"/fixture/first","repo_dir":"/fixture/first","session_uid":"first"}],"active_tab":0},
+            {"name":"Second","abbrev":"S","dir":"/fixture/second","color":"green",
+             "tabs":[{"dir":"/fixture/second","repo_dir":"/fixture/second","session_uid":"second"}],"active_tab":0}
+        ]
+    })).unwrap();
+    let path = temp.path().join("workspaces.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&iced).unwrap()).unwrap();
+    let store = DesktopStore::open(temp.path()).unwrap();
+    let target = WorkspaceTarget::of(&iced.workspaces[0]);
+    let tab = WorkspaceTabConfig::from_terminal(
+        Path::new("/fixture/first/sub"),
+        Path::new("/fixture/first/sub"),
+        Some("placeholder-cli --example"),
+        &gitterm_core::session::Target {
+            tab_id: 9,
+            session_uid: "new-terminal".into(),
+            task_id: None,
+            task_session_id: None,
+        },
+        Some("placeholder-chat".into()),
+        false,
+    );
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(&target, DesktopSessionEdit::OpenTabs(vec![tab]))
+        })
+        .wait()
+        .unwrap();
+    // The original Iced workspace_config mapping, pinned independently of the
+    // shared projection so changing its wire fields is a regression.
+    iced.workspaces[0].tabs.push(serde_json::from_value(json!({
+        "dir":"/fixture/first/sub","repo_dir":"/fixture/first/sub","startup_command":"placeholder-cli --example",
+        "chat_session_id":"placeholder-chat","session_uid":"new-terminal"
+    })).unwrap());
+    iced.workspaces[0].active_tab = Some(1);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        serde_json::to_vec_pretty(&iced).unwrap()
+    );
+    let target = WorkspaceTarget::of(&iced.workspaces[0]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(
+                &target,
+                DesktopSessionEdit::OpenBottom {
+                    terminal: BottomTerminalConfig {
+                        extra: Default::default(),
+                        dir: "/fixture/first".into(),
+                    },
+                    initial_tabs: vec![],
+                },
+            )
+        })
+        .wait()
+        .unwrap();
+    iced.workspaces[0]
+        .bottom_terminals
+        .push(BottomTerminalConfig {
+            extra: Default::default(),
+            dir: "/fixture/first".into(),
+        });
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        serde_json::to_vec_pretty(&iced).unwrap()
+    );
+    let target = WorkspaceTarget::of(&iced.workspaces[1]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(&target, DesktopSessionEdit::Select(Some(0)))
+        })
+        .wait()
+        .unwrap();
+    iced.active_workspace = 1;
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        serde_json::to_vec_pretty(&iced).unwrap()
+    );
+}

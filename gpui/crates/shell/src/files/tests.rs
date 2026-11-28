@@ -161,7 +161,7 @@ fn jobs_use_owners_runtime_and_publish_errors_without_panicking() {
     let mut jobs = FileJobs::default();
     let mut tree = FileTree::default();
     let request = tree.refresh(WorkspaceId(1), dir.path().join("missing"));
-    jobs.execute(runtime.handle(), request, sender);
+    jobs.execute(runtime.handle(), request, Ok(None), sender);
     let outcome = runtime.block_on(async { receiver.recv().await.unwrap() });
     tree.complete(outcome);
     assert!(matches!(&tree.rows()[0], Row::Error { .. }));

@@ -424,3 +424,90 @@ fn source_git_file(status: crate::status::GitFileStatus) -> SourceGitFile {
         is_staged: status.is_staged,
     }
 }
+
+pub fn source_git_status_snapshot(
+    tab_id: usize,
+    fallback_root: PathBuf,
+    result: Result<SourceGitStatus, String>,
+) -> crate::status::GitStatusSnapshot {
+    match result {
+        Ok(status) => crate::status::GitStatusSnapshot {
+            tab_id,
+            repo_path: PathBuf::from(status.root.display()),
+            repo_name: status.repo_name,
+            branch_name: status.branch_name,
+            is_git_repo: status.is_git_repo,
+            staged: status.staged.into_iter().map(source_status_file).collect(),
+            unstaged: status
+                .unstaged
+                .into_iter()
+                .map(source_status_file)
+                .collect(),
+            untracked: status
+                .untracked
+                .into_iter()
+                .map(source_status_file)
+                .collect(),
+            error: None,
+        },
+        Err(error) => crate::status::GitStatusSnapshot {
+            tab_id,
+            repo_path: fallback_root,
+            repo_name: String::new(),
+            branch_name: String::new(),
+            is_git_repo: false,
+            staged: Vec::new(),
+            unstaged: Vec::new(),
+            untracked: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn source_status_file(file: SourceGitFile) -> crate::status::GitFileStatus {
+    crate::status::GitFileStatus {
+        path: file.path,
+        status: file.status,
+        is_staged: file.is_staged,
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    #[test]
+    fn remote_parity_status_snapshot_preserves_opaque_paths_groups_and_errors() {
+        let file = |staged| SourceGitFile {
+            path: "placeholder file.rs".into(),
+            status: "M".into(),
+            is_staged: staged,
+        };
+        let snapshot = source_git_status_snapshot(
+            7,
+            "/placeholder/fallback".into(),
+            Ok(SourceGitStatus {
+                root: SourcePath::Remote("/placeholder/../opaque".into()),
+                repo_name: "placeholder".into(),
+                branch_name: "branch".into(),
+                is_git_repo: true,
+                staged: vec![file(true)],
+                unstaged: vec![file(false)],
+                untracked: vec![],
+            }),
+        );
+        assert_eq!(snapshot.tab_id, 7);
+        assert_eq!(snapshot.repo_path.to_str(), Some("/placeholder/../opaque"));
+        assert_eq!(snapshot.staged[0].path, "placeholder file.rs");
+        assert!(snapshot.staged[0].is_staged);
+        assert!(!snapshot.unstaged[0].is_staged);
+        assert_eq!(snapshot.branch_name, "branch");
+        let failed = source_git_status_snapshot(
+            7,
+            "/placeholder/fallback".into(),
+            Err("placeholder unavailable".into()),
+        );
+        assert_eq!(failed.error.as_deref(), Some("placeholder unavailable"));
+        assert_eq!(failed.repo_path.to_str(), Some("/placeholder/fallback"));
+        assert!(!failed.is_git_repo);
+    }
+}

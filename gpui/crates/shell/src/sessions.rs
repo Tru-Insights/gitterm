@@ -122,7 +122,7 @@ impl crate::Shell {
             // The prompt shows the pane it asks about; the strip's active
             // session follows, so a Stop and close lands from it.
             let workspace = state.workspace.id;
-            self.show_session(workspace, id, window, cx);
+            self.show_session(workspace, id, true, window, cx);
             let panel = self.ensure_task_panel(window, cx);
             panel.update(cx, |panel, cx| {
                 panel.open_stop_and_close(requested.clone(), cx)
@@ -136,22 +136,38 @@ impl crate::Shell {
         ) {
             // Dock removal precedes the close decision; keep a protected last tab visible.
             let workspace = state.workspace.id;
-            self.show_session(workspace, id, window, cx);
+            self.show_session(workspace, id, true, window, cx);
             return;
         }
         if !persisted && live {
             let workspace = state.workspace.id;
-            let save = self
-                .owner
-                .read(cx)
-                .close_live_tab(state.workspace.id, id, requested, cx);
+            // Bottom descriptors have no UID. Their append/restore order is
+            // the local inventory order, independent of dock rearrangements.
+            let bottom_index = state.store.terminals.as_ref().and_then(|terminals| {
+                terminals
+                    .iter()
+                    .filter(|terminal| {
+                        terminal.bottom
+                            && !self.run_tabs.contains_key(&crate::session_pane_id(
+                                crate::SessionId(terminal.id),
+                            ))
+                    })
+                    .position(|terminal| terminal.id == id.0)
+            });
+            let save = self.owner.read(cx).close_live_tab(
+                state.workspace.id,
+                id,
+                requested,
+                bottom_index,
+                cx,
+            );
             match save {
                 Err(error) => {
                     self.owner.update(cx, |owner, cx| {
                         owner.error = Some(format!("Close terminal: {error}"));
                         cx.notify();
                     });
-                    self.show_session(workspace, id, window, cx);
+                    self.show_session(workspace, id, false, window, cx);
                     return;
                 }
                 Ok(Some(save)) => {
@@ -177,7 +193,7 @@ impl crate::Shell {
                                         owner.error = Some(format!("Close terminal: {error}"));
                                         cx.notify();
                                     });
-                                    shell.show_session(workspace, id, window, cx);
+                                    shell.show_session(workspace, id, false, window, cx);
                                 }
                             }
                         });
@@ -228,7 +244,7 @@ impl crate::Shell {
             Some(task) => self.land_after_task_close(workspace, task, window, cx),
             None if was_active => {
                 if let Some(next) = self.workspace(workspace).active_session {
-                    self.show_session(workspace, next, window, cx);
+                    self.show_session(workspace, next, true, window, cx);
                 }
             }
             None => {}
@@ -289,7 +305,7 @@ impl crate::Shell {
             .or(general)
             .or_else(|| state.sessions.first().map(|session| session.id));
         if let Some(next) = next {
-            self.show_session(workspace, next, window, cx);
+            self.show_session(workspace, next, true, window, cx);
         }
     }
 
@@ -328,7 +344,7 @@ impl crate::Shell {
                 .iter()
                 .any(|session| session.id == active)
         {
-            self.show_session(workspace_id, active, window, cx);
+            self.show_session(workspace_id, active, true, window, cx);
         }
         if preserve_selection {
             self.selected_task = selection;
@@ -343,11 +359,16 @@ impl crate::Shell {
         &mut self,
         workspace: crate::data::WorkspaceId,
         id: crate::data::SessionId,
+        persist_selection: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
         if self.active_workspace(cx) == Some(workspace) {
-            self.select_session_id(id, window, cx);
+            if persist_selection {
+                self.select_session_id(id, window, cx);
+            } else {
+                self.activate_session_id(id, window, cx);
+            }
         } else {
             self.workspace_mut(workspace).active_session = Some(id);
             self.show_workspace_pane(workspace, &crate::session_pane_id(id), window, cx);
@@ -2058,9 +2079,10 @@ impl crate::Shell {
                 )
             });
             for terminal in &saved.bottom_terminals {
-                self.new_terminal_at(
+                self.new_terminal_launch(
                     gpui_component::dock::DockPlacement::Bottom,
                     Some(terminal.dir.clone().into()),
+                    Some(crate::PaneStart::RestoreBottom),
                     window,
                     cx,
                 );
@@ -2106,7 +2128,24 @@ impl crate::Shell {
                         .position(|s| s.id == session.id)
                         .and_then(|i| saved.tabs.get(i))
                 });
-            let Some(tab) = tab.cloned() else { continue };
+            let tab = tab.cloned().or_else(|| {
+                // Iced restores an empty local inventory as one home shell.
+                // Give that shell its caller before a later action saves it.
+                (!remote
+                    && saved.tabs.is_empty()
+                    && imported.first().is_some_and(|s| s.id == session.id))
+                .then(|| {
+                    gitterm_core::workspace_config::WorkspaceTabConfig::from_terminal(
+                        std::path::Path::new(&saved.dir),
+                        std::path::Path::new(&saved.dir),
+                        None,
+                        &fresh_target(),
+                        None,
+                        false,
+                    )
+                })
+            });
+            let Some(tab) = tab else { continue };
             if tab.tab_kind.as_deref() == Some("agent") {
                 if !chats && !remote {
                     continue;
@@ -2131,6 +2170,7 @@ impl crate::Shell {
                 let pane =
                     self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
                 if pane.read(cx).session.is_none() {
+                    pane.update(cx, |pane, _| pane.imported_tab = Some(tab.clone()));
                     let host = cx
                         .try_global::<crate::task_host::GpuiTaskHost>()
                         .map(|h| h.0.clone());
@@ -2304,6 +2344,7 @@ impl crate::Shell {
             .filter(|id| !self.run_tabs.contains_key(id))
             .filter_map(|id| state.panes.get(&id)?.read(cx).task_folder(cx))
             .map(|dir| gitterm_core::workspace_config::BottomTerminalConfig {
+                extra: Default::default(),
                 dir: dir.to_string_lossy().into_owned(),
             })
             .collect()
@@ -2394,11 +2435,26 @@ impl crate::Shell {
                     tab.task_id = target.task_id;
                     tab.task_session_id = target.task_session_id;
                 }
-                if pane.startup_command.is_some() {
+                let mounted_local_terminal = !saved.is_legacy_remote()
+                    && crate::workspace_config::workspace_remote_id(saved).is_none()
+                    && tab.tab_kind.as_deref() != Some("agent")
+                    && pane.session.is_some();
+                if mounted_local_terminal {
+                    // Iced workspace_config projects a terminal's launch repo,
+                    // including legacy records that had only a cwd, and omits
+                    // the explicit terminal discriminator on its next save.
+                    tab.repo_dir.get_or_insert_with(|| tab.dir.clone());
+                    tab.tab_kind = None;
+                    tab.agent_config = None;
                     tab.startup_command = pane.startup_command.clone();
-                }
-                if pane.chat_session_id.is_some() {
                     tab.chat_session_id = pane.chat_session_id.clone();
+                } else {
+                    if pane.startup_command.is_some() {
+                        tab.startup_command = pane.startup_command.clone();
+                    }
+                    if pane.chat_session_id.is_some() {
+                        tab.chat_session_id = pane.chat_session_id.clone();
+                    }
                 }
                 tab.dir = pane.terminal_saved_dir.as_ref().unwrap_or(&cwd).to_string_lossy().into_owned();
                 if matches!(saved.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) && pane.startup_command.is_some() {

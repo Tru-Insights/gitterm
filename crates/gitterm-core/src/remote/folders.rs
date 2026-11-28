@@ -301,6 +301,7 @@ mod tests {
         file.workspaces[index].active = false;
         file.workspaces[index].bottom_terminals.push(
             crate::workspace_config::BottomTerminalConfig {
+                extra: Default::default(),
                 dir: "/srv/project".into(),
             },
         );

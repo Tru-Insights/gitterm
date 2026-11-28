@@ -2178,6 +2178,11 @@ fn find_sidebar_resume_recorded_acp_without_claude_index(cx: &mut TestAppContext
             serde_json::json!("placeholder-find-acp-background");
     });
     cx.update(|window, cx| {
+        let lock = std::sync::Arc::new(
+            crate::task_host::HostLock::acquire(&root.path().join("iced")).unwrap(),
+        );
+        let desktop = crate::workspace_config::live_desktop_store(lock).unwrap();
+        cx.set_global(crate::workspace_config::LiveWorkspaces(desktop));
         crate::chat::policy::install_live(
             gitterm_core::preview::service::ServiceContext::production(
                 &root.path().join("iced"),
@@ -2226,4 +2231,17 @@ fn find_sidebar_resume_recorded_acp_without_claude_index(cx: &mut TestAppContext
             );
         });
     });
+    let desktop = cx.read(|cx| {
+        cx.global::<crate::workspace_config::LiveWorkspaces>()
+            .0
+            .clone()
+    });
+    desktop.drain().wait().unwrap();
+    cx.run_until_parked();
+    let saved: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(root.path().join("iced/workspaces.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved.active_workspace, 1);
+    assert_eq!(saved.workspaces[1].active_tab, Some(1));
+    cx.read(|cx| assert!(shell.read(cx).owner.read(cx).error.is_none()));
 }

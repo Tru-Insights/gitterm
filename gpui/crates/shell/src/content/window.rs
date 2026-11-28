@@ -102,6 +102,11 @@ impl SurfaceHost for WindowHost {
     }
 }
 enum Source {
+    Remote {
+        root: PathBuf,
+        relative: PathBuf,
+    },
+    Prepared,
     Local {
         root: PathBuf,
         relative: PathBuf,
@@ -127,6 +132,7 @@ struct Entry {
 /// One inventory per window, including inactive workspaces. Covers are reconciled
 /// before native callbacks and in pane prepaint, before any popup is painted.
 pub(crate) struct ContentRequest {
+    pub remote: Option<crate::remote_client::source::RemoteSource>,
     pub root: PathBuf,
     pub relative: PathBuf,
     pub workspace: u64,
@@ -139,6 +145,7 @@ pub struct ContentWindow {
     pub selected: Option<String>,
     covered: [bool; 3],
     pub picker: bool,
+    pub(crate) close_requested: bool,
     pub resizing: bool,
     prior_focus: Option<WeakFocusHandle>,
     fallback_focus: FocusHandle,
@@ -163,6 +170,10 @@ impl ContentWindow {
                         for entry in this.entries.values_mut() {
                             let before = entry.viewer.state();
                             if let Some(host) = &mut entry.viewer.host_mut().native {
+                                if host.take_close_requested() {
+                                    this.close_requested = true;
+                                    changed = true;
+                                }
                                 for url in host.drain_external() {
                                     cx.open_url(&url);
                                 }
@@ -201,6 +212,7 @@ impl ContentWindow {
             selected: None,
             covered: [false; 3],
             picker: false,
+            close_requested: false,
             resizing: false,
             prior_focus: None,
             fallback_focus: cx.focus_handle(),
@@ -217,6 +229,7 @@ impl ContentWindow {
         cx: &mut Context<Self>,
     ) {
         let ContentRequest {
+            remote,
             root,
             relative,
             workspace,
@@ -227,7 +240,11 @@ impl ContentWindow {
             if matches!(entry.viewer.state(), State::Loading) {
                 return;
             }
-            let signature = gitterm_core::content::file_version_signature(&root.join(&relative));
+            let signature = if remote.is_none() {
+                gitterm_core::content::file_version_signature(&root.join(&relative))
+            } else {
+                None
+            };
             if signature.is_some()
                 && entry
                     .viewer
@@ -258,9 +275,16 @@ impl ContentWindow {
                 self.entries.insert(
                     id,
                     Entry {
-                        source: Source::Local {
-                            root: root.clone(),
-                            relative: relative.clone(),
+                        source: if remote.is_some() {
+                            Source::Remote {
+                                root: root.clone(),
+                                relative: relative.clone(),
+                            }
+                        } else {
+                            Source::Local {
+                                root: root.clone(),
+                                relative: relative.clone(),
+                            }
                         },
                         viewer,
                         covers: [None; 3],
@@ -279,9 +303,16 @@ impl ContentWindow {
         self.entries.insert(
             id.clone(),
             Entry {
-                source: Source::Local {
-                    root: root.clone(),
-                    relative: relative.clone(),
+                source: if remote.is_some() {
+                    Source::Remote {
+                        root: root.clone(),
+                        relative: relative.clone(),
+                    }
+                } else {
+                    Source::Local {
+                        root: root.clone(),
+                        relative: relative.clone(),
+                    }
                 },
                 viewer,
                 covers: [None; 3],
@@ -292,7 +323,14 @@ impl ContentWindow {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { Document::local_file_with_font(&root, &relative, dark, font) })
+                .spawn(async move {
+                    match remote {
+                        Some(source) => {
+                            Document::remote_file(&source, &root.join(&relative), dark, font)
+                        }
+                        None => Document::local_file_with_font(&root, &relative, dark, font),
+                    }
+                })
                 .await;
             _ = this.update(cx, |this, cx| {
                 if let Some(entry) = this.entries.get_mut(&id) {
@@ -305,6 +343,60 @@ impl ContentWindow {
         // Newly opened entries also inherit covers that predate their creation.
         self.apply_covers(window, cx);
     }
+    /// A dedicated read-only document prepared off-thread, with the same cover,
+    /// geometry and stale-completion handling as ordinary Viewer content.
+    pub(crate) fn open_prepared(
+        &mut self,
+        id: String,
+        origin: Origin,
+        prepare: impl FnOnce() -> Result<Document, String> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close(&id);
+        self.close_requested = false;
+        let mut failed = None;
+        let host = WindowHost::new(window, None).unwrap_or_else(|error| {
+            failed = Some(error);
+            WindowHost {
+                native: None,
+                navigation: vec![],
+                page: None,
+            }
+        });
+        let mut viewer = RetainedViewer::new(host);
+        let ticket = viewer.begin_content(origin);
+        self.entries.insert(
+            id.clone(),
+            Entry {
+                source: Source::Prepared,
+                viewer,
+                covers: [None; 3],
+            },
+        );
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(error) = failed {
+                        Err(error)
+                    } else {
+                        prepare()
+                    }
+                })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if let Some(entry) = this.entries.get_mut(&id) {
+                    entry.viewer.complete_content(&ticket, result);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        self.apply_covers(window, cx);
+        cx.notify();
+    }
+
     /// Load `url` in the Page entry `id`. The same store reuses its surface;
     /// another store rebuilds it, since a WebKit view's store is fixed.
     #[allow(clippy::too_many_arguments)]
@@ -455,10 +547,14 @@ impl ContentWindow {
     pub(crate) fn page_policy(&self, id: &str) -> Option<Rc<RefCell<PagePolicy>>> {
         self.entries.get(id)?.viewer.host().page.clone()
     }
-    pub(super) fn displayed_text(&self, root: &Path, relative: &Path) -> Option<&str> {
+    pub(crate) fn displayed_text(&self, root: &Path, relative: &Path) -> Option<&str> {
         let entry = self.entries.get(self.selected.as_deref()?)?;
         match &entry.source {
             Source::Local {
+                root: entry_root,
+                relative: entry_relative,
+            }
+            | Source::Remote {
                 root: entry_root,
                 relative: entry_relative,
             } if entry_root == root && entry_relative == relative => {
@@ -468,23 +564,48 @@ impl ContentWindow {
         }
     }
     #[cfg(test)]
-    pub(super) fn document(&self, id: &str) -> Option<&Document> {
+    pub(crate) fn document(&self, id: &str) -> Option<&Document> {
         let viewer = &self.entries.get(id)?.viewer;
         (viewer.state() != State::Loading)
             .then(|| viewer.document())
             .flatten()
     }
-    pub(super) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
+    pub(crate) fn source(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
         match &self.entries.get(id)?.source {
-            Source::Local { root, relative } => Some((root.clone(), relative.clone())),
-            Source::Page { .. } => None,
+            Source::Local { root, relative } | Source::Remote { root, relative } => {
+                Some((root.clone(), relative.clone()))
+            }
+            Source::Page { .. } | Source::Prepared => None,
         }
+    }
+    pub(crate) fn remote_html(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Option<String>, String> {
+        let Some(entry) = self.selected.as_ref().and_then(|id| self.entries.get(id)) else {
+            return Ok(None);
+        };
+        if let Source::Remote {
+            root: entry_root,
+            relative: entry_relative,
+        } = &entry.source
+            && root == entry_root
+            && relative == entry_relative
+        {
+            return entry
+                .viewer
+                .document()
+                .map(|document| Some(document.html.clone()))
+                .ok_or_else(|| "Remote preview is not loaded".into());
+        }
+        Ok(None)
     }
     /// The URL and login store a Page entry was asked to show.
     pub(crate) fn page(&self, id: &str) -> Option<(&str, &PageStore)> {
         match &self.entries.get(id)?.source {
             Source::Page { url, store, .. } => Some((url, store)),
-            Source::Local { .. } => None,
+            Source::Local { .. } | Source::Remote { .. } | Source::Prepared => None,
         }
     }
     /// Whether the workspace's viewer cover currently shows this pane.
@@ -710,6 +831,7 @@ mod tests {
                 this.open(
                     "a".into(),
                     ContentRequest {
+                        remote: None,
                         root: root.path().into(),
                         relative: "a.html".into(),
                         workspace: 1,
@@ -771,6 +893,7 @@ mod tests {
                 this.open(
                     "a".into(),
                     ContentRequest {
+                        remote: None,
                         root: root.path().into(),
                         relative: "a.html".into(),
                         workspace: 1,

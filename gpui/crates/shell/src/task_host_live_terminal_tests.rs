@@ -340,6 +340,10 @@ fn golive10_review_f3_closed_imported_cli_stays_closed(cx: &mut TestAppContext) 
                 .contains("Close terminal")
         );
     });
+    assert!(
+        !desktop.snapshot().wait().unwrap().workspaces.dirty,
+        "failed-close refocus must not enqueue a dirty selection retry"
+    );
     assert_eq!(
         std::fs::read(fixture.iced.join("workspaces.json")).unwrap(),
         before

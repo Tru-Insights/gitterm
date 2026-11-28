@@ -9940,30 +9940,30 @@ impl App {
             tabs: ws
                 .tabs
                 .iter()
-                .map(|tab| WorkspaceTabConfig {
-                    extra: Default::default(),
-                    // Terminal-style tabs persist their tracked local
-                    // cwd; source-browsing tabs persist the browser dir
-                    // so remote workspaces restore where they left off.
-                    dir: if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. })
+                .map(|tab| {
+                    // Terminal-style tabs persist their tracked local cwd;
+                    // source-browsing tabs keep the remote browser directory.
+                    let dir = if matches!(ws.location, WorkspaceLocation::RemoteAgent { .. })
                         && tab.startup_command().is_none()
                     {
                         tab.files.dir.display()
                     } else {
                         tab.current_dir.to_string_lossy().to_string()
-                    },
-                    repo_dir: Some(tab.repo_path.to_string_lossy().to_string()),
-                    startup_command: tab.startup_command().map(String::from),
-                    tab_kind: match &tab.kind {
+                    };
+                    let mut config = WorkspaceTabConfig::from_terminal(
+                        Path::new(&dir),
+                        &tab.repo_path,
+                        tab.startup_command(),
+                        &tab.session_target(),
+                        tab.chat_session_id.clone(),
+                        tab.worker_shutdown_refused,
+                    );
+                    config.tab_kind = match &tab.kind {
                         TabKind::Terminal(_) => None, // omitted for backward compat
                         TabKind::Agent(_) => Some("agent".to_string()),
-                    },
-                    agent_config: tab.agent_session().map(|s| s.config.clone()),
-                    chat_session_id: tab.chat_session_id.clone(),
-                    task_id: tab.task_id.clone(),
-                    task_session_id: tab.task_session_id.clone(),
-                    worker_shutdown_refused: tab.worker_shutdown_refused,
-                    session_uid: Some(tab.session_uid.clone()),
+                    };
+                    config.agent_config = tab.agent_session().map(|s| s.config.clone());
+                    config
                 })
                 .collect(),
             // The run command is a pre-TRU-180 field, from the home repo,
@@ -9975,6 +9975,7 @@ impl App {
                 .iter()
                 .filter(|bt| bt.run.is_none())
                 .map(|bt| BottomTerminalConfig {
+                    extra: Default::default(),
                     dir: bt.cwd.to_string_lossy().to_string(),
                 })
                 .collect(),

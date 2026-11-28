@@ -230,10 +230,30 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let out_dir = browser_out_dir();
+        let remote_html = self.content.read(cx).remote_html(&root, &relative);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { browser_page(&root, &relative, dark, &out_dir) })
+                .spawn(async move {
+                    if let Some(html) = remote_html? {
+                        let mut file = tempfile::Builder::new()
+                            .prefix("gitterm-gpui-")
+                            .suffix("-preview.html")
+                            .tempfile_in(&out_dir)
+                            .map_err(|error| {
+                                format!("Create remote preview in {}: {error}", out_dir.display())
+                            })?;
+                        use std::io::Write as _;
+                        file.write_all(html.as_bytes())
+                            .map_err(|error| format!("Write remote preview: {error}"))?;
+                        let (_, path) = file
+                            .keep()
+                            .map_err(|error| format!("Keep remote preview: {error}"))?;
+                        Ok(Some(path))
+                    } else {
+                        browser_page(&root, &relative, dark, &out_dir)
+                    }
+                })
                 .await;
             _ = this.update(cx, |this, cx| {
                 if let Err(error) =

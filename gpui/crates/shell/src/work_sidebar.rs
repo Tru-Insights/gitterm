@@ -745,13 +745,6 @@ impl WorkSidebar {
             {
                 cx.open_url(url)
             }
-            WorkSidebarOutcome::OpenDocument { workspace, path } => {
-                if let Some(source) = &self.source {
-                    _ = source.owner.update(cx, |owner, cx| {
-                        owner.open_file(crate::data::WorkspaceId(*workspace), path.clone(), cx)
-                    });
-                }
-            }
             _ => {}
         }
         cx.emit(outcome);

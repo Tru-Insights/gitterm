@@ -3,8 +3,8 @@
 //! `window` owns the shell's surfaces, off-thread preparation, native result
 //! draining, deadlines, selection and window-relative pane geometry. Component
 //! popup/dialog state and native pickers cover the selected surface before paint.
-//! There are no IPC handlers. Document links follow the Iced Viewer
-//! network/navigation policy; a remote Page has its own login store and policy.
+//! A local message can only request viewer dismissal. Document links follow the
+//! Iced Viewer network/navigation policy; a remote Page has its own login store and policy.
 pub(crate) mod actions;
 pub mod host;
 pub mod overlay;
@@ -102,6 +102,37 @@ impl Document {
                 path.display()
             ));
         }
+        Self::text_load(&path, load, dark, font)
+    }
+
+    pub(crate) fn remote_file(
+        source: &crate::remote_client::source::RemoteSource,
+        path: &Path,
+        dark: bool,
+        font: f32,
+    ) -> Result<Self, String> {
+        let content = source
+            .client
+            .source_read(&source.spec, path.to_string_lossy().into_owned());
+        let load =
+            gitterm_core::content::shape_source_file_load(0, path.to_path_buf(), content, dark);
+        if let Some(html) = load.webview_content {
+            return Ok(Self {
+                html,
+                text: load.file_content,
+                signature: None,
+                page_url: None,
+            });
+        }
+        Self::text_load(path, load, dark, font)
+    }
+
+    fn text_load(
+        path: &Path,
+        load: gitterm_core::content::FileLoadSnapshot,
+        dark: bool,
+        font: f32,
+    ) -> Result<Self, String> {
         let escape = gitterm_core::file_page::html_escape;
         let (background, foreground, muted) = if dark {
             ("#1e1e2e", "#cdd6f4", "#9399b2")
@@ -110,7 +141,7 @@ impl Document {
         };
         let (highlighted, syntax_notice) =
             gitterm_core::content::syntax::build_syntax_highlight_lines(
-                &path,
+                path,
                 &load.file_content,
                 dark,
             );
@@ -154,7 +185,7 @@ impl Document {
                 total_lines - limit
             ));
         }
-        if load.file_content.is_empty() {
+        if load.file_content.is_empty() && load.file_preview_notice.is_none() {
             body.push_str("(empty file)");
         }
         body.push_str("</div>");
@@ -176,6 +207,15 @@ impl Document {
             return Err(format!("Invalid plan path: {relative}"));
         }
         Self::local_file(root, Path::new(relative), dark)
+    }
+
+    pub(crate) fn plans_viewer(html: String) -> Self {
+        Self {
+            html,
+            text: String::new(),
+            signature: None,
+            page_url: None,
+        }
     }
 
     /// A remote Page. Only HTTP(S) URLs are accepted.

@@ -342,9 +342,6 @@ impl WorkspaceStatus {
         event: StatusEvent,
         now: Instant,
     ) -> Vec<Command> {
-        if workspace.remote {
-            return vec![];
-        }
         workspace
             .status
             .reduce(event, now)

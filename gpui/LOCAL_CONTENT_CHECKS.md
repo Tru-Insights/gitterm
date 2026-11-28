@@ -10,11 +10,26 @@ Review opens retain their existing behavior.
 Reads use a captured workspace root and core's canonical containment check.
 Missing, unreadable, invalid, oversized and escaping files show an inline error.
 The leaf `Document::plan` adapter additionally uses core's plans path policy with
-an explicit plans/docs root. There is no new plans index/selector: the design
-specifies shared routes and explicit roots, but no separate shell plans control.
-Local Markdown under plans/docs can be opened through Files.
+an explicit plans/docs root. Local Markdown under plans/docs can be opened
+through Files.
 
-One window coordinator selects at most one native surface. Component deferred
+The dedicated Plans Viewer now uses `assets/plans-viewer.html` in that same
+retained WebKit host, including Iced's TOC, section toggles, Collapse/Expand,
+Markdown drop, theme and 40px Back to Terminal header. The Work sidebar opens
+`.plans/` and `docs/` rows in this viewer; other document rows and Files keep
+the ordinary file viewer. Core's `list_documents` is shared with Iced's routes.
+GPUI supplies inert JSON for the captured source/selection rather than starting
+another HTTP listener. No document is copied or written. The shared asset's
+CDN imports remain unchanged. Workspace changes resolve the saved workspace
+home, independent of a session checkout. Workspace/tab changes dismiss Plans as
+Iced does; explicit dismissal restores prior focus.
+
+Focused acceptance tests: `scripts/cargo.sh test --manifest-path gpui/Cargo.toml
+-p gitterm-gpui-shell -j 4 plans_viewer`. Page control tests execute the actual
+shared JavaScript functions in macOS JavaScriptCore without a window or network.
+
+The content coordinators show at most one native surface: Plans covers ordinary
+file content while open. Component deferred
 popup registration covers More, dock menus and nested popovers; dialogs/sheets,
 the Add folder picker and dock motion also hide native content. The component
 root paints the single modal dim layer over the snapshot. The shell's dialogs
