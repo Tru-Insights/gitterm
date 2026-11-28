@@ -1179,15 +1179,15 @@ impl Shell {
         };
         // A terminal bridge browses locally. The Files tab's saved directory
         // is remote-native, just as Iced's SourcePath::Remote ownership test.
+        // Session ids follow the owner's rename alias (go-live 12).
+        let imported = self.owner.read(cx).iced_sessions(&saved);
         let state = self.active(cx);
         let remote_dir = state.active_session.and_then(|id| {
             let pane = state.panes.get(&crate::session_pane_id(id))?.read(cx);
             if pane.startup_command.is_some() {
                 return None;
             }
-            let index = crate::data::iced_sessions(&saved)
-                .iter()
-                .position(|s| s.id == id)?;
+            let index = imported.iter().position(|s| s.id == id)?;
             saved.tabs.get(index).map(|tab| tab.dir.as_str())
         });
         let launch = launch::agent_session_launch(
@@ -1302,7 +1302,7 @@ impl Shell {
             self.remote_agent_location(saved),
             Some(WorkspaceLocationConfig::RemoteAgent { .. })
         );
-        let imported = crate::data::iced_sessions(saved);
+        let imported = self.owner.read(cx).iced_sessions(saved);
         let sessions = self.workspace(workspace).sessions.clone();
         for session in sessions {
             let pane = self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
