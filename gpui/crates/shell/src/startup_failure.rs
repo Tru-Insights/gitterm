@@ -3,19 +3,54 @@ use gpui::{
     App, AppContext as _, Context, IntoElement, Render, Window, WindowOptions, div, prelude::*,
 };
 
-fn detail(error: &str, root: &std::path::Path) -> String {
-    format!("{error}\n\nPreview root: {}", root.display())
+fn detail(error: &str, label: &str, root: &std::path::Path) -> String {
+    format!("{error}\n\n{label}: {}", root.display())
 }
 
-fn root_for_message() -> std::path::PathBuf {
+fn installed_executable() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        .and_then(|macos| {
+            let contents = macos.parent()?;
+            Some(
+                macos.file_name().is_some_and(|name| name == "MacOS")
+                    && contents.file_name().is_some_and(|name| name == "Contents")
+                    && contents.parent().is_some_and(|bundle| {
+                        bundle
+                            .extension()
+                            .is_some_and(|extension| extension == "app")
+                    }),
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn root_for_message() -> (&'static str, std::path::PathBuf) {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let preview = args
+        .iter()
+        .any(|arg| arg == "--preview" || arg == "--sample");
+    let live = !preview && (args.iter().any(|arg| arg == "--live") || installed_executable());
+    if live {
+        let root = gitterm_core::config_paths::desktop_config_dir()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                std::env::var_os("GITTERM_V6_CONFIG_DIR")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| dirs::home_dir().map(|home| home.join(".config/gitterm-v6")))
+                    .unwrap_or_else(|| "<home directory unavailable>".into())
+            });
+        return ("V6 state root", root);
+    }
     let root = std::env::var_os("GITTERM_GPUI_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config/gitterm-gpui")))
         .unwrap_or_else(|| "<home directory unavailable>".into());
     if std::env::args_os().any(|arg| arg == "--sample") {
-        root.join("sample")
+        ("Preview root", root.join("sample"))
     } else {
-        root
+        ("Preview root", root)
     }
 }
 
@@ -41,7 +76,8 @@ impl Render for StartupFailure {
 }
 
 pub(crate) fn show(cx: &mut App, error: &str) {
-    let message = detail(error, &root_for_message());
+    let (label, root) = root_for_message();
+    let message = detail(error, label, &root);
     let opened = cx.open_window(WindowOptions::default(), move |window, cx| {
         let failure = StartupFailure(message);
         let answer = failure.prompt(window, cx);
@@ -73,10 +109,22 @@ mod tests {
     fn startup_failure_presented_to_user_contains_error_and_preview_root() {
         let text = super::detail(
             "recorded launch PID 123 is still alive",
+            "Preview root",
             std::path::Path::new("/tmp/preview"),
         );
         assert!(text.contains("PID 123 is still alive"));
         assert!(text.contains("Preview root: /tmp/preview"));
+    }
+
+    #[test]
+    fn startup_failure_uses_the_v6_state_root_label_in_live_mode() {
+        let text = super::detail(
+            "could not open state",
+            "V6 state root",
+            std::path::Path::new("/tmp/v6"),
+        );
+        assert!(text.contains("V6 state root: /tmp/v6"));
+        assert!(!text.contains("Preview root"));
     }
 
     #[gpui::test]
@@ -86,6 +134,7 @@ mod tests {
             cx.open_window(gpui::WindowOptions::default(), |window, cx| {
                 let failure = super::StartupFailure(super::detail(
                     "startup refused",
+                    "Preview root",
                     std::path::Path::new("/tmp/preview"),
                 ));
                 // Exercise the production presentation path without its exit task.

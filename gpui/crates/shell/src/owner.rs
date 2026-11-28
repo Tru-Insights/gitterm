@@ -16,6 +16,7 @@ pub struct WorkspaceOwner {
     pub(crate) worktree_operations: crate::pane::git_view::WorktreeOperations,
     /// Startup park metadata blocks PTY construction until explicit resume.
     pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
+    pub(crate) notifications: Option<crate::notifications::Notifications>,
     pub model: WorkspaceStatus,
     pub error: Option<String>,
     pub(crate) workspace_save_pending: bool,
@@ -186,8 +187,13 @@ impl WorkspaceOwner {
             }
             std::future::ready(())
         });
+        let notifications = crate::chat::policy::is_live(cx).then(|| {
+            tasks.push(crate::notifications::start(cx));
+            crate::notifications::Notifications::new(Instant::now())
+        });
         Self {
             worktree_operations: Default::default(),
+            notifications,
             stopped_workspaces: Default::default(),
             model,
             files: Default::default(),

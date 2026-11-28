@@ -954,6 +954,7 @@ impl crate::Shell {
                         session.title = title.clone();
                         pane.update(cx, |pane, cx| {
                             pane.title = title.clone();
+                            pane.notification_chat_title = Some(title.clone());
                             cx.notify();
                         });
                     }
@@ -971,6 +972,54 @@ impl crate::Shell {
     ) {
         // Labels belong to every open tab, independently of history availability.
         self.load_iced_strip_titles(window, cx);
+        if self.live_chat_enabled(cx) {
+            // Iced restores every open agent tab. Register background panes too,
+            // so delivery can reach them before they are ever selected. Resume
+            // defers the provider process until a prompt is actually submitted.
+            let selected = self.active_workspace(cx).and_then(|workspace| {
+                let state = self
+                    .workspaces
+                    .iter()
+                    .find(|state| state.workspace.id == workspace)?;
+                Some((workspace, state.active_session?))
+            });
+            let mut tabs: Vec<_> = self
+                .workspaces
+                .iter()
+                .flat_map(|state| {
+                    state.sessions.iter().filter_map(|session| {
+                        let pane = state.panes.get(&crate::session_pane_id(session.id))?;
+                        if !matches!(
+                            pane.read(cx).content,
+                            crate::pane::PaneContent::IcedSession(_)
+                        ) {
+                            return None;
+                        }
+                        let tab = self
+                            .data
+                            .imported_chat(state.workspace.id, session.id, cx)?;
+                        Some((state.workspace.id, session.id, tab))
+                    })
+                })
+                .collect();
+            // A saved conversation can appear in more than one tab. Keep the
+            // selected tab's existing priority when resume reuses its pane.
+            tabs.sort_by_key(|(workspace, id, _)| Some((*workspace, *id)) != selected);
+            for (workspace, id, tab) in tabs {
+                if let Err(error) =
+                    self.mount_live_chat(workspace, tab, Some(id), false, window, cx)
+                {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some(format!(
+                            "Resume chat in workspace {}: {error:#}",
+                            workspace.0
+                        ));
+                        cx.notify();
+                    });
+                }
+            }
+            return;
+        }
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
@@ -988,15 +1037,6 @@ impl crate::Shell {
             pane.read(cx).content,
             crate::pane::PaneContent::IcedSession(_)
         ) {
-            return;
-        }
-        if self.live_chat_enabled(cx) {
-            if let Err(error) = self.mount_live_chat(workspace, tab, Some(id), window, cx) {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some(format!("Resume chat: {error:#}"));
-                    cx.notify();
-                });
-            }
             return;
         }
         // Read the task store with the transcript: the shell's roster facts may
@@ -1342,6 +1382,7 @@ impl crate::Shell {
         workspace: crate::WorkspaceId,
         tab: gitterm_core::workspace_config::WorkspaceTabConfig,
         existing: Option<crate::data::SessionId>,
+        activate: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> anyhow::Result<()> {
@@ -1349,9 +1390,11 @@ impl crate::Shell {
         if let Some(id) = &tab.chat_session_id
             && let Some((workspace, session)) = self.live_chat_location(id, cx)
         {
-            self.reopen_workspace(workspace, window, cx);
-            self.select_workspace_id(workspace, window, cx);
-            self.select_session_id(session, window, cx);
+            if activate {
+                self.reopen_workspace(workspace, window, cx);
+                self.select_workspace_id(workspace, window, cx);
+                self.select_session_id(session, window, cx);
+            }
             return Ok(());
         }
         let owner = self.owner.read(cx);
@@ -1391,7 +1434,7 @@ impl crate::Shell {
         if let Some(error) = error {
             return Err(error);
         }
-        self.install_live_pane(workspace, view, existing, window, cx);
+        self.install_live_pane(workspace, view, existing, activate, window, cx);
         Ok(())
     }
 
@@ -1400,6 +1443,7 @@ impl crate::Shell {
         workspace: crate::WorkspaceId,
         view: gpui::Entity<crate::chat::ChatPane>,
         existing: Option<crate::data::SessionId>,
+        activate: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
@@ -1456,9 +1500,11 @@ impl crate::Shell {
                 kind: crate::data::SessionKind::Chat,
             });
         }
-        self.reopen_workspace(workspace, window, cx);
-        self.select_workspace_id(workspace, window, cx);
-        self.select_session_id(id, window, cx);
+        if activate {
+            self.reopen_workspace(workspace, window, cx);
+            self.select_workspace_id(workspace, window, cx);
+            self.select_session_id(id, window, cx);
+        }
         cx.notify();
     }
 
@@ -1511,7 +1557,7 @@ impl crate::Shell {
                             )
                         })
                 });
-            return self.mount_live_chat(workspace, tab, existing, window, cx);
+            return self.mount_live_chat(workspace, tab, existing, true, window, cx);
         }
         // A closed tab can still carry the recorded configuration in another
         // workspace. Prefer it over the index's backend/cwd-only metadata.
@@ -1520,7 +1566,7 @@ impl crate::Shell {
             workspace.tabs.iter().find(|tab| tab.chat_session_id.as_deref() == Some(id)).cloned().map(|tab| (crate::WorkspaceId(index as u64 + 1), tab))
         }));
         if let Some((workspace, tab)) = recorded {
-            return self.mount_live_chat(workspace, tab, None, window, cx);
+            return self.mount_live_chat(workspace, tab, None, true, window, cx);
         }
         let indexed = indexed.or_else(|| {
             self.work_sidebars.get(&workspace).and_then(|sidebar| {
@@ -1540,7 +1586,7 @@ impl crate::Shell {
         );
         let tab =
             crate::chat::resume::tab(&indexed.cwd, fresh_target().session_uid, Some(id.into()));
-        self.mount_live_chat(workspace, tab, None, window, cx)
+        self.mount_live_chat(workspace, tab, None, true, window, cx)
     }
 }
 
@@ -1828,7 +1874,7 @@ impl crate::Shell {
                     continue;
                 }
                 if let Err(error) =
-                    self.mount_live_chat(workspace, tab, Some(session.id), window, cx)
+                    self.mount_live_chat(workspace, tab, Some(session.id), false, window, cx)
                 {
                     self.owner.update(cx, |owner, cx| {
                         owner.error = Some(format!("Resume chat: {error:#}"));
@@ -2047,6 +2093,41 @@ impl crate::Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn live_restore_keeps_selected_tab_when_background_tab_shares_conversation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let live = tempfile::tempdir().unwrap();
+        let services = gitterm_core::preview::service::ServiceContext::production(
+            live.path(),
+            "restore-selection-test",
+        )
+        .unwrap();
+        cx.update(|cx| crate::chat::policy::install_live(services, cx).unwrap());
+        let (_root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+            file["active_workspace"] = serde_json::json!(1);
+            for (index, uid) in [(0, "background-copy"), (1, "selected-original")] {
+                file["workspaces"][index]["active_tab"] = serde_json::json!(0);
+                file["workspaces"][index]["tabs"] = serde_json::json!([{
+                    "dir": "/fixture/work", "tab_kind": "agent",
+                    "agent_config": {"backend":"claude", "model":"default"},
+                    "session_uid": uid, "chat_session_id": "same-conversation"
+                }]);
+            }
+        });
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(shell.active_workspace(cx), Some(crate::WorkspaceId(2)));
+            let state = shell.active(cx);
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx);
+            let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
+                panic!("selected conversation must be mounted in its selected tab");
+            };
+            assert_eq!(view.read(cx).target().session_uid, "selected-original");
+            assert!(shell.owner.read(cx).chats.contains_key("selected-original"));
+            assert!(!shell.owner.read(cx).chats.contains_key("background-copy"));
+        });
+    }
+
     #[test]
     fn strip_fixture_resolves_all_saved_tabs_and_facts_without_loading_history() {
         use gitterm_core::workspace_config::WorkspacesFile;

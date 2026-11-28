@@ -557,8 +557,15 @@ impl DelegationCard {
                 },
                 self.held || none,
                 true,
-                TranscriptAction::PreviewOnly {
-                    label: label.into(),
+                TranscriptAction::SendDelegation {
+                    id: d.delegation_id.clone(),
+                    finding_ids: self
+                        .findings()
+                        .into_iter()
+                        .flat_map(|findings| &findings.findings)
+                        .filter(|finding| selected.contains(&finding.id))
+                        .map(|finding| finding.id.clone())
+                        .collect(),
                 },
             );
         }
@@ -573,8 +580,8 @@ impl DelegationCard {
                 "",
                 false,
                 false,
-                TranscriptAction::PreviewOnly {
-                    label: "Re-run".into(),
+                TranscriptAction::RerunDelegation {
+                    id: d.delegation_id.clone(),
                 },
             );
         }
