@@ -3034,7 +3034,7 @@ mod live_writes {
                 .for_gpui_live(),
         );
         let owner = cx
-            .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+            .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
             .unwrap();
         // Exercise the same issuance path used by the shell's chat descriptor.
         assert_eq!(

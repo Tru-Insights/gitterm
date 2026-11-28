@@ -584,6 +584,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_log_servers_bind_distinct_ephemeral_ports() {
+        let first_state = ServerState::new();
+        let second_state = ServerState::new();
+        let first = tokio::spawn(start_server_on(
+            first_state.clone(),
+            ListenerBind::LoopbackEphemeral,
+        ));
+        let second = tokio::spawn(start_server_on(
+            second_state.clone(),
+            ListenerBind::LoopbackEphemeral,
+        ));
+
+        let ports = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let first_port = *first_state.bound_port.lock().unwrap();
+                let second_port = *second_state.bound_port.lock().unwrap();
+                if let (Some(first_port), Some(second_port)) = (first_port, second_port) {
+                    break (first_port, second_port);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both log servers should bind");
+        assert_ne!(ports.0, ports.1);
+
+        first_state.shutdown.notify_one();
+        second_state.shutdown.notify_one();
+        for server in [first, second] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("log server did not shut down")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_bind_failure_is_returned() {
         let state = ServerState::new();
         let bind = ListenerBind::Addr(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));

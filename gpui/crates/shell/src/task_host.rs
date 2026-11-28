@@ -364,7 +364,7 @@ impl TaskHostOwner {
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), None, None, cx)
+        Self::start_with(config, Vec::new(), None, None, false, cx)
     }
 
     pub(crate) fn start_locked(
@@ -372,7 +372,7 @@ impl TaskHostOwner {
         lock: Arc<HostLock>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), Some(lock), None, cx)
+        Self::start_with(config, Vec::new(), Some(lock), None, false, cx)
     }
 
     pub(crate) fn start_live(
@@ -381,7 +381,19 @@ impl TaskHostOwner {
         services: Arc<ServiceContext>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
-        Self::start_with(config, Vec::new(), Some(lock), Some(services), cx)
+        Self::start_with(config, Vec::new(), Some(lock), Some(services), false, cx)
+    }
+
+    /// Start live services in tests while keeping each local listener on an
+    /// OS-assigned port. Production startup continues to use the V6 bands.
+    #[cfg(test)]
+    pub(crate) fn start_live_for_test(
+        config: HostConfig,
+        lock: Arc<HostLock>,
+        services: Arc<ServiceContext>,
+        cx: &mut App,
+    ) -> Result<Entity<Self>> {
+        Self::start_with(config, Vec::new(), Some(lock), Some(services), true, cx)
     }
 
     pub(super) fn is_live(&self) -> bool {
@@ -410,7 +422,7 @@ impl TaskHostOwner {
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         anyhow::ensure!(!fixtures.is_empty(), "fixture mode needs a fixture root");
-        Self::start_with(config, fixtures, None, None, cx)
+        Self::start_with(config, fixtures, None, None, false, cx)
     }
 
     fn start_with(
@@ -418,6 +430,7 @@ impl TaskHostOwner {
         fixtures: Vec<PathBuf>,
         lock: Option<Arc<HostLock>>,
         live_services: Option<Arc<ServiceContext>>,
+        ephemeral_listeners: bool,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         let HostConfig {
@@ -478,7 +491,7 @@ impl TaskHostOwner {
             .context("create GPUI task host runtime")?;
         let (sender, commands) = ingress.open();
         let html = gitterm_browser::browser_control::html_preview_runner_in(&services);
-        let (task_mcp, task_server) = if live {
+        let (task_mcp, task_server) = if live && !ephemeral_listeners {
             gitterm_core::task_mcp::prepare(
                 services.task_mcp().instance_id(),
                 sender.clone(),
@@ -497,7 +510,7 @@ impl TaskHostOwner {
         .context("bind GPUI task MCP")?;
         let (browser, browser_server) = {
             let _entered = runtime.enter();
-            if live {
+            if live && !ephemeral_listeners {
                 gitterm_browser::browser_mcp::prepare_production_scoped(
                     services.clone(),
                     SERVER_VERSION,
@@ -518,7 +531,7 @@ impl TaskHostOwner {
             let log = log.clone();
             let instance = services.task_mcp().instance_id().to_owned();
             async move {
-                if live {
+                if live && !ephemeral_listeners {
                     gitterm_core::log_server::start_server(log, &instance).await;
                 } else if let Err(error) =
                     gitterm_core::log_server::start_server_on(log, ListenerBind::LoopbackEphemeral)
@@ -2078,7 +2091,7 @@ mod live_tests {
             ingress: Ingress::Channel(sender.clone(), receiver),
         };
         let owner = cx
-            .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+            .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
             .unwrap();
         owner.read_with(cx, |owner, _| {
             assert_eq!(owner.host.store().as_ref().unwrap().path(), source);
