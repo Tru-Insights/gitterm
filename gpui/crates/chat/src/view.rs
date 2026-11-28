@@ -1,3 +1,4 @@
+mod external;
 /// The host validates the current chat checkout before opening its editor.
 #[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
 #[action(namespace = native_chat, no_json)]
@@ -177,6 +178,7 @@ pub struct ChatView {
     pub(crate) review: review_ui::ReviewComposer,
     slash_scroll: gpui::ScrollHandle,
     roster: Vec<roster::RosterEntry>,
+    external_runs: std::collections::BTreeMap<String, gitterm_core::chat::external::RunView>,
     roster_hidden: HashSet<String>,
     activity_tick: Option<Task<()>>,
     /// Raw fixture ingress only; live projection is always supplied by the owner.
@@ -234,6 +236,7 @@ pub struct ChatView {
 }
 impl gpui::EventEmitter<roster::RosterOutcome> for ChatView {}
 impl gpui::EventEmitter<crate::review::ReviewOutcome> for ChatView {}
+impl gpui::EventEmitter<crate::events::ComposerEvent> for ChatView {}
 impl gpui::EventEmitter<crate::interactions::TranscriptAction> for ChatView {}
 
 impl ChatView {
@@ -329,6 +332,7 @@ impl ChatView {
             review: review_ui::ReviewComposer::new(window, cx),
             slash_scroll: gpui::ScrollHandle::new(),
             roster: vec![],
+            external_runs: Default::default(),
             roster_hidden: HashSet::new(),
             activity_tick: None,
             fixture_composer,
@@ -433,6 +437,7 @@ impl ChatView {
     /// Supply the chat's worker/task roster without giving the view runtime ownership.
     pub fn set_roster(&mut self, rows: Vec<roster::RosterEntry>, cx: &mut Context<Self>) {
         self.roster = rows;
+        self.refresh_external_roster();
         self.sync_activity_tick(cx);
         cx.notify();
     }
@@ -751,6 +756,15 @@ impl ChatView {
             self.composer_state.checkout_choices.clear();
         }
     }
+    pub fn set_checkout(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.fixture_composer.checkout = Some(path.clone());
+        if let Some(state) = &mut self.shadow {
+            state.checkout = Some(path);
+        }
+        self.composer_state.checkout_notice = None;
+        self.reproject();
+        cx.notify();
+    }
     /// The host's source for the checkout menu, asked again whenever it opens.
     pub fn set_checkout_source(
         &mut self,
@@ -840,8 +854,12 @@ impl ChatView {
         if self.composer_state.checkout_locked.is_none()
             && self.composer_state.checkout_path.as_deref() != Some(path)
         {
-            self.composer_state.checkout_notice =
-                Some(format!("{label} · {}", crate::composer::NOT_IN_PREVIEW));
+            if self.delegation_actions_live {
+                cx.emit(crate::events::ComposerEvent::ChooseCheckout(path.into()));
+            } else {
+                self.composer_state.checkout_notice =
+                    Some(format!("{label} · {}", crate::composer::NOT_IN_PREVIEW));
+            }
         }
         self.focus_composer(window, cx);
         cx.notify();
@@ -911,7 +929,8 @@ impl ChatView {
                 state
                     .prestart
                     .retain(|held| std::mem::discriminant(held) != std::mem::discriminant(&change));
-                state.prestart.push(change);
+                state.prestart.push(change.clone());
+                cx.emit(crate::events::ComposerEvent::SettingConfigured(change));
                 self.reproject();
             } else if !selected && let Some(callback) = &self.callback {
                 let receipt = callback(ChatIntent::ChangeSetting { change }, cx);
@@ -2222,6 +2241,7 @@ impl RowView {
             cx.notify();
         });
         let open = match (&row.delegation, &row.tool) {
+            (None, None) if row.external_run.is_some() => false,
             (Some(card), _) => card.delegation.dismissed_at.is_none(),
             // Iced opens a tool card, live or replayed, until its result.
             (None, Some(tool)) => tool.output.is_none(),
@@ -2434,9 +2454,17 @@ impl Render for RowView {
             RowKind::Error => palette.err,
             RowKind::Permission | RowKind::Question => palette.warn,
             RowKind::Delegation if self.row.delivery.is_none() => {
-                self.row.delegation.as_ref().map_or(palette.result, |card| {
-                    transcript::card_border(card, palette)
-                })
+                if let Some(run) = &self.row.external_run {
+                    if run.state == gitterm_core::chat::external::RunState::Running {
+                        palette.accent
+                    } else {
+                        palette.result
+                    }
+                } else {
+                    self.row.delegation.as_ref().map_or(palette.result, |card| {
+                        transcript::card_border(card, palette)
+                    })
+                }
             }
             RowKind::Worker | RowKind::Delegation => palette.result,
             _ => palette.fg,
@@ -2489,10 +2517,11 @@ impl Render for RowView {
                 )
             })
             .children(self.render_queued_tag());
+        let rendered_title = external::display_title(&self.row);
         let header = div()
             .text_size(px(self.appearance.size(13.)))
             .text_color(rgb(color))
-            .child(self.row.title.clone());
+            .child(rendered_title.clone());
         let run_summary = self.run_summary.clone().map(|label| {
             let toggle = self.run_toggle.clone();
             let id = self.row.id;
@@ -2752,7 +2781,7 @@ impl Render for RowView {
                                                                     } else {
                                                                         "▸"
                                                                     },
-                                                                    self.row.title
+                                                                    rendered_title
                                                                 )),
                                                         )
                                                     })

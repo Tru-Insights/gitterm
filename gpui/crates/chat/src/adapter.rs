@@ -143,6 +143,31 @@ impl ChatAdapter {
     pub fn state(&self) -> &State {
         &self.state
     }
+    pub fn configure_setting(
+        &mut self,
+        config: AgentBackendConfig,
+        change: SettingChange,
+    ) -> Effect {
+        self.state.reduce(Intent::ConfigureSetting {
+            config,
+            process_running: false,
+            change,
+        })
+    }
+    pub fn choose_checkout(
+        &mut self,
+        runtime: RuntimeStamp,
+        current: session::Target,
+        context: gitterm_core::chat::state::CheckoutContext,
+        path: std::path::PathBuf,
+    ) -> Effect {
+        self.state.reduce(Intent::ChooseCheckout {
+            runtime,
+            current,
+            context,
+            path,
+        })
+    }
     pub fn bind_session(&mut self, id: Option<String>) {
         self.state.reduce(Intent::BindSession(id));
     }

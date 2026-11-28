@@ -36,7 +36,6 @@ pub mod content;
 pub mod file_page;
 pub mod plans;
 
-#[cfg(feature = "runtime")]
 pub mod atomic_file;
 pub mod limits;
 pub mod plan_limits;
@@ -66,6 +65,8 @@ pub mod work_notes;
 // Delegation services and runtime lifecycle authority; hosts execute effects.
 #[cfg(feature = "runtime")]
 pub mod checkout_name;
+#[cfg(feature = "runtime")]
+pub mod codex_exec;
 #[cfg(feature = "runtime")]
 pub mod codex_review;
 #[cfg(feature = "runtime")]

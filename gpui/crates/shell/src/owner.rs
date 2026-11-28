@@ -465,12 +465,9 @@ impl WorkspaceOwner {
                     .session_uid
                     .as_deref()
                     .ok_or("Live chat has no caller identity")?;
-                let id = tab
-                    .chat_session_id
-                    .as_deref()
-                    .ok_or("Live chat has no confirmed provider identity")?;
+                let id = tab.chat_session_id.as_deref();
                 if workspace.tabs.iter().any(|saved| {
-                    saved.chat_session_id.as_deref() == Some(id)
+                    id.is_some() && saved.chat_session_id.as_deref() == id
                         && saved
                             .session_uid
                             .as_deref()
@@ -486,7 +483,7 @@ impl WorkspaceOwner {
                 }
                 if let Some(saved) = workspace.tabs.iter_mut().find(|t| {
                     t.session_uid == tab.session_uid
-                        || (t.session_uid.is_none() && t.chat_session_id == tab.chat_session_id)
+                        || (tab.chat_session_id.is_some() && t.session_uid.is_none() && t.chat_session_id == tab.chat_session_id)
                 }) {
                     *saved = tab;
                 } else {
@@ -540,7 +537,9 @@ impl WorkspaceOwner {
             }
             if let Some(saved) = workspace.tabs.iter_mut().find(|saved| {
                 saved.session_uid == tab.session_uid
-                    || (saved.session_uid.is_none() && saved.chat_session_id == tab.chat_session_id)
+                    || (tab.chat_session_id.is_some()
+                        && saved.session_uid.is_none()
+                        && saved.chat_session_id == tab.chat_session_id)
             }) {
                 *saved = tab;
             } else {
