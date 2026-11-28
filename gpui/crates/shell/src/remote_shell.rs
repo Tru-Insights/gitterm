@@ -1052,7 +1052,12 @@ impl Shell {
             return;
         }
         if !self.live_chat_enabled(cx) {
-            self.preview_unavailable("Remote terminal", cx);
+            let label = match kind {
+                launch::SessionKind::Shell => "Shell",
+                launch::SessionKind::Codex => "Codex",
+                launch::SessionKind::Claude => "Claude",
+            };
+            self.chrome_unavailable(label, cx);
             return;
         }
         let Some(config) = self.active_remote_session(cx) else {
