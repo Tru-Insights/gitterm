@@ -528,6 +528,9 @@ impl ChatView {
         cx.notify();
     }
     pub fn set_status_error(&mut self, error: String, cx: &mut Context<Self>) {
+        if self.read_only_reason.as_deref() == Some(error.as_str()) {
+            return;
+        }
         self.composer_state.notice = Some(error);
         cx.notify();
     }

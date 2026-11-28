@@ -355,6 +355,7 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
             .child(
                 div()
                     .text_size(px(13.))
+                    .font_family("Menlo")
                     .text_color(rgb(if active { c.text } else { c.subtext0 }))
                     .child(session.label(input.remote)),
             );
@@ -373,7 +374,13 @@ pub fn render(input: &Input, c: Colors, emit: Handler<Outcome>) -> gpui::Statefu
         if let Some(hint) = shortcut(position) {
             tab = tab.child(
                 div()
+                    .id(SharedString::from(format!(
+                        "pstrip-session-shortcut-{}",
+                        id.0
+                    )))
+                    .debug_selector(move || format!("pstrip-session-shortcut-{}", id.0))
                     .text_size(px(10.))
+                    .font_family("Menlo")
                     .text_color(rgb(c.surface2))
                     .child(hint),
             );
@@ -814,5 +821,29 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[gpui::test]
+    fn ordinary_session_tab_keeps_iced_shortcut_and_close_without_attention(
+        cx: &mut TestAppContext,
+    ) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| View {
+            input: input(),
+            events: Rc::new(RefCell::new(vec![])),
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let active = view.input.sessions[0]
+                .icon(true, false, Colors::new(true))
+                .0;
+            assert_eq!(active, "✦ ");
+            assert_eq!(view.input.sessions[0].label(false), "Fix login");
+        });
+        assert!(cx.debug_bounds("pstrip-session-11").is_some());
+        assert!(cx.debug_bounds("pstrip-session-shortcut-11").is_some());
+        assert!(cx.debug_bounds("pstrip-session-close-11").is_some());
     }
 }
