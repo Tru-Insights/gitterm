@@ -100,6 +100,8 @@ impl ReviewIpc {
 
 #[derive(Debug)]
 pub enum Intent {
+    /// A presentation-only filter; the collected diff and generation stay intact.
+    SetHideNoise(bool),
     Open {
         target: ReviewTarget,
         source: ReviewSource,
@@ -201,6 +203,13 @@ impl State {
     }
     pub fn reduce(&mut self, intent: Intent) -> Vec<Effect> {
         match intent {
+            Intent::SetHideNoise(hide_noise) => {
+                let Some(pane) = self.pane.as_mut() else {
+                    return Vec::new();
+                };
+                pane.hide_noise = hide_noise;
+                vec![Effect::Render]
+            }
             Intent::Open {
                 target,
                 source,
