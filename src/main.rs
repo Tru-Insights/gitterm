@@ -2404,38 +2404,7 @@ impl ParkMode {
     }
 }
 
-/// Why a running parked workspace came back to the bar (TRU-186), shown
-/// on its chip until it is visited.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeReason {
-    NeedsYou,
-    Finished,
-    Failed,
-}
-
-impl WakeReason {
-    /// The chat attention marks that wake it: a question or permission
-    /// request, a finished turn, an error. Delegation results are not a
-    /// chat of its own asking.
-    fn for_attention(reason: AttentionReason) -> Option<Self> {
-        match reason {
-            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
-            AttentionReason::CompletedUnread => Some(Self::Finished),
-            AttentionReason::AgentFailed => Some(Self::Failed),
-            AttentionReason::DelegationReady(_)
-            | AttentionReason::DelegationFailed(_)
-            | AttentionReason::DelegationBlocked(_) => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NeedsYou => "needs you",
-            Self::Finished => "finished",
-            Self::Failed => "failed",
-        }
-    }
-}
+use gitterm_core::park::WakeReason;
 
 /// The wake a chat event raises: the attention mark it drives today
 /// (`agent_event_attention_reason`), no detection of its own.
@@ -3563,58 +3532,7 @@ impl RunOutput {
 
 use gitterm_core::workspace_config::detect_run_command;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttentionReason {
-    HumanInputRequired,
-    AgentFailed,
-    CompletedUnread,
-    /// A Codex review or consult this tab requested has its result (TRU-142).
-    DelegationReady(gitterm::tasks::DelegationKind),
-    /// A Codex review or consult this tab requested failed.
-    DelegationFailed(gitterm::tasks::DelegationKind),
-    /// A worker this tab delegated reported itself blocked (TRU-142 S6):
-    /// it needs the human.
-    DelegationBlocked(gitterm::tasks::DelegationKind),
-}
-
-impl AttentionReason {
-    /// Rank on the shared attention scale: 0 input needed · 1 failed ·
-    /// 2 interrupted (task-only) · 3 ready to review. Failures outrank
-    /// completions by construction.
-    fn priority(self) -> u8 {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => 0,
-            Self::AgentFailed | Self::DelegationFailed(_) => 1,
-            Self::CompletedUnread | Self::DelegationReady(_) => 3,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired => gitterm_core::attention_notifications::INPUT_REQUIRED,
-            Self::AgentFailed => "Agent failed",
-            Self::CompletedUnread => "Ready to review",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Review) => "Review ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Consult) => "Consult ready",
-            Self::DelegationReady(gitterm::tasks::DelegationKind::Implement) => "Worker done",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Review) => "Review failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Consult) => "Consult failed",
-            Self::DelegationFailed(gitterm::tasks::DelegationKind::Implement) => "Worker failed",
-            Self::DelegationBlocked(gitterm::tasks::DelegationKind::Implement) => {
-                gitterm_core::attention_notifications::WORKER_BLOCKED
-            }
-            Self::DelegationBlocked(_) => gitterm_core::attention_notifications::DELEGATION_BLOCKED,
-        }
-    }
-
-    fn icon(self) -> &'static str {
-        match self {
-            Self::HumanInputRequired | Self::DelegationBlocked(_) => "●",
-            Self::AgentFailed | Self::DelegationFailed(_) => "!",
-            Self::CompletedUnread | Self::DelegationReady(_) => "✓",
-        }
-    }
-}
+use gitterm_core::attention::AttentionReason;
 
 #[derive(Debug, Clone, Copy)]
 struct TabAttention {
@@ -3914,9 +3832,7 @@ use gitterm_core::attention_notifications::{
 };
 
 fn terminal_title_attention_reason(title: &str) -> Option<AttentionReason> {
-    title
-        .starts_with('✳')
-        .then_some(AttentionReason::HumanInputRequired)
+    gitterm_core::attention::terminal_title_attention_reason(title)
 }
 
 /// Row presentation for a task attention reason on the shared priority
@@ -3933,49 +3849,13 @@ fn task_attention_presentation(reason: TaskAttentionReason) -> (u8, &'static str
     }
 }
 
-/// What a chat tab's icon in the session strip says about its live session
-/// (TRU-140). Terminal tabs get this from Claude's own title; a chat tab
-/// has no title, so the strip reads the agent session instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatTabMarker {
-    /// A permission prompt or question waits on the human: the strip's
-    /// "needs you" dot. `pulse` is off on the tab in front, whose page
-    /// already shows the request card.
-    NeedsYou { pulse: bool },
-    /// A turn is running: the strip's ▶ marker.
-    Running,
-}
-
-/// The marker for a chat tab: a pending request outranks a running turn
-/// (the human is the blocker); neither means the tab falls back to its
-/// attention icon or the idle chat glyph. Clears as soon as the requests
-/// are answered and the turn ends, since both inputs are live state.
-fn chat_tab_marker(
-    turn_running: bool,
-    pending_requests: usize,
-    is_active: bool,
-) -> Option<ChatTabMarker> {
-    if pending_requests > 0 {
-        Some(ChatTabMarker::NeedsYou { pulse: !is_active })
-    } else if turn_running {
-        Some(ChatTabMarker::Running)
-    } else {
-        None
-    }
-}
+use gitterm_core::attention::{chat_tab_marker, ChatTabMarker};
 
 fn agent_event_attention_reason(event: &tab::AgentEvent) -> Option<AttentionReason> {
     match event {
-        tab::AgentEvent::Harness(harness_event) => match harness_event {
-            HarnessEvent::RuntimeRequest { .. } => Some(AttentionReason::HumanInputRequired),
-            HarnessEvent::TurnCompleted { status, .. } => match status {
-                TurnStatus::Completed => Some(AttentionReason::CompletedUnread),
-                TurnStatus::Failed(_) => Some(AttentionReason::AgentFailed),
-                TurnStatus::Interrupted => None,
-            },
-            HarnessEvent::Error(_) => Some(AttentionReason::AgentFailed),
-            _ => None,
-        },
+        tab::AgentEvent::Harness(event) => {
+            gitterm_core::attention::harness_event_attention_reason(event)
+        }
         tab::AgentEvent::Result(_) => Some(AttentionReason::CompletedUnread),
         tab::AgentEvent::Other(value) => match value.get("type").and_then(|value| value.as_str()) {
             Some("done") => Some(AttentionReason::CompletedUnread),
@@ -23855,7 +23735,8 @@ impl App {
         let stt_recording = false;
         if self.any_tab_requires_attention_pulse() || stt_recording {
             subs.push(
-                iced::time::every(Duration::from_millis(500)).map(|_| Event::AttentionPulseTick),
+                iced::time::every(gitterm_core::attention::PULSE_INTERVAL)
+                    .map(|_| Event::AttentionPulseTick),
             );
         }
 

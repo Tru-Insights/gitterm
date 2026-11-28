@@ -4,6 +4,7 @@
 //! and persistence. The optional runtime owns status jobs and remote transport;
 //! hosts supply credential resolution and local path display.
 
+pub mod attention;
 pub mod attention_notifications;
 #[cfg(unix)]
 pub mod backup;
