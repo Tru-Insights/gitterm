@@ -1,12 +1,12 @@
-//! Standalone Iced Find sidebar and centre preview. No discovery or launch I/O.
+//! Iced Find sidebar and centre preview; discovery and launches belong to the shell.
 //!
 //! Host hookup: retain `Rc<RefCell<State>>`, with one selection owner (the tab's
 //! stable session UID). Mount `FindSidebar` in the left content region and
 //! `FindPreview` in the centre while that owner has a selection. Subscribe to
 //! `FindOutcome` on both. Reduce `outcome.intent(state, owner)` and execute core
 //! effects asynchronously, returning their exact index/preview stamps. Open
-//! focuses an existing conversation. Process/workspace controls emit Unavailable
-//! and the host shows its existing notice without performing the operation. On
+//! focuses an existing conversation. Live resume, ownership and indexing controls
+//! reach the shared shell paths; Preview emits Unavailable. On
 //! workspace changes update Filter.machine/workspace_root; refresh both entities
 //! after reductions or host-fact changes. Closing returns to the host's overview.
 
@@ -43,6 +43,8 @@ pub enum FindOutcome {
     SetBackend(Option<ChatBackend>),
     Select { id: ChatRef },
     ClosePreview,
+    GoToChatOwner { id: ChatRef },
+    IndexOlderChats,
     Open { id: ChatRef },
     Resume { id: ChatRef, mode: ResumeMode },
     Unavailable(String),
@@ -68,7 +70,12 @@ impl FindOutcome {
                 });
             }
             Self::ClosePreview => return Some(Intent::ClosePreview(owner.into())),
-            Self::Open { .. } | Self::Resume { .. } | Self::Unavailable(_) | Self::OpenFile(_) => {
+            Self::GoToChatOwner { .. }
+            | Self::IndexOlderChats
+            | Self::Open { .. }
+            | Self::Resume { .. }
+            | Self::Unavailable(_)
+            | Self::OpenFile(_) => {
                 return None;
             }
         }
@@ -287,7 +294,7 @@ impl FindFacts {
     }
 }
 
-fn entry<'a>(state: &'a State, id: &ChatRef) -> Option<&'a ChatIndexEntry> {
+pub(crate) fn entry<'a>(state: &'a State, id: &ChatRef) -> Option<&'a ChatIndexEntry> {
     state
         .index(&id.remote_id)?
         .entries
@@ -1035,11 +1042,19 @@ impl FindSidebar {
                             let selector = selector.clone();
                             move || format!("{selector}-label")
                         })
-                        .child(control.label),
+                        .child(control.label.clone()),
                 )
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(control.outcome.clone());
+                    cx.emit(
+                        if matches!(control.outcome, FindOutcome::IndexOlderChats)
+                            && !crate::chat::policy::is_live(cx)
+                        {
+                            FindOutcome::Unavailable(control.label.clone())
+                        } else {
+                            control.outcome.clone()
+                        },
+                    );
                 }))
                 .into_any_element();
         }
@@ -1073,7 +1088,7 @@ impl FindSidebar {
                 }))
             })
             .accessibility_label(control.label.clone())
-            .child(content.child(control.label))
+            .child(content.child(control.label.clone()))
             .when(active, |b| b.bg(rgb(p.surface)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
@@ -1356,7 +1371,7 @@ impl Render for FindSidebar {
                                     div()
                                         .text_size(px(secondary))
                                         .text_color(rgb(p.green))
-                                        .child(control.label),
+                                        .child(control.label.clone()),
                                 )
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.stop_propagation();
@@ -1450,7 +1465,7 @@ impl Render for FindSidebar {
                 "find-backfill".into(),
                 Control {
                     label: "Index older chats".into(),
-                    outcome: FindOutcome::Unavailable("Index older chats".into()),
+                    outcome: FindOutcome::IndexOlderChats,
                 },
                 false,
                 cx,
@@ -1693,13 +1708,22 @@ impl FindPreview {
             } else {
                 owner.name.clone()
             };
-            line =
-                line.child(format!("in workspace {}", owner.name))
-                    .child(self.unavailable_button(
-                        "find-workspace-owner".into(),
-                        format!("Go to {name}"),
-                        cx,
-                    ));
+            line = line.child(format!("in workspace {}", owner.name)).child({
+                let id = ChatRef::local(&entry.id);
+                let label = format!("Go to {name}");
+                Button::new("find-workspace-owner")
+                    .debug_selector(|| "find-workspace-owner".into())
+                    .label(label.clone())
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(if crate::chat::policy::is_live(cx) {
+                            FindOutcome::GoToChatOwner { id: id.clone() }
+                        } else {
+                            FindOutcome::Unavailable(label.clone())
+                        });
+                    }))
+            });
         } else if entry.root_id.is_none() {
             line = line.child(self.unavailable_button(
                 "find-workspace-make".into(),
@@ -2126,11 +2150,15 @@ impl Render for FindPreview {
                     .outline()
                     .small()
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(if matches!(control.outcome, FindOutcome::Resume { .. }) {
-                            FindOutcome::Unavailable(control.label.clone())
-                        } else {
-                            control.outcome.clone()
-                        });
+                        cx.emit(
+                            if matches!(control.outcome, FindOutcome::Resume { .. })
+                                && !crate::chat::policy::is_live(cx)
+                            {
+                                FindOutcome::Unavailable(control.label.clone())
+                            } else {
+                                control.outcome.clone()
+                            },
+                        );
                     })),
             );
         }
@@ -2322,7 +2350,7 @@ impl crate::Shell {
         self.find_owner_for(workspace, workspace.active_session, cx)
     }
 
-    fn find_conversation(
+    pub(crate) fn find_conversation(
         &self,
         workspace: &crate::WorkspaceDock,
         session: &crate::data::Session,
@@ -2357,6 +2385,9 @@ impl crate::Shell {
             .panes
             .get(&crate::session_pane_id(session.id))?
             .read(cx);
+        if let Some(id) = &pane.chat_session_id {
+            return Some(ChatRef::local(id));
+        }
         let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
             return None;
         };
@@ -2450,7 +2481,7 @@ impl crate::Shell {
             .collect(),
             open_sessions: sessions.into_iter().map(|(_, session)| session).collect(),
             running_remote: vec![],
-            workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().filter(|w| w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|w| WorkspaceFacts { name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
+            workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().chain(&catalog.closed).filter(|w| w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|w| WorkspaceFacts { name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
             relevance_available: ranking_key().is_some(),
             relevance_down: false,
             local_files_openable: self.active_agent_tab(cx),
@@ -2618,14 +2649,40 @@ impl crate::Shell {
                     let home = self.find_home.clone();
                     #[cfg(not(test))]
                     let home = dirs::home_dir();
+                    let source = cx
+                        .try_global::<crate::work_sidebar::IcedWorkSource>()
+                        .cloned();
+                    let tasks = source
+                        .as_ref()
+                        .map(|source| crate::data::TaskSource::resolve(&source.config, cx));
                     cx.spawn_in(window, async move |shell, cx| {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                home.map(|home| gitterm_core::find::build_local_index(&home))
-                                    .ok_or_else(|| {
-                                        "Local transcript source not available in preview".into()
-                                    })
+                                let home = home.ok_or_else(|| {
+                                    "Local transcript source not available in preview".to_string()
+                                })?;
+                                let mut entries = gitterm_core::find::build_local_index(&home);
+                                if let Some(source) = source {
+                                    gitterm_core::chat_facts::attach_facts(
+                                        &mut entries,
+                                        &gitterm_core::chat_facts::facts_dir(&source.config),
+                                    );
+                                    if let Some(tasks) = tasks {
+                                        let tasks = tasks.load().map_err(|error| {
+                                            format!("Read task links for chat index: {error}")
+                                        })?;
+                                        let links = crate::data::iced_chat_links(
+                                            &source.workspaces,
+                                            &tasks,
+                                        );
+                                        gitterm_core::chat_facts::resolve_tree(
+                                            &mut entries,
+                                            &links,
+                                        );
+                                    }
+                                }
+                                Ok(entries)
                             })
                             .await;
                         _ = shell.update_in(cx, |shell, window, cx| {
@@ -2695,11 +2752,38 @@ impl crate::Shell {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if matches!(outcome, FindOutcome::Resume { .. }) && !self.live_chat_enabled(cx) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Conversation resume not available in preview".into());
+                cx.notify();
+            });
+            return;
+        }
         if let FindOutcome::Unavailable(label) = outcome {
             self.owner.update(cx, |owner, cx| {
                 owner.error = Some(format!("{label} · not available in preview"));
                 cx.notify();
             });
+            return;
+        }
+        if let FindOutcome::IndexOlderChats = outcome {
+            self.index_older_chats(window, cx);
+            return;
+        }
+        if let FindOutcome::GoToChatOwner { id } = outcome {
+            if self.live_chat_enabled(cx) {
+                self.find_state
+                    .borrow_mut()
+                    .reduce(Intent::ClosePreview(owner.into()));
+            }
+            self.go_to_chat_owner(id, window, cx);
+            if self.live_chat_enabled(cx) {
+                let target_owner = self.find_owner(cx);
+                self.find_state
+                    .borrow_mut()
+                    .reduce(Intent::ClosePreview(target_owner));
+                self.refresh_find(window, cx);
+            }
             return;
         }
         if let FindOutcome::OpenFile(path) = outcome {
@@ -2760,20 +2844,22 @@ impl crate::Shell {
                 .reduce(Intent::ClosePreview(target_owner));
             self.refresh_find(window, cx);
             cx.notify();
-        } else if self.live_chat_enabled(cx) && id.remote_id.is_none() {
+        } else if self.live_chat_enabled(cx) {
             let indexed = entry(&self.find_state.borrow(), id).cloned();
-            if let Some(workspace) = self.active_workspace(cx) {
-                match self.open_saved_live_chat(workspace, &id.id, indexed, window, cx) {
-                    Ok(()) => {
-                        self.find_state
-                            .borrow_mut()
-                            .reduce(Intent::ClosePreview(owner.into()));
-                    }
-                    Err(error) => self.owner.update(cx, |owner, cx| {
-                        owner.error = Some(format!("Resume chat: {error:#}"));
-                        cx.notify();
-                    }),
+            let mode = match outcome {
+                FindOutcome::Resume { mode, .. } => *mode,
+                _ => ResumeMode::Chat,
+            };
+            match self.resume_indexed_chat(id, indexed, mode, None, window, cx) {
+                Ok(()) => {
+                    self.find_state
+                        .borrow_mut()
+                        .reduce(Intent::ClosePreview(owner.into()));
                 }
+                Err(error) => self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Resume chat: {error:#}"));
+                    cx.notify();
+                }),
             }
         } else {
             self.owner.update(cx, |owner, cx| {

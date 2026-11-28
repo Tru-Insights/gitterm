@@ -268,7 +268,7 @@ mod tests {
 
 /// Explicit read authority only. This reader never enters the preview writer or
 /// claims an Iced lease, including when the source is absent or half-written.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct IcedCatalog {
     pub source: PathBuf,
     pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
@@ -906,6 +906,10 @@ impl gpui::Global for LiveWorkspaces {}
 
 #[derive(Clone)]
 pub(crate) enum LiveWorkspaceAction {
+    ChatFolder {
+        name: String,
+        dir: PathBuf,
+    },
     Create {
         name: String,
         start: gitterm_core::work::catalog::WorkStart,
@@ -965,7 +969,7 @@ pub(crate) fn save_live_workspace(
             let previous_active = active.as_ref().and_then(|key| file.workspaces.iter().filter(|w| w.active).position(|w| key.matches(w))).unwrap_or(file.active_workspace);
             let returning_at = if let LiveWorkspaceAction::Return { ordinal, .. } = &action { Some(*ordinal) } else { None };
             let target = match &action {
-                LiveWorkspaceAction::Create { .. } => None,
+                LiveWorkspaceAction::Create { .. } | LiveWorkspaceAction::ChatFolder { .. } => None,
                 LiveWorkspaceAction::Park { key, .. } | LiveWorkspaceAction::Resume { key, .. } | LiveWorkspaceAction::Done(key) | LiveWorkspaceAction::Return { key, .. } => Some(key),
             };
             if let Some(key) = target && file.workspaces.iter().filter(|w| key.matches(w)).count() > 1 {
@@ -976,6 +980,13 @@ pub(crate) fn save_live_workspace(
                 return Err("Remote workspaces cannot be changed in Live yet.".into());
             }
             let mut workspace = match action {
+                LiveWorkspaceAction::ChatFolder { name, dir } => {
+                    use gitterm_core::settings::WorkspaceColor as C;
+                    let colors = [C::Lavender, C::Blue, C::Green, C::Peach, C::Pink, C::Yellow, C::Red, C::Teal];
+                    let used: Vec<_> = file.workspaces.iter().filter(|w| w.active).map(|w| w.color).collect();
+                    let color = colors.iter().copied().find(|c| !used.contains(c)).unwrap_or(colors[used.len() % colors.len()]);
+                    new_work_config(&name, &dir, color, Default::default())
+                }
                 LiveWorkspaceAction::Create { name, start, .. } => {
                     use gitterm_core::settings::WorkspaceColor as C;
                     let used: Vec<_> = file

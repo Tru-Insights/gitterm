@@ -637,6 +637,7 @@ impl IcedWorkData {
             chat_owners: catalog
                 .workspaces
                 .iter()
+                .chain(&catalog.closed)
                 .flat_map(|w| w.chats.iter().map(|chat| (chat.clone(), w.name.clone())))
                 .collect(),
             running_by_repo: HashMap::new(),

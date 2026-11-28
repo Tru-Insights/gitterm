@@ -507,7 +507,7 @@ fn w03_and_w15_index_and_owned_chat_only_notice(cx: &mut gpui::TestAppContext) {
     click_row(&sidebar, cx, "✦ Unindexed chat");
     assert_eq!(
         sidebar.read_with(cx, |s, _| s.error.clone()).as_deref(),
-        Some("✦ Unindexed chat · not available in preview")
+        Some("Open chat · not available in preview")
     );
     assert!(events.borrow().is_empty());
     assert_eq!(tree_snapshot(root.path()), before);
@@ -1289,7 +1289,13 @@ fn owned_coordinators_open_and_folder_coordinators_focus_with_explicit_open() {
             .find(|row| row.label == "✦ Ship parity")
             .unwrap();
         if owned {
-            assert_eq!(row.action, Some(Action::Preview(row.label.clone())));
+            assert_eq!(
+                row.action,
+                Some(Action::Emit(WorkSidebarOutcome::OpenChat {
+                    workspace: 7,
+                    chat: "recent".into()
+                }))
+            );
         } else {
             assert_eq!(
                 sidebar.activate(row.action.unwrap()),
@@ -3784,4 +3790,82 @@ fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
         )
     });
     assert_eq!(events.borrow().len(), 4);
+}
+
+#[gpui::test]
+fn work_sidebar_live_owned_chat_row_arrow_owner_and_index_dispatch(cx: &mut gpui::TestAppContext) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    let fixture = fixture(true);
+    let mut chat = entry("recent", "Unindexed chat", SystemTime::now());
+    chat.facts = None;
+    replace_entries(&fixture, vec![chat]);
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(640.), px(1300.)));
+    draw_sidebar(cx);
+    // Every newly enabled control still refuses Preview, including an open chat.
+    click_row(&sidebar, cx, "✦ Unindexed chat");
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::GoToChatOwner {
+                chat: "recent".into(),
+            },
+            cx,
+        );
+    });
+    assert!(events.borrow().is_empty());
+    cx.update(|_, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "work-controls",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    click_row(&sidebar, cx, "✦ Unindexed chat");
+    sidebar.update(cx, |s, cx| {
+        s.open.insert(Fold::Chat("recent".into()));
+        cx.notify();
+    });
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "✦ Unindexed chat", "↗");
+    sidebar.update(cx, |s, cx| {
+        s.workspace
+            .chat_owners
+            .insert("recent".into(), "Owner".into());
+        s.workspace.owned_chats.clear();
+        cx.notify();
+    });
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "✦ Unindexed chat", "→ Go to Owner");
+    let label = sidebar.read_with(cx, |s, _| {
+        s.rows()
+            .into_iter()
+            .find(|r| r.label.starts_with("No chat facts"))
+            .unwrap()
+            .label
+    });
+    click_control(&sidebar, cx, &label, "Index older chats");
+    assert_eq!(
+        *events.borrow(),
+        [
+            WorkSidebarOutcome::OpenChat {
+                workspace: 7,
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::OpenChat {
+                workspace: 7,
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::GoToChatOwner {
+                chat: "recent".into()
+            },
+            WorkSidebarOutcome::IndexOlderChats,
+        ]
+    );
 }

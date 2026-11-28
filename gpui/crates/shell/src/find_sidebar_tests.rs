@@ -1520,7 +1520,11 @@ fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppCont
 
 #[gpui::test]
 fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
-    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][0]["dir"] = serde_json::json!(directory.path());
+        file["workspaces"][0]["tabs"][0]["dir"] = serde_json::json!(directory.path());
+    });
     let id = format!(
         "unopened-{}",
         root.path()
@@ -1540,7 +1544,11 @@ fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
             load(
                 &mut shell.find_state.borrow_mut(),
                 None,
-                vec![chat(&id, "/fixture/folder", ChatBackend::Claude)],
+                vec![chat(
+                    &id,
+                    directory.path().to_str().unwrap(),
+                    ChatBackend::Claude,
+                )],
             );
             let before = shell.active(cx).sessions.len();
             let owner = shell.find_owner(cx);
@@ -1567,4 +1575,173 @@ fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn find_sidebar_live_resume_buttons_and_owner_emit_actions(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "find-controls",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let (mut state, mut facts) = fixture();
+    facts.workspaces = vec![WorkspaceFacts {
+        name: "Owner".into(),
+        chats: vec!["first".into()],
+        open: true,
+    }];
+    preview_state(
+        &mut state,
+        ChatRef::local("first"),
+        ChatPreview::default().into(),
+    );
+    let (window_root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = window_root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1400.)));
+    click("find-preview-action-0", cx);
+    click("find-preview-action-1", cx);
+    click("find-workspace-owner", cx);
+    view.update(cx, |view, cx| {
+        let mut dead = chat("first", "/tmp/deleted", ChatBackend::Claude);
+        dead.dead_cwd = true;
+        let mut state = view.state.borrow_mut();
+        state.reduce(Intent::SourceChanged(None));
+        load(&mut state, None, vec![dead]);
+        preview_state(
+            &mut state,
+            ChatRef::local("first"),
+            ChatPreview::default().into(),
+        );
+        cx.notify();
+    });
+    click("find-preview-action-0", cx);
+    assert_eq!(
+        *events.borrow(),
+        [
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::Session
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::Chat
+            },
+            FindOutcome::GoToChatOwner {
+                id: ChatRef::local("first")
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::RecreateDirectory
+            },
+        ]
+    );
+}
+
+#[gpui::test]
+fn find_sidebar_preview_refuses_resume_owner_and_index_without_writes(cx: &mut TestAppContext) {
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let before = std::fs::read(root.path().join("iced/workspaces.json")).unwrap();
+    shell.update_in(cx, |shell, window, cx| {
+        let sessions: usize = shell.workspaces.iter().map(|w| w.sessions.len()).sum();
+        let owner = shell.find_owner(cx);
+        for action in [
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::Session,
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::Chat,
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::RecreateDirectory,
+            },
+            FindOutcome::GoToChatOwner {
+                id: ChatRef::local("saved-chat"),
+            },
+            FindOutcome::IndexOlderChats,
+        ] {
+            shell.find_outcome(&owner, &action, window, cx);
+            assert!(
+                shell
+                    .owner
+                    .read(cx)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not available in preview")
+            );
+            assert_eq!(
+                shell
+                    .workspaces
+                    .iter()
+                    .map(|w| w.sessions.len())
+                    .sum::<usize>(),
+                sessions
+            );
+        }
+    });
+    assert_eq!(
+        std::fs::read(root.path().join("iced/workspaces.json")).unwrap(),
+        before
+    );
+    assert!(!root.path().join("iced/chat-meta").exists());
+}
+
+#[gpui::test]
+fn find_sidebar_live_index_control_emits_index(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "find-index-control",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let (state, facts) = fixture();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            FindSidebar::new(
+                Rc::new(RefCell::new(state)),
+                "tab".into(),
+                facts,
+                window,
+                cx,
+            )
+        });
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindSidebar>().unwrap()
+    });
+    let events = Rc::new(RefCell::new(vec![]));
+    cx.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(&view, move |_, outcome: &FindOutcome, _| {
+            events.borrow_mut().push(outcome.clone())
+        })
+        .detach();
+    });
+    click("find-backfill", cx);
+    assert_eq!(*events.borrow(), [FindOutcome::IndexOlderChats]);
 }

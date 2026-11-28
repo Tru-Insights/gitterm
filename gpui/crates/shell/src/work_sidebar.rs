@@ -116,6 +116,7 @@ pub enum WorkSidebarOutcome {
         workspace: u64,
     },
     OpenFind,
+    IndexOlderChats,
     OpenDocument {
         workspace: u64,
         path: PathBuf,
@@ -423,7 +424,7 @@ impl WorkSidebar {
         &self.repo_recency
     }
 
-    fn load(&mut self, force: bool, cx: &mut Context<Self>) {
+    pub(crate) fn load(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.source.is_none() {
             self.source = cx.try_global::<IcedWorkSource>().cloned();
         }
@@ -685,14 +686,15 @@ impl WorkSidebar {
         } else {
             outcome.preview_error()
         })
-        .or_else(|| match &outcome {
-            WorkSidebarOutcome::OpenChat { chat, .. }
-                if !self.workspace.open_chats.contains(chat)
-                    && !crate::chat::policy::is_live(cx) =>
-            {
-                Some("Open chat · not available in preview".into())
-            }
-            _ => None,
+        .or_else(|| {
+            let label = match &outcome {
+                WorkSidebarOutcome::OpenChat { .. } => "Open chat",
+                WorkSidebarOutcome::GoToChatOwner { .. } => "Go to owning workspace",
+                WorkSidebarOutcome::IndexOlderChats => "Index older chats",
+                _ => return None,
+            };
+            (!crate::chat::policy::is_live(cx))
+                .then(|| format!("{label} · not available in preview"))
         });
         if let Some(error) = error {
             self.notice(error, cx);
@@ -798,7 +800,7 @@ impl WorkSidebar {
             ));
             row.detail_controls.push(Control {
                 label: "Index older chats".into(),
-                action: Action::Preview("Index older chats".into()),
+                action: Action::Emit(WorkSidebarOutcome::IndexOlderChats),
             });
             rows.push(row);
         }
@@ -1638,7 +1640,10 @@ impl WorkSidebar {
         row.expanded = expanded;
         row.selected = focused;
         row.action = Some(if owning {
-            Action::Preview(row.label.clone())
+            Action::Emit(WorkSidebarOutcome::OpenChat {
+                workspace: self.workspace.id,
+                chat: chat.id.clone(),
+            })
         } else {
             Action::Emit(WorkSidebarOutcome::Focus {
                 workspace: self.workspace.id,
@@ -2165,18 +2170,28 @@ impl WorkSidebar {
                                 outcome,
                                 WorkSidebarOutcome::OpenChat { .. }
                                     | WorkSidebarOutcome::GoToChatOwner { .. }
+                                    | WorkSidebarOutcome::IndexOlderChats
                             )
                     }
                     _ => false,
                 };
-                let live = cx
+                let repo_live = cx
                     .try_global::<crate::workspace_config::LiveWorkspaces>()
-                    .is_some()
-                    && match &control.action {
-                        Action::Rename | Action::Edit(_) | Action::DismissAuto => true,
-                        Action::Emit(outcome) => outcome.is_repo_edit(),
-                        _ => false,
-                    };
+                    .is_some();
+                let live = match &control.action {
+                    Action::Rename | Action::Edit(_) | Action::DismissAuto => repo_live,
+                    Action::Emit(outcome) => {
+                        (repo_live && outcome.is_repo_edit())
+                            || (crate::chat::policy::is_live(cx)
+                                && matches!(
+                                    outcome,
+                                    WorkSidebarOutcome::OpenChat { .. }
+                                        | WorkSidebarOutcome::GoToChatOwner { .. }
+                                        | WorkSidebarOutcome::IndexOlderChats
+                                ))
+                    }
+                    _ => false,
+                };
                 this.dispatch(
                     if preview && !live {
                         Action::Preview(preview_label.clone())

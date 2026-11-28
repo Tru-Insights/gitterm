@@ -295,7 +295,9 @@ fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
     let path = root.join("workspaces.json");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     let iced = saved(&root);
-    let tab = iced.workspaces[0].tabs[0].clone();
+    let mut tab = iced.workspaces[0].tabs[0].clone();
+    // Exercise a typed save; the serialized owner intentionally preserves a no-op's bytes.
+    tab.repo_dir = Some(root.to_string_lossy().into_owned());
     let iced_config = serde_json::to_value(&tab.agent_config).unwrap();
     assert!(iced_config.get("future").is_none());
     LiveTab::new(

@@ -69,7 +69,7 @@ pub(crate) fn validate_saved(records: &[SavedPark]) -> Result<()> {
 }
 
 impl WorkspaceDock {
-    fn park_key(&self, cx: &App) -> Key {
+    pub(crate) fn park_key(&self, cx: &App) -> Key {
         let dir = self
             .panes
             .values()

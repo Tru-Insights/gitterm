@@ -199,6 +199,7 @@ pub struct Shell {
     find_views: HashMap<String, find_sidebar::FindViews>,
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
+    chat_backfill_running: bool,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     saved_facts: workspace_bar::SavedFactsCache,
     saved_facts_error: Option<workspace_bar::News>,
@@ -517,6 +518,7 @@ impl Shell {
             find_views: HashMap::new(),
             #[cfg(test)]
             find_home: None,
+            chat_backfill_running: false,
             work_state: Default::default(),
             saved_facts: workspace_bar::SavedFactsCache::default(),
             saved_facts_error: None,

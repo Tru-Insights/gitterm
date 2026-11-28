@@ -111,3 +111,6 @@ pub mod dictation;
 pub mod desktop_store;
 
 pub mod editor;
+
+#[cfg(feature = "runtime")]
+pub mod shutdown;

@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Permission mode for a Claude tab whose config does not name one. Always
 /// passed explicitly so a user-level `defaultMode` cannot pre-empt prompts.
-pub(crate) const DEFAULT_CLAUDE_PERMISSION_MODE: &str = "default";
+pub(crate) use gitterm_core::chats::DEFAULT_CLAUDE_PERMISSION_MODE;
 /// Every mode the CLI accepts for `set_permission_mode` (its `invalid_mode`
 /// error lists these; `claude --help` also accepts `manual`, an alias it
 /// reports back as `default`).

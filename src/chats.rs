@@ -1,5 +1,5 @@
 //! Host facade for the read-only core chat index and previews.
-//! Resume commands and task startup discovery remain host-owned.
+//! Resume commands are shared with GPUI; task startup discovery stays here.
 
 pub use gitterm_core::chats::*;
 pub(crate) use gitterm_core::find::{codex_message, codex_meta_is_subagent, resolve_repo_root};
@@ -10,46 +10,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-
-/// Host-owned resume command construction for a chat backend.
-pub trait ChatBackendResume {
-    fn resume_command(&self, base: &str, id: &str) -> String;
-}
-
-impl ChatBackendResume for ChatBackend {
-    /// Shell command that resumes conversation `id` using harness
-    /// launch command `base`. Must run in the conversation's recorded
-    /// cwd.
-    fn resume_command(&self, base: &str, id: &str) -> String {
-        match self {
-            ChatBackend::Claude => format!("{base} --resume {id}"),
-            ChatBackend::Codex => format!("{base} resume {id}"),
-            // pi resumes a specific session via --session (`--resume`
-            // is the interactive picker).
-            ChatBackend::Pi => format!("{base} --session {id}"),
-        }
-    }
-}
-
-/// Host-owned resume command construction for an indexed conversation.
-pub trait ChatEntryResume {
-    fn resume_command(&self) -> String;
-    fn resume_command_with(&self, base: &str) -> String;
-}
-
-impl ChatEntryResume for ChatIndexEntry {
-    /// Shell command that resumes this conversation. Must run in the
-    /// conversation's recorded cwd (or the rescue dir when cwd is dead).
-    fn resume_command(&self) -> String {
-        self.resume_command_with(self.backend.label())
-    }
-    /// Resume command with an explicit harness binary/launch command —
-    /// remote machines resolve the binary through the remote's
-    /// session_commands map (agent daemons run with a minimal PATH).
-    fn resume_command_with(&self, base: &str) -> String {
-        self.backend.resume_command(base, &self.id)
-    }
-}
 
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
