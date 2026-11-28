@@ -1,6 +1,4 @@
 //! Workspace slide presentation and the debug Pi action. No alternate child launcher.
-// shortcut: the assigned session_content lane slides its viewport only; sidebar
-// and overriding viewers need the parent render lane to join the same strip.
 use super::*;
 use gitterm_core::workspace::{self, slide::Slide};
 use gpui::{RenderOnce, WeakEntity};
@@ -14,11 +12,12 @@ struct SlideViewport {
 #[derive(gpui::IntoElement)]
 pub(super) struct WorkspaceSlide {
     pub shell: WeakEntity<Shell>,
-    pub home: Option<gpui::Stateful<gpui::Div>>,
+    pub panels: HashMap<WorkspaceId, gpui::Stateful<gpui::Div>>,
+    pub background_work: Vec<(WorkspaceId, Entity<work_sidebar::WorkSidebar>)>,
 }
 impl RenderOnce for WorkspaceSlide {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let mut home = self.home;
+        let mut contents = self.panels;
         let viewport =
             window.use_keyed_state("workspace-slide-state", cx, |_, _| SlideViewport::default());
         let Some(shell) = self.shell.upgrade() else {
@@ -60,29 +59,20 @@ impl RenderOnce for WorkspaceSlide {
             let tick = viewport.clone();
             window.on_next_frame(move |_, cx| tick.update(cx, |_, cx| cx.notify()));
         }
-        let host = shell.read(cx);
         let mut panels = div().relative().size_full().overflow_hidden();
         if moving {
             for (pos, &index) in order.iter().enumerate() {
                 let id = input.workspaces[index].id;
                 let content = if pos.abs_diff(position) <= 1 {
-                    host.workspaces
-                        .iter()
-                        .find(|w| w.workspace.id == id)
-                        .map(|state| {
-                            if index == active
-                                && let Some(home) = home.take()
-                            {
-                                home
-                            } else {
-                                host.slide_workspace_content(state, index == active, cx)
-                            }
-                        })
+                    contents.remove(&id)
                 } else {
                     None
                 };
                 panels = panels.child(
                     div()
+                        .id(("workspace-slide-panel", id.0))
+                        .debug_selector(move || format!("workspace-slide-panel-{}", id.0))
+                        .bg(rgb(Palette::current(cx).base))
                         .absolute()
                         .left(px(pos as f32 * width - offset))
                         .top_0()
@@ -92,16 +82,41 @@ impl RenderOnce for WorkspaceSlide {
                         .children(content),
                 );
             }
-        } else if let Some(state) = host
-            .workspaces
-            .iter()
-            .find(|w| Some(w.workspace.id) == input.active)
-        {
+        } else if let Some(id) = input.active {
             panels = panels.child(
-                home.take()
-                    .unwrap_or_else(|| host.slide_workspace_content(state, true, cx)),
+                div()
+                    .id(("workspace-slide-panel", id.0))
+                    .debug_selector(move || format!("workspace-slide-panel-{}", id.0))
+                    .size_full()
+                    .overflow_hidden()
+                    .children(contents.remove(&id)),
             );
         }
+        // A neighbour's Work sidebar is now mounted in the strip; do not mount
+        // the same retained entity a second time for background fact loading.
+        let background_work = self
+            .background_work
+            .into_iter()
+            .filter_map(|(id, sidebar)| {
+                let state = shell
+                    .read(cx)
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace.id == id)?;
+                let visible = !contents.contains_key(&id)
+                    && !state.store.regions.sidebar_collapsed
+                    && state.store.regions.sidebar_mode == SidebarMode::Work;
+                (!visible).then_some(sidebar)
+            })
+            .collect::<Vec<_>>();
+        panels = panels.child(
+            div()
+                .absolute()
+                .size(px(0.))
+                .invisible()
+                .overflow_hidden()
+                .children(background_work),
+        );
         let weak = self.shell;
         panels.child(
             gpui::canvas(
@@ -180,7 +195,7 @@ impl RenderOnce for WorkspaceSlide {
 }
 
 impl Shell {
-    fn slide_workspace_content(
+    pub(super) fn slide_workspace_content(
         &self,
         state: &WorkspaceDock,
         active_workspace: bool,
@@ -703,7 +718,7 @@ mod tests {
     fn workspace_swipe_gesture_sequence_changes_workspace_and_edge_peek(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
-        let bounds = cx.debug_bounds("session-content").unwrap();
+        let bounds = cx.debug_bounds("workspace-slide-host").unwrap();
         cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::none());
         draw(cx);
         cx.read(|cx| {
@@ -756,6 +771,204 @@ mod tests {
             let viewport = cx.global::<SlideProbe>().0.upgrade().unwrap();
             assert_eq!(viewport.read(cx).slide.peek, (false, false));
         });
+    }
+
+    fn scroll_panel(cx: &mut VisualTestContext, fraction: f32) {
+        let bounds = cx.debug_bounds("workspace-slide-host").unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::none());
+        draw(cx);
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(-bounds.size.width * fraction, px(0.))),
+            touch_phase: gpui::TouchPhase::Moved,
+            ..Default::default()
+        });
+        draw(cx);
+    }
+
+    fn settle(cx: &mut VisualTestContext, position: usize) {
+        cx.update(|_, cx| {
+            let viewport = cx.global::<SlideProbe>().0.upgrade().unwrap();
+            viewport.update(cx, |state, cx| {
+                let now = Instant::now();
+                state.slide.tick(position, now + Duration::from_secs(1));
+                state.slide.tick(position, now + Duration::from_secs(2));
+                cx.notify();
+            });
+        });
+        draw(cx);
+    }
+
+    fn assert_x(cx: &mut VisualTestContext, selector: &'static str, expected: gpui::Pixels) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        assert!(
+            (f32::from(bounds.origin.x - expected)).abs() < 1.,
+            "{selector}: {bounds:?}, expected x {expected:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn workspace_slide_open_sidebar_and_neighbour_are_inside_strip_mid_slide_and_settled(
+        cx: &mut TestAppContext,
+    ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (_root, shell, cx) = h6_tests::sample(cx);
+        cx.update(|_, cx| {
+            shell.update(cx, |shell, cx| {
+                for (index, state) in shell.workspaces.iter_mut().enumerate() {
+                    state.store.regions.sidebar_collapsed = false;
+                    state.store.regions.sidebar_mode = SidebarMode::Files;
+                    state.store.regions.sidebar_width = 240. + index as f32 * 40.;
+                }
+                cx.notify();
+            })
+        });
+        draw(cx);
+        let host = cx.debug_bounds("workspace-slide-host").unwrap();
+        let sidebar = cx.debug_bounds("sidebar").unwrap();
+        let divider = cx.debug_bounds("sidebar-divider").unwrap();
+        let main = cx.debug_bounds("workspace-main-1").unwrap();
+        let fixed = [
+            "pstrip-spine",
+            "pstrip-session-strip",
+            "pstrip-workspace-bar",
+        ]
+        .map(|selector| (selector, cx.debug_bounds(selector).unwrap()));
+        assert_eq!(sidebar.origin.x, host.origin.x);
+        assert_eq!(sidebar.size.width, px(240.));
+        assert_eq!(main.origin.x, divider.right());
+        assert!(cx.debug_bounds("workspace-sidebar-2").is_none());
+        scroll_panel(cx, 0.25);
+        let shift = host.size.width * 0.25;
+        assert_x(cx, "sidebar", sidebar.origin.x - shift);
+        assert_x(cx, "sidebar-divider", divider.origin.x - shift);
+        assert_x(cx, "workspace-main-1", main.origin.x - shift);
+        assert_x(
+            cx,
+            "workspace-sidebar-2",
+            host.origin.x + host.size.width - shift,
+        );
+        assert_eq!(
+            cx.debug_bounds("workspace-sidebar-2").unwrap().size.width,
+            px(280.)
+        );
+        assert_x(
+            cx,
+            "workspace-main-2",
+            host.origin.x + host.size.width - shift + px(284.),
+        );
+        assert!(
+            cx.debug_bounds("workspace-sidebar-3").is_none(),
+            "distant panels are placeholders"
+        );
+        for (selector, bounds) in fixed {
+            assert_eq!(
+                cx.debug_bounds(selector).unwrap(),
+                bounds,
+                "{selector} stays outside the strip"
+            );
+        }
+        settle(cx, 0);
+        assert_x(cx, "sidebar", sidebar.origin.x);
+        assert_x(cx, "sidebar-divider", divider.origin.x);
+        assert_x(cx, "workspace-main-1", main.origin.x);
+        assert!(cx.debug_bounds("workspace-sidebar-2").is_none());
+    }
+
+    #[gpui::test]
+    fn workspace_slide_open_viewer_and_neighbour_are_inside_strip_mid_slide_and_settled(
+        cx: &mut TestAppContext,
+    ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        cx.update(install_app_menus);
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let source = root.path().join("iced");
+        let work = root.path().join("work");
+        let neighbour = root.path().join("neighbour");
+        for dir in [&source, &work, &neighbour] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(work.join("file.txt"), "placeholder viewer text").unwrap();
+        std::fs::write(source.join("workspaces.json"), serde_json::json!({
+            "active_workspace": 0,
+            "workspaces": [
+                {"name":"Work", "abbrev":"W", "color":"blue", "dir":work, "repos":[work], "tabs":[]},
+                {"name":"Neighbour", "abbrev":"N", "color":"green", "dir":neighbour, "repos":[neighbour], "tabs":[]}
+            ]
+        }).to_string()).unwrap();
+        let mut store = preview::tests::guarded_store(&root.path().join("preview"));
+        let model = workspace_config::load_iced_workspaces_from(&mut store, &source);
+        let layout = store.guard.as_ref().unwrap().preview().layout();
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+            Shell::with_owner(
+                Rc::new(data::LocalData(owner.clone())),
+                owner,
+                &layout,
+                true,
+                window,
+                cx,
+            )
+            .unwrap()
+        });
+        cx.simulate_resize(size(px(1400.), px(800.)));
+        draw(cx);
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.open_file_viewer(
+                    &FileOpen {
+                        workspace: WorkspaceId(1),
+                        path: root.path().join("work/file.txt"),
+                        changed: None,
+                        from_files: true,
+                    },
+                    window,
+                    cx,
+                );
+                cx.notify();
+            })
+        });
+        draw(cx);
+        settle(cx, 0);
+        let host = cx.debug_bounds("workspace-slide-host").unwrap();
+        let close = cx.debug_bounds("close-file-viewer").unwrap();
+        let main = cx.debug_bounds("workspace-main-1").unwrap();
+        scroll_panel(cx, 0.25);
+        assert_x(
+            cx,
+            "close-file-viewer",
+            close.origin.x - host.size.width * 0.25,
+        );
+        assert_x(
+            cx,
+            "workspace-main-1",
+            main.origin.x - host.size.width * 0.25,
+        );
+        assert_x(
+            cx,
+            "workspace-sidebar-2",
+            host.origin.x + host.size.width * 0.75,
+        );
+        settle(cx, 0);
+        assert_x(cx, "close-file-viewer", close.origin.x);
+        assert_x(cx, "workspace-main-1", main.origin.x);
+        assert!(cx.debug_bounds("workspace-sidebar-2").is_none());
+        // The same retained viewer is rendered when it belongs to the outgoing
+        // neighbour after crossing Iced's halfway selection threshold.
+        scroll_panel(cx, 0.75);
+        cx.read(|cx| assert_eq!(shell.read(cx).active_workspace(cx), Some(WorkspaceId(2))));
+        assert_x(
+            cx,
+            "close-file-viewer",
+            close.origin.x - host.size.width * 0.75,
+        );
+        settle(cx, 1);
+        assert!(cx.debug_bounds("close-file-viewer").is_none());
+        assert_x(cx, "sidebar", host.origin.x);
     }
 
     #[gpui::test]

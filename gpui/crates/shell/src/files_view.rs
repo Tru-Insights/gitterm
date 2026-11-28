@@ -755,9 +755,8 @@ impl crate::Shell {
     pub(crate) fn files_sidebar(
         &self,
         sidebar: gpui::Stateful<gpui::Div>,
-        cx: &Context<Self>,
+        state: &crate::WorkspaceDock,
     ) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
         sidebar.child(
             div().flex_1().min_h_0().child(
                 state.panes[&format!("workspace-{}-files", state.workspace.layout_key)].clone(),
