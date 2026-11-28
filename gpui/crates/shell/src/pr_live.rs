@@ -27,10 +27,26 @@ pub(crate) struct Snapshot {
     pub index: Vec<gitterm_core::chats::ChatIndexEntry>,
     pub links: Vec<chat_facts::ChildLink>,
     pub error: Option<String>,
+    watch_dirty: bool,
     // Iced's task-branch lookup state: scoped to this admitted root, forgotten
     // outside the 14-day attribution window; refreshed on completion or Refresh.
     branch_reads:
         HashMap<gitterm_core::work::pr_discovery::TaskBranch, (String, Vec<prs::BranchPr>)>,
+}
+impl Snapshot {
+    fn reload_watch(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if self.watch_dirty {
+            self.save_watch(path)?;
+        } else {
+            self.watch = prs::WatchFile::load(path);
+        }
+        Ok(())
+    }
+    fn save_watch(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let result = self.watch.save(path);
+        self.watch_dirty = result.is_err();
+        result
+    }
 }
 #[derive(Clone)]
 pub(crate) struct LivePrs {
@@ -141,7 +157,7 @@ impl LivePrs {
         }
         chat_facts::resolve_tree(&mut index, &links);
         let mut snapshot = self.snapshot();
-        snapshot.watch = prs::WatchFile::load(&prs::WatchFile::path_in(&self.root));
+        snapshot.reload_watch(&prs::WatchFile::path_in(&self.root))?;
         snapshot.plans = merge_plan::load_plans(&merge_plan::plans_dir(&self.root));
         snapshot.accounts = read_accounts(&self.root)?;
         if self.refresh_requested.swap(false, Ordering::SeqCst) {
@@ -339,14 +355,17 @@ impl LivePrs {
                 .groups
                 .insert(crate::workspace_config::iced_layout_key(workspace), groups);
         }
-        let logins = gitterm_core::work::pr_live::poll_and_save(
+        let result = gitterm_core::work::pr_live::poll_and_save(
             &mut snapshot.watch,
             wanted,
             &snapshot.accounts,
             &prs::WatchFile::path_in(&self.root),
             &mut *client,
-        )?;
-        snapshot.logins.extend(logins);
+        );
+        snapshot.watch_dirty = result.is_err();
+        if let Ok(logins) = &result {
+            snapshot.logins.extend(logins.clone());
+        }
         for groups in snapshot.groups.values_mut() {
             for group in groups {
                 for pr in &mut group.prs {
@@ -356,7 +375,7 @@ impl LivePrs {
                 }
             }
         }
-        snapshot.error = None;
+        snapshot.error = result.as_ref().err().cloned();
         if branches
             .iter()
             .any(|(_, branch)| !snapshot.branch_reads.contains_key(branch))
@@ -368,7 +387,7 @@ impl LivePrs {
             self.wake.notify_one();
         }
         *self.snapshot.lock().unwrap() = snapshot;
-        Ok(())
+        result.map(|_| ())
     }
     pub fn confirm(
         &self,
@@ -402,11 +421,11 @@ impl LivePrs {
         // An action success or failure requests the next read, like Iced.
         // Read the whole saved document even if startup's first poll failed.
         let mut snapshot = self.snapshot.lock().unwrap();
-        snapshot.watch = prs::WatchFile::load(&prs::WatchFile::path_in(&self.root));
+        snapshot.reload_watch(&prs::WatchFile::path_in(&self.root))?;
         if let Some(pr) = snapshot.watch.prs.get_mut(&confirm.key.id()) {
             pr.checked_at = None;
         }
-        snapshot.watch.save(&prs::WatchFile::path_in(&self.root))?;
+        snapshot.save_watch(&prs::WatchFile::path_in(&self.root))?;
         self.wake.notify_one();
         result
     }
@@ -450,16 +469,25 @@ impl LivePrs {
             return Err("PR watch is shutting down".into());
         }
         let mut snapshot = self.snapshot.lock().unwrap();
-        snapshot.watch = prs::WatchFile::load(&prs::WatchFile::path_in(&self.root));
+        snapshot.reload_watch(&prs::WatchFile::path_in(&self.root))?;
         if gitterm_core::work::pr_actions::take_unseen_comments(&mut snapshot.watch, key) {
-            snapshot.watch.save(&prs::WatchFile::path_in(&self.root))?;
+            snapshot.save_watch(&prs::WatchFile::path_in(&self.root))?;
         }
         Ok(())
     }
+    fn current_tree(
+        &self,
+        links: &[chat_facts::ChildLink],
+    ) -> Vec<gitterm_core::chats::ChatIndexEntry> {
+        let mut index =
+            chat_facts::saved_facts_index(&chat_facts::facts_dir(&self.root), links, |m| {
+                eprintln!("{m}")
+            });
+        chat_facts::resolve_tree(&mut index, links);
+        index
+    }
     pub fn root_chat(&self, conversation: &str, links: &[chat_facts::ChildLink]) -> String {
-        self.read(|snapshot| {
-            chat_facts::root_chat_of(&snapshot.index, conversation, || links.to_vec())
-        })
+        chat_facts::root_chat_of(&self.current_tree(links), conversation, || links.to_vec())
     }
     #[cfg(test)]
     pub(crate) fn with_client(
@@ -489,16 +517,7 @@ impl LivePrs {
     ) -> serde_json::Value {
         let mut snapshot = self.snapshot();
         snapshot.links = links.to_vec();
-        for entry in chat_facts::saved_facts_index(&chat_facts::facts_dir(&self.root), links, |m| {
-            eprintln!("{m}")
-        }) {
-            if let Some(old) = snapshot.index.iter_mut().find(|e| e.id == entry.id) {
-                old.facts = entry.facts;
-            } else {
-                snapshot.index.push(entry);
-            }
-        }
-        chat_facts::resolve_tree(&mut snapshot.index, links);
+        snapshot.index = self.current_tree(links);
         let root =
             chat_facts::root_chat_of(&snapshot.index, conversation, || snapshot.links.clone());
         let saved = chat_facts::load_root_prs(
@@ -516,8 +535,10 @@ impl LivePrs {
                 .chain(snapshot.found.get(&root).into_iter().flatten()),
         );
         let plans = merge_plan::load_plans(&merge_plan::plans_dir(&self.root));
-        let watch = prs::WatchFile::load(&prs::WatchFile::path_in(&self.root));
-        prs::merge_plan_value(&root, plans.get(&root), &watch, found)
+        if !snapshot.watch_dirty {
+            snapshot.watch = prs::WatchFile::load(&prs::WatchFile::path_in(&self.root));
+        }
+        prs::merge_plan_value(&root, plans.get(&root), &snapshot.watch, found)
     }
 }
 fn read_accounts(root: &std::path::Path) -> Result<BTreeMap<String, String>, String> {
@@ -593,6 +614,116 @@ pub(crate) mod tests {
             Arc::new(move || Ok(Box::new(clone.clone()))),
         );
         (dir, live, fake)
+    }
+    #[test]
+    fn live_pr_f3_failed_save_retains_news_and_retries_without_refetch() {
+        struct FailSaveOnce {
+            fake: Fake,
+            path: PathBuf,
+            failed: Arc<AtomicBool>,
+        }
+        impl Github for FailSaveOnce {
+            type Credential = String;
+            fn identity(&mut self, account: Option<&str>) -> Result<(String, String), String> {
+                self.fake.identity(account)
+            }
+            fn fetch(
+                &mut self,
+                key: &PrKey,
+                previous: &PrSnapshot,
+                etags: &BTreeMap<String, String>,
+                credential: &String,
+            ) -> Result<Fetched, String> {
+                let fetched = self.fake.fetch(key, previous, etags, credential)?;
+                if !self.failed.swap(true, Ordering::SeqCst) {
+                    std::fs::rename(&self.path, self.path.with_extension("old")).unwrap();
+                    std::fs::create_dir(&self.path).unwrap();
+                } else {
+                    panic!("retry should save the dirty watch before another fetch is due");
+                }
+                Ok(fetched)
+            }
+            fn run(
+                &mut self,
+                run: &RunPrAction,
+                head: &str,
+                credential: &String,
+            ) -> Result<String, String> {
+                self.fake.run(run, head, credential)
+            }
+        }
+        let (dir, _live, mut fake) = fixture();
+        std::fs::write(dir.path().join("workspaces.json"), serde_json::to_vec(&serde_json::json!({"active_workspace":0,"workspaces":[{"name":"Example","abbrev":"EX","color":"blue","dir":dir.path(),"tabs":[],"chats":["root"]}]})).unwrap()).unwrap();
+        let plan = serde_json::from_value(serde_json::json!({"root_chat_id":"root", "entries":[{"repo":"owner/repo", "number":53,"step":1}]})).unwrap();
+        merge_plan::write_plan(&merge_plan::plans_dir(dir.path()), &plan).unwrap();
+        fake.watched.snapshot.comments.push(prs::Activity {
+            id: "comment:1".into(),
+            author: "author".into(),
+            review_state: String::new(),
+        });
+        let path = prs::WatchFile::path_in(dir.path());
+        let factory_path = path.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let live = LivePrs::with_client(
+            dir.path(),
+            Snapshot::default(),
+            Arc::new(move || {
+                Ok(Box::new(FailSaveOnce {
+                    fake: fake.clone(),
+                    path: factory_path.clone(),
+                    failed: failed.clone(),
+                }))
+            }),
+        );
+        assert!(live.refresh().unwrap_err().contains("cannot write"));
+        let dirty = live.snapshot();
+        let pr = &dirty.watch.prs["owner/repo#53"];
+        assert_eq!(pr.unseen_comments, 3);
+        assert!(!pr.news.is_empty());
+        assert!(dirty.error.is_some());
+        assert!(dirty.watch_dirty);
+        assert_eq!(
+            live.merge_plan("root", &[])["entries"][0]["live"]["checked_at"],
+            serde_json::json!(pr.checked_at)
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(path.with_extension("old"), &path).unwrap();
+        live.refresh().unwrap();
+        assert_eq!(live.snapshot().watch, dirty.watch);
+        assert_eq!(prs::WatchFile::load(&path), dirty.watch);
+        assert!(!live.snapshot().watch_dirty);
+        assert!(live.snapshot().error.is_none());
+    }
+
+    #[test]
+    fn live_pr_f4_merge_plan_set_and_get_resolve_current_links() {
+        let (dir, live, fake) = fixture();
+        let link = |parent: &str| chat_facts::ChildLink {
+            parent: parent.into(),
+            child: serde_json::from_value(
+                serde_json::json!({"session_id":"child", "kind":"worker"}),
+            )
+            .unwrap(),
+        };
+        let old_links = vec![link("old-root")];
+        {
+            let mut snapshot = live.snapshot.lock().unwrap();
+            snapshot.index = chat_facts::saved_facts_index(
+                &chat_facts::facts_dir(dir.path()),
+                &old_links,
+                |_| {},
+            );
+            chat_facts::resolve_tree(&mut snapshot.index, &old_links);
+        }
+        let links = vec![link("new-root")];
+        let root = live.root_chat("child", &links);
+        assert_eq!(root, "new-root");
+        let plan = serde_json::from_value(serde_json::json!({"root_chat_id":root,"entries":[{"repo":"owner/repo","number":53,"step":1}]})).unwrap();
+        merge_plan::write_plan(&merge_plan::plans_dir(dir.path()), &plan).unwrap();
+        let value = live.merge_plan("child", &links);
+        assert_eq!(value["root_chat_id"], root);
+        assert_eq!(value["entries"][0]["number"], 53);
+        assert!(fake.writes.lock().unwrap().is_empty());
     }
     #[test]
     fn live_pr_mcp_uses_full_watch_and_unplanned_live_sources() {

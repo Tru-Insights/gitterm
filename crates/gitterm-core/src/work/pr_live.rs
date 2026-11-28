@@ -26,6 +26,14 @@ pub trait Github {
         etags: &BTreeMap<String, String>,
         credential: &Self::Credential,
     ) -> Result<Fetched, String>;
+    fn fetch_for_confirmation(
+        &mut self,
+        key: &PrKey,
+        previous: &PrSnapshot,
+        credential: &Self::Credential,
+    ) -> Result<Fetched, String> {
+        self.fetch(key, previous, &BTreeMap::new(), credential)
+    }
     fn run(
         &mut self,
         run: &RunPrAction,
@@ -76,6 +84,15 @@ impl Github for Gh {
     ) -> Result<Fetched, String> {
         self.0
             .block_on(prs::fetch_pr(key, previous, etags, Some(token)))
+    }
+    fn fetch_for_confirmation(
+        &mut self,
+        key: &PrKey,
+        previous: &PrSnapshot,
+        token: &String,
+    ) -> Result<Fetched, String> {
+        self.0
+            .block_on(prs::fetch_pr_strict(key, previous, Some(token)))
     }
     fn run(&mut self, run: &RunPrAction, head: &str, token: &String) -> Result<String, String> {
         self.0.block_on(prs::run_action_with_token(
@@ -144,7 +161,7 @@ impl Guard {
         {
             return Err("Signed-in account changed or is wrong; refresh and reopen".into());
         }
-        let fetched = github.fetch(&confirm.key, &self.snapshot, &BTreeMap::new(), &credential)?;
+        let fetched = github.fetch_for_confirmation(&confirm.key, &self.snapshot, &credential)?;
         let before = self
             .snapshot
             .core
@@ -203,6 +220,16 @@ pub fn poll_and_save(
     let mut seen = std::collections::HashSet::new();
     let mut count = 0;
     let mut identities = BTreeMap::new();
+    // Oldest observations go first, so a permanently pending first batch
+    // cannot starve later due PRs at the next polling wake.
+    let mut wanted: Vec<_> = wanted.into_iter().collect();
+    wanted.sort_by_key(|(key, _)| {
+        watch
+            .prs
+            .get(&key.id())
+            .and_then(|pr| pr.checked_at.as_deref())
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+    });
     for (key, interval) in wanted {
         if !seen.insert(key.id()) {
             continue;
@@ -382,6 +409,33 @@ mod tests {
             assert!(guard.execute(&mut confirm, &mut fake).is_err());
             assert_eq!(fake.writes.len(), 1);
         }
+    }
+    #[test]
+    fn live_pr_f5_poll_admits_oldest_pending_prs_before_repolling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = WatchFile::path_in(dir.path());
+        let (_, _, mut fake) = fixture(ActionKind::Merge);
+        fake.snapshot.check_runs[0].outcome = CheckOutcome::Pending;
+        let mut watch = WatchFile::default();
+        let wanted: Vec<_> = (1..=26)
+            .map(|number| (PrKey::new("owner/repo", number), Duration::ZERO))
+            .collect();
+        poll_and_save(
+            &mut watch,
+            wanted.clone(),
+            &BTreeMap::new(),
+            &path,
+            &mut fake,
+        )
+        .unwrap();
+        assert_eq!(fake.reads, 25);
+        assert!(watch.prs["owner/repo#26"].checked_at.is_none());
+        poll_and_save(&mut watch, wanted, &BTreeMap::new(), &path, &mut fake).unwrap();
+        assert!(watch.prs["owner/repo#26"].checked_at.is_some());
+        assert!(watch
+            .prs
+            .values()
+            .all(|pr| pr.snapshot.gate_checks() == prs::ChecksState::Pending));
     }
     #[test]
     fn live_pr_poll_survives_iced_reload_with_identical_bytes() {
