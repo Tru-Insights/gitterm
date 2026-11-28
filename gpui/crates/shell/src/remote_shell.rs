@@ -125,6 +125,75 @@ impl RemoteState {
     }
 }
 
+struct RemoteTabSave {
+    key: gitterm_core::park::Key,
+    location: Option<WorkspaceLocationConfig>,
+    tabs: Vec<gitterm_core::workspace_config::WorkspaceTabConfig>,
+    active_tab: Option<usize>,
+}
+
+fn remote_workspace_index(
+    file: &gitterm_core::workspace_config::WorkspacesFile,
+    key: &gitterm_core::park::Key,
+    location: &Option<WorkspaceLocationConfig>,
+) -> Result<usize, String> {
+    let indices: Vec<_> = file
+        .workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| key.matches(w))
+        .map(|(i, _)| i)
+        .collect();
+    if indices.len() != 1 {
+        return Err(format!(
+            "Remote workspace {} is missing or ambiguous",
+            key.name
+        ));
+    }
+    let index = indices[0];
+    if file.workspaces[index].location != *location {
+        return Err("Remote workspace changed before saving its terminals".into());
+    }
+    Ok(index)
+}
+
+fn validate_remote_launch(
+    store: &gitterm_core::desktop_store::DesktopStore,
+    key: &gitterm_core::park::Key,
+    location: &Option<WorkspaceLocationConfig>,
+) -> Result<(), String> {
+    use gitterm_core::desktop_store::LoadState;
+    match store.snapshot().wait()?.workspaces.loaded {
+        LoadState::Valid(file) => remote_workspace_index(&file, key, location).map(|_| ()),
+        LoadState::Missing => Err(format!("Remote workspace {} is missing", key.name)),
+        LoadState::Refused(error) => Err(error),
+    }
+}
+
+fn save_remote_tabs(
+    store: &gitterm_core::desktop_store::DesktopStore,
+    save: RemoteTabSave,
+) -> Result<crate::workspace_config::LiveWorkspaceSaved, String> {
+    store
+        .transact_workspaces(move |file| {
+            let index = remote_workspace_index(file, &save.key, &save.location)?;
+            let workspace = &mut file.workspaces[index];
+            workspace.tabs = save.tabs;
+            workspace.active_tab = save.active_tab;
+            Ok(crate::workspace_config::LiveWorkspaceSaved {
+                workspace: workspace.clone(),
+                repos: file.repos.clone(),
+                closed: file
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| !workspace.active)
+                    .cloned()
+                    .collect(),
+            })
+        })
+        .wait()
+}
+
 impl Shell {
     #[cfg(test)]
     pub(crate) fn set_remote_client(&mut self, client: Arc<dyn RemoteClient>) {
@@ -823,6 +892,20 @@ impl Shell {
         .detach();
     }
 
+    /// Resolve Iced's legacy host inference without rewriting saved location bytes.
+    fn remote_agent_location(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> Option<WorkspaceLocationConfig> {
+        saved.location.clone().or_else(|| {
+            let session = saved.remote_session.as_ref()?;
+            gitterm_core::remote::launch::remote_agent_location_for_session(
+                self.configured_remotes(),
+                &gitterm_core::remote::launch::RemoteSessionDefinition::from(session),
+            )
+        })
+    }
+
     /// The active workspace's legacy SSH remote session, if it is one.
     fn active_remote_session(
         &self,
@@ -833,7 +916,452 @@ impl Shell {
         saved
             .is_legacy_remote()
             .then(|| saved.remote_session.clone())
+            .filter(|_| {
+                !matches!(
+                    self.remote_agent_location(saved),
+                    Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                )
+            })
             .flatten()
+    }
+
+    fn remote_tab_save(
+        &self,
+        workspace: crate::WorkspaceId,
+        cx: &gpui::App,
+    ) -> Option<RemoteTabSave> {
+        if !self.live_chat_enabled(cx) {
+            return None;
+        }
+        let saved = self.owner.read(cx).iced_workspace(workspace)?;
+        if !saved.is_legacy_remote()
+            && !matches!(
+                self.remote_agent_location(saved),
+                Some(WorkspaceLocationConfig::RemoteAgent { .. })
+            )
+        {
+            return None;
+        }
+        let state = self.workspace(workspace);
+        if state.parked.as_ref().is_some_and(|parked| !parked.running) {
+            return None;
+        }
+        Some(RemoteTabSave {
+            key: gitterm_core::park::Key {
+                name: saved.name.clone(),
+                dir: saved.dir.clone(),
+            },
+            location: saved.location.clone(),
+            tabs: self.live_workspace_tabs(state.runtime_uid, cx),
+            active_tab: self.live_active_tab(state.runtime_uid, cx),
+        })
+    }
+
+    pub(crate) fn persist_remote_tabs(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(save) = self.remote_tab_save(workspace, cx) else {
+            return;
+        };
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|store| store.0.clone())
+        else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error =
+                    Some("Save remote terminals: Live workspace store unavailable".into());
+                cx.notify();
+            });
+            return;
+        };
+        self.owner
+            .update(cx, |owner, _| owner.workspace_save_pending = true);
+        let saved = cx
+            .background_executor()
+            .spawn(async move { save_remote_tabs(&store, save) });
+        cx.spawn(async move |shell, cx| {
+            let saved = saved.await;
+            let _ = shell.update(cx, |shell, cx| {
+                shell.owner.update(cx, |owner, cx| {
+                    owner.workspace_save_pending = false;
+                    match saved {
+                        Ok(saved) => {
+                            owner.publish_workspace(saved, false, cx);
+                        }
+                        Err(error) => {
+                            owner.error = Some(format!("Save remote terminals: {error}"));
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn save_remote_tabs_on_quit(&self, cx: &gpui::App) -> gpui::Task<()> {
+        let store = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|store| store.0.clone());
+        let saves: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter_map(|state| self.remote_tab_save(state.workspace.id, cx))
+            .collect();
+        cx.background_executor().spawn(async move {
+            if let Some(store) = store {
+                for save in saves {
+                    if let Err(error) = save_remote_tabs(&store, save) {
+                        eprintln!("Save remote terminals on quit: {error}");
+                    }
+                }
+            }
+        })
+    }
+
+    fn fresh_remote_launch_config(
+        &mut self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<RemoteAgentConfig> {
+        // Iced prefers a current file entry, then its startup snapshot.
+        let previous = self
+            .remote
+            .remotes
+            .iter()
+            .find(|remote| remote.id == id)
+            .cloned();
+        self.reload_remotes(cx)
+            .into_iter()
+            .find(|remote| remote.id == id)
+            .or(previous)
+    }
+
+    /// The SSH/tmux Shell, Codex and Claude buttons share Iced's selection
+    /// and command bytes. Reopening a command selects its existing tab.
+    pub(crate) fn open_remote_session_terminal(
+        &mut self,
+        kind: gitterm_core::remote::launch::SessionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::remote::launch;
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        if !self.live_chat_enabled(cx) {
+            self.preview_unavailable("Remote terminal", cx);
+            return;
+        }
+        let Some(config) = self.active_remote_session(cx) else {
+            return;
+        };
+        let session = launch::RemoteSessionDefinition::from(&config);
+        let Some((name, command, title)) = launch::session_command(&session, kind) else {
+            return;
+        };
+        let command = launch::remote_attach_command(&session, &name, &command);
+        if let Some(id) = self.active(cx).sessions.iter().find_map(|s| {
+            let pane = self
+                .active(cx)
+                .panes
+                .get(&crate::session_pane_id(s.id))?
+                .read(cx);
+            (pane.startup_command.as_deref() == Some(&command)).then_some(s.id)
+        }) {
+            self.select_session_id(id, window, cx);
+            return;
+        }
+        let cwd = launch::attach_cwd(true, Path::new(&config.remote_dir), dirs::home_dir());
+        self.open_remote_attach_terminal(
+            self.active(cx).workspace.id,
+            command,
+            cwd,
+            title.into(),
+            window,
+            cx,
+        );
+    }
+
+    fn open_remote_attach_terminal(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        command: String,
+        cwd: PathBuf,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = cx
+            .try_global::<crate::task_host::GpuiTaskHost>()
+            .map(|h| h.0.clone())
+        else {
+            return;
+        };
+        let tab = gitterm_core::workspace_config::WorkspaceTabConfig {
+            dir: cwd.to_string_lossy().into_owned(),
+            startup_command: Some(command),
+            extra: Default::default(),
+            repo_dir: None,
+            tab_kind: None,
+            agent_config: None,
+            chat_session_id: None,
+            task_id: None,
+            task_session_id: None,
+            worker_shutdown_refused: false,
+            session_uid: None,
+        };
+        let name = self.workspace(workspace).workspace.name.clone();
+        match host.update(cx, |host, cx| {
+            host.open_remote_terminal(&name, &tab, cwd, cx)
+        }) {
+            Ok(mut launched) => {
+                launched.title = title;
+                self.adopt_task_terminal_in(workspace, &host, &launched, window, cx);
+                self.persist_remote_tabs(workspace, cx);
+            }
+            Err(error) => self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!("Remote terminal: {error}"));
+                cx.notify();
+            }),
+        }
+    }
+
+    /// Returns true when this is a remote-agent workspace (including errors).
+    /// Starting and attaching are separate: restart only replays the attach.
+    pub(crate) fn launch_remote_agent_terminal(
+        &mut self,
+        preset: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use gitterm_core::remote::launch;
+        let Some(workspace) = self.active_workspace(cx) else {
+            return false;
+        };
+        let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
+            return false;
+        };
+        let Some(WorkspaceLocationConfig::RemoteAgent {
+            remote_id,
+            workspace_id,
+            root,
+        }) = self.remote_agent_location(&saved)
+        else {
+            return false;
+        };
+        if self.owner.read(cx).workspace_save_pending {
+            return true;
+        }
+        if !self.live_chat_enabled(cx) {
+            self.preview_unavailable("Remote terminal", cx);
+            return true;
+        }
+        let admitted = cx
+            .try_global::<crate::task_host::GpuiTaskHost>()
+            .ok_or_else(|| "Live task host unavailable".to_string())
+            .and_then(|host| host.0.read(cx).authorize_remote_session());
+        if let Err(error) = admitted {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(error);
+                cx.notify();
+            });
+            return true;
+        }
+        let Some(remote) = self.fresh_remote_launch_config(&remote_id, cx) else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Remote agent configuration unavailable".into());
+                cx.notify();
+            });
+            return true;
+        };
+        // A terminal bridge browses locally. The Files tab's saved directory
+        // is remote-native, just as Iced's SourcePath::Remote ownership test.
+        // Session ids follow the owner's rename alias (go-live 12).
+        let imported = self.owner.read(cx).iced_sessions(&saved);
+        let state = self.active(cx);
+        let remote_dir = state.active_session.and_then(|id| {
+            let pane = state.panes.get(&crate::session_pane_id(id))?.read(cx);
+            if pane.startup_command.is_some() {
+                return None;
+            }
+            let index = imported.iter().position(|s| s.id == id)?;
+            saved.tabs.get(index).map(|tab| tab.dir.as_str())
+        });
+        let launch = launch::agent_session_launch(
+            preset,
+            Some(&remote),
+            &root,
+            remote_dir,
+            saved.claude_in_chrome,
+        );
+        let kind = launch.kind.clone();
+        let runtime_uid = state.runtime_uid;
+        let workspace_id = workspace_id.clone();
+        let client = self.remote.client.clone();
+        let store = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|s| s.0.clone());
+        let key = gitterm_core::park::Key {
+            name: saved.name.clone(),
+            dir: saved.dir.clone(),
+        };
+        let location = saved.location.clone();
+        cx.spawn_in(window, async move |shell, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = store.ok_or_else(|| "Live workspace store unavailable".to_string())?;
+                    validate_remote_launch(&store, &key, &location)?;
+                    client
+                        .start_session(&remote, workspace_id, launch)
+                        .map(|id| (remote, id))
+                })
+                .await;
+            let mut result = Some(result);
+            loop {
+                let completed = shell.update_in(cx, |shell, window, cx| {
+                    // A closed/replaced workspace cannot receive this completion.
+                    if !shell.workspaces.iter().any(|state| {
+                        state.workspace.id == workspace
+                            && state.runtime_uid == runtime_uid
+                            && (state.on_bar() || state.parked.as_ref().is_some_and(|p| p.running))
+                    }) {
+                        return true;
+                    }
+                    if shell.owner.read(cx).workspace_save_pending { return false; }
+                    let Some(result) = result.take() else { return true; };
+                    match result {
+                        Ok((remote, id)) => {
+                            let Some(remote) = shell.fresh_remote_launch_config(&remote.id, cx) else {
+                                shell.owner.update(cx, |owner, cx| {
+                                    owner.error = Some(format!("Remote session {id} started but its agent configuration is unavailable"));
+                                    cx.notify();
+                                });
+                                return true;
+                            };
+                            if shell.workspace(workspace).on_bar() {
+                                shell.select_workspace_id(workspace, window, cx);
+                            }
+                            let command = launch::remote_session_attach_command(
+                                &launch::agent_binary(),
+                                &remote,
+                                &id,
+                            );
+                            let mut label = kind.clone();
+                            if let Some(first) = label.get_mut(0..1) {
+                                first.make_ascii_uppercase();
+                            }
+                            label = format!("{label} @ {}", remote.name);
+                            shell.open_remote_attach_terminal(
+                                workspace,
+                                command,
+                                dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+                                label,
+                                window,
+                                cx,
+                            );
+                        }
+                        Err(error) => shell.owner.update(cx, |owner, cx| {
+                            owner.error = Some(format!("Could not start remote session: {error}"));
+                            cx.notify();
+                        }),
+                    }
+                    true
+                }).unwrap_or(true);
+                if completed { break; }
+                // A second start may finish while the first tab is being saved.
+                // Wait for that receipt, then attach this already-started session.
+                cx.background_executor().timer(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .detach();
+        true
+    }
+
+    pub(crate) fn restore_remote_terminals(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::remote::{config::WorkspaceLocationConfig, launch};
+        if !self.live_chat_enabled(cx) {
+            return;
+        }
+        let Some(host) = cx
+            .try_global::<crate::task_host::GpuiTaskHost>()
+            .map(|h| h.0.clone())
+        else {
+            return;
+        };
+        let remote_agent = matches!(
+            self.remote_agent_location(saved),
+            Some(WorkspaceLocationConfig::RemoteAgent { .. })
+        );
+        let imported = self.owner.read(cx).iced_sessions(saved);
+        let sessions = self.workspace(workspace).sessions.clone();
+        for session in sessions {
+            let pane = self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
+            if pane.read(cx).session.is_some() {
+                continue;
+            }
+            let Some(index) = imported.iter().position(|s| s.id == session.id) else {
+                continue;
+            };
+            let Some(tab) = saved.tabs.get(index) else {
+                continue;
+            };
+            pane.update(cx, |pane, _| pane.imported_tab = Some(tab.clone()));
+            if (remote_agent && tab.startup_command.is_none())
+                || (!remote_agent
+                    && tab.tab_kind.as_deref() == Some("agent")
+                    && tab.agent_config.is_some())
+            {
+                continue;
+            }
+            let mut tab = tab.clone();
+            // Iced's remote-agent terminal restore constructs a plain bridge;
+            // its saved chat/task fields do not bind a local conversation.
+            if remote_agent {
+                tab.chat_session_id = None;
+            }
+            let paths = launch::restored_terminal_paths(remote_agent, &tab, dirs::home_dir());
+            match host.update(cx, |host, cx| {
+                host.open_remote_terminal(&saved.name, &tab, paths.cwd.clone(), cx)
+            }) {
+                Ok(launched) => {
+                    if let Some(view) =
+                        host.update(cx, |host, _| host.take_terminal(&launched.session_id))
+                    {
+                        self.adopt_terminal_view(&pane, view, launched.target, window, cx);
+                        pane.update(cx, |pane, cx| {
+                            pane.terminal_cwd = Some(launched.cwd);
+                            pane.terminal_saved_dir = Some(paths.current_dir);
+                            pane.exited = false;
+                            pane.startup_command = launched.startup_command;
+                            pane.chat_session_id = launched.chat_session_id;
+                            if let Some(config) = &saved.remote_session {
+                                pane.title = launch::tab_title(
+                                    &launch::RemoteSessionDefinition::from(config),
+                                    pane.startup_command.as_deref(),
+                                );
+                            }
+                            cx.notify();
+                        });
+                    }
+                }
+                Err(error) => pane.update(cx, |pane, cx| {
+                    pane.content = crate::pane::PaneContent::Error(format!(
+                        "Restore remote terminal: {error}"
+                    ));
+                    cx.notify();
+                }),
+            }
+        }
     }
 
     /// Iced's remote-content Refresh: reload the host's tmux sessions.
@@ -894,14 +1422,16 @@ impl Shell {
         let line = |text: String, color: u32, size: f32| {
             div().text_size(px(size)).text_color(rgb(color)).child(text)
         };
-        let unavailable = |id: &'static str, label: &'static str, enabled: bool| {
+        let terminal_button = |id: &'static str, label: &'static str, enabled: bool, kind| {
             Button::new(id)
                 .debug_selector(move || id.into())
                 .ghost()
                 .small()
                 .label(label)
                 .disabled(!enabled)
-                .on_click(cx.listener(move |this, _, _, cx| this.chrome_unavailable(label, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_remote_session_terminal(kind, window, cx)
+                }))
         };
         let mut detail = div()
             .flex()
@@ -970,16 +1500,23 @@ impl Shell {
                                 this.refresh_remote_sessions(window, cx)
                             })),
                     )
-                    .child(unavailable("remote-session-shell", "Shell", true))
-                    .child(unavailable(
+                    .child(terminal_button(
+                        "remote-session-shell",
+                        "Shell",
+                        true,
+                        gitterm_core::remote::launch::SessionKind::Shell,
+                    ))
+                    .child(terminal_button(
                         "remote-session-codex",
                         "Codex",
                         session.codex_command.is_some(),
+                        gitterm_core::remote::launch::SessionKind::Codex,
                     ))
-                    .child(unavailable(
+                    .child(terminal_button(
                         "remote-session-claude",
                         "Claude",
                         session.claude_command.is_some(),
+                        gitterm_core::remote::launch::SessionKind::Claude,
                     )),
             )
             .child(detail);
@@ -1010,6 +1547,29 @@ mod connect_tests {
     use super::*;
     use crate::remote_shell_tests::{click, draw, fixture};
     use gpui::TestAppContext;
+
+    #[test]
+    fn golive19_remote_tab_save_rejects_changed_identity_without_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let bytes = br#"{"active_workspace":0,"workspaces":[{"name":"Placeholder","abbrev":"PH","dir":"/srv/root","color":"blue","location":{"kind":"remote_agent","remote_id":"placeholder","workspace_id":"placeholder-workspace","root":"/srv/root"},"tabs":[]}]}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let store = gitterm_core::desktop_store::DesktopStore::open(root.path()).unwrap();
+        let result = save_remote_tabs(
+            &store,
+            RemoteTabSave {
+                key: gitterm_core::park::Key {
+                    name: "Placeholder".into(),
+                    dir: "/srv/root".into(),
+                },
+                location: None,
+                tabs: vec![],
+                active_tab: None,
+            },
+        );
+        assert!(result.err().unwrap().contains("changed before saving"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 
     #[test]
     fn obsolete_handshake_cannot_replace_a_newer_connection() {

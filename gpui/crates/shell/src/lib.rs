@@ -6,6 +6,7 @@ mod agent_sidebar;
 mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
+mod browser;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -57,6 +58,7 @@ mod park;
 pub mod park_sheet;
 pub mod phone;
 mod pr_confirm;
+mod pr_live;
 pub mod preview;
 #[cfg(test)]
 mod region_tests;
@@ -204,6 +206,7 @@ pub struct Shell {
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
     bar_menu: Option<workspace_bar::Menu>,
+    browser: browser::State,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
@@ -387,6 +390,8 @@ impl Shell {
                 }
             }
         }
+        subscriptions
+            .push(cx.on_app_quit(|shell: &mut Self, cx| shell.save_remote_tabs_on_quit(cx)));
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
             for workspace in &this.workspaces {
                 for pane in workspace.panes.values() {
@@ -522,6 +527,7 @@ impl Shell {
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
             bar_menu: None,
+            browser: browser::State::new(cx),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             agent_sidebars: HashMap::new(),
@@ -532,6 +538,7 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.start_browser_poll(cx);
         shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
@@ -1144,6 +1151,30 @@ impl Shell {
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launch_remote_agent_terminal(None, window, cx) {
+            return;
+        }
+        if let Some(saved) = self
+            .active_workspace(cx)
+            .and_then(|id| self.owner.read(cx).iced_workspace(id))
+            .filter(|saved| saved.is_legacy_remote())
+        {
+            if !self.live_chat_enabled(cx) {
+                self.preview_unavailable("Remote terminal", cx);
+                return;
+            }
+            // Iced NewPlainTab falls back to a local plain terminal for legacy SSH.
+            let cwd = self
+                .active(cx)
+                .active_session
+                .and_then(|id| self.active(cx).panes.get(&session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).task_folder(cx))
+                .unwrap_or_else(|| saved.dir.clone().into());
+            let workspace = self.active(cx).workspace.id;
+            self.new_terminal_at(DockPlacement::Center, Some(cwd), window, cx);
+            self.persist_remote_tabs(workspace, cx);
+            return;
+        }
         self.new_terminal_in(DockPlacement::Center, window, cx);
     }
     fn new_terminal_in(
@@ -1171,10 +1202,30 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.owner.read(cx).workspace_save_pending {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        self.new_terminal_launch_in(workspace, placement, cwd, launch, window, cx);
+    }
+    fn new_terminal_launch_in(
+        &mut self,
+        workspace: WorkspaceId,
+        placement: DockPlacement,
+        cwd: Option<std::path::PathBuf>,
+        launch: Option<PaneStart>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| {
+                state.workspace.id == workspace
+                    && (state.on_bar() || state.parked.as_ref().is_some_and(|p| p.running))
+            })
+        {
             return;
         }
         let transient_run =
@@ -1184,11 +1235,10 @@ impl Shell {
             .iter()
             .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
             .collect();
-        let active = self.active_workspace(cx);
         let state = self
             .workspaces
             .iter_mut()
-            .find(|w| Some(w.workspace.id) == active)
+            .find(|w| w.workspace.id == workspace)
             .unwrap();
         let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
             self.owner.update(cx, |owner, cx| {
@@ -1311,16 +1361,25 @@ impl Shell {
         }
         match launch {
             Some(PaneStart::Launch(launch)) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.launch_run_terminal(&pane, launch, window, cx);
             }
             Some(PaneStart::Adopt { view, target, .. }) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
             None => {}
         }
-        self.show_pane(&pane_id, window, cx);
+        if self.workspace(workspace).on_bar() {
+            self.show_workspace_pane(workspace, &pane_id, window, cx);
+        } else {
+            // Keep-running workspaces receive their tab without taking focus.
+            let state = self.workspace(workspace);
+            let pane = state.panes[&pane_id].clone();
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
+            });
+        }
     }
     /// Iced opens a tab for a launched task session; GPUI adopts the task
     /// host's terminal into a new center pane of the active workspace. A
@@ -1333,15 +1392,27 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Pane>> {
-        if self.owner.read(cx).workspace_save_pending
-            || !self.local
-            || !self.workspaces.iter().any(|state| state.on_bar())
-        {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
+            return None;
+        }
+        let workspace = self.active_workspace(cx)?;
+        self.adopt_task_terminal_in(workspace, host, launched, window, cx)
+    }
+    fn adopt_task_terminal_in(
+        &mut self,
+        workspace: WorkspaceId,
+        host: &Entity<task_host::TaskHostOwner>,
+        launched: &task_host::TerminalLaunched,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Pane>> {
+        if self.owner.read(cx).workspace_save_pending || !self.local {
             return None;
         }
         let view = host.update(cx, |host, _| host.take_terminal(&launched.session_id))?;
         let target = launched.target.clone();
-        self.new_terminal_launch(
+        self.new_terminal_launch_in(
+            workspace,
             DockPlacement::Center,
             Some(launched.cwd.clone()),
             Some(PaneStart::Adopt {
@@ -1352,8 +1423,9 @@ impl Shell {
             window,
             cx,
         );
+        // Update exactly the pane holding this launch, never a neighbour.
         let pane = self
-            .active(cx)
+            .workspace(workspace)
             .panes
             .values()
             .find(|pane| pane.read(cx).session.as_ref() == Some(&launched.target))?
@@ -1733,6 +1805,10 @@ fn build_workspace(
     let imported = data
         .local_owner()
         .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
+    let live_remote = cx.try_global::<task_host::GpuiTaskHost>().is_some_and(|host| host.0.read(cx).is_live())
+        && data.local_owner().is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some_and(|saved| {
+            saved.is_legacy_remote() || matches!(saved.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))
+        }));
     let sessions = if imported {
         let mut sessions = data.sessions(workspace.id, cx);
         let mut terminals = store
@@ -1746,7 +1822,11 @@ fn build_workspace(
             })
             .unwrap_or_default();
         terminals.retain(|terminal| {
-            !session_ids.contains(&terminal.id) && !sessions.iter().any(|s| s.id.0 == terminal.id)
+            // Live remote main tabs restore only from Iced's saved DTOs.
+            // Dock copies use different ids and would attach a second bridge.
+            (!live_remote || terminal.bottom)
+                && !session_ids.contains(&terminal.id)
+                && !sessions.iter().any(|s| s.id.0 == terminal.id)
         });
         sessions.extend(terminals.iter().map(|terminal| {
             Session {
@@ -1972,6 +2052,7 @@ fn adopt_view(
             _ = cwd_pane.update(cx, |pane, cx| {
                 if pane.session.as_ref() == Some(&cwd_target) {
                     pane.terminal_cwd = Some(cwd.into());
+                    pane.terminal_saved_dir = None;
                     cx.notify();
                 }
             });
@@ -2254,13 +2335,7 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: workspace_bar::Browser {
-                color: colors.muted,
-                driving: false,
-                hint: "Browser idle".into(),
-                action: Some(workspace_bar::BrowserAction::Open),
-                has_evidence: false,
-            },
+            browser: self.browser.bar(colors),
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
@@ -2602,12 +2677,6 @@ impl Shell {
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.open_ready_list(window, cx),
                         O::OpenParked => shell.open_parked_list(window, cx),
-                        O::Browser(workspace_bar::BrowserAction::Open) => {
-                            shell.chrome_unavailable("Open browser", cx)
-                        }
-                        O::Browser(workspace_bar::BrowserAction::Focus) => {
-                            shell.chrome_unavailable("Focus browser", cx)
-                        }
                         outcome => shell.bar_outcome(outcome, window, cx),
                     }
                 });
@@ -3452,21 +3521,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        let launch = {
-            let mut launch = launch;
-            launch.program = "/bin/zsh".into();
-            launch.args = vec!["-d".into(), "-l".into()];
-            launch.env.insert(
-                "HOME".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch.env.insert(
-                "ZDOTDIR".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch
-        };
         let preview = self.owner.read(cx).preview();
         if let Err(error) = preview::executable(
             preview.as_deref(),
@@ -3512,6 +3566,25 @@ impl Shell {
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
+        let mut launch = launch;
+        if let Some(target) = &target {
+            browser::terminal_environment(&mut launch, &target.session_uid, cx);
+        }
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
             gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
@@ -3728,6 +3801,9 @@ impl Shell {
         if self.dictation_enabled() {
             context.push_str(" IcedStt");
         }
+        if self.browser.evidence_open {
+            return context;
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3806,6 +3882,7 @@ impl Shell {
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
         [
+            (self.browser.evidence_open, Modal::BrowserEvidence),
             (self.task_switcher.is_some(), Modal::TaskSwitcher),
             (self.usage_open, Modal::Usage),
             (Self::has_dialog(window, cx), Modal::Dialog),
@@ -3834,7 +3911,8 @@ impl Shell {
     /// switcher, the new-task form and task prompts, the New Work and Park
     /// sheets (not the Parked and Ready lists) and a PR action confirmation.
     fn pty_blocked(&self, cx: &App) -> bool {
-        self.task_switcher.is_some()
+        self.browser.evidence_open
+            || self.task_switcher.is_some()
             || self.task_panel_modal_open(cx)
             || self.new_work_sheet.is_some()
             || self
@@ -4309,7 +4387,10 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.browser.evidence_open
+                || self.plans_open
+                || self.task_switcher.is_some()
+                || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -4499,6 +4580,9 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_browser_evidence(window, cx) {
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -4643,6 +4727,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser.evidence_open {
+            if event.keystroke.key == "escape" {
+                self.close_browser_evidence(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
@@ -4808,7 +4899,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open
+            content.picker = self.browser.evidence_open
+                || self.plans_open
                 || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
@@ -4899,6 +4991,7 @@ impl Render for Shell {
                 )
                 .children(self.new_work_sheet.clone())
                 .children(self.remote_overlays())
+                .children(self.browser_evidence_view(window, cx))
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -5039,6 +5132,7 @@ impl Render for Shell {
             )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
+            .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
@@ -5203,6 +5297,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
             // namespace included), so keep a copy of the one the host gets.
             let chat_services = live_services.as_deref().cloned();
             let started = if let Some(services) = live_services {
+                pr_live::LivePrs::install(services.clone(), cx);
                 task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
             } else {
                 task_host::TaskHostOwner::start_locked(config, host_lock, cx)

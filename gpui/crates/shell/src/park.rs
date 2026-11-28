@@ -960,7 +960,7 @@ impl Shell {
 }
 
 impl Shell {
-    fn live_active_tab(&self, uid: u64, cx: &gpui::App) -> Option<usize> {
+    pub(crate) fn live_active_tab(&self, uid: u64, cx: &gpui::App) -> Option<usize> {
         self.workspaces
             .iter()
             .find(|w| w.runtime_uid == uid)

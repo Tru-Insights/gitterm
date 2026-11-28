@@ -378,16 +378,17 @@ impl ServiceContext {
         })
     }
 
-    /// Live admits task execution and result delivery. General restore and
+    /// Live admits task/merge-plan writes, guarded PR actions, task execution,
+    /// result delivery, browser control and HTML previews. General restore and
     /// notify ingress stay closed; current workers have scoped notify admission.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
     }
     /// Browser setup must not open a default target or initialize an external
-    /// engine in Preview, fixtures, or this restricted Live slice.
+    /// engine in Preview or fixtures. Live uses the production engine/profile.
     pub fn browser_read_only(&self) -> bool {
-        self.gpui_live || self.is_preview()
+        self.is_preview()
     }
 
     pub fn is_preview(&self) -> bool {
@@ -488,6 +489,9 @@ impl ServiceContext {
     }
 
     pub fn runner(&self, effect: RunnerEffect, target: Option<&Path>) -> Result<(), Denied> {
+        if self.gpui_live && !self.is_preview() && effect == RunnerEffect::HtmlPreview {
+            return Ok(());
+        }
         self.authorize(classify_runner(effect), target)
     }
 
@@ -501,6 +505,9 @@ impl ServiceContext {
 
     /// `tool` is the browser MCP tool name, used as the notice label.
     pub fn browser(&self, tool: &str, access: BrowserAccess) -> Result<(), Denied> {
+        if self.gpui_live && !self.is_preview() {
+            return Ok(());
+        }
         self.decide(tool, classify_browser(access), None)
     }
 
@@ -592,6 +599,7 @@ impl ServiceContext {
                     | "Save delegation"
                     | "Queue session"
                     | "Worker notify"
+                    | "merge_plan_set"
                     | "Dismiss delegation"
                     | "Save delivery"
             );
@@ -611,10 +619,13 @@ impl ServiceContext {
                     | "Automatic delivery"
                     | "Deliver results"
             );
+        let live_pr_action =
+            access == Access::Outside && matches!(label, "Approve" | "Merge" | "Ready for review");
         if self.gpui_live
             && !matches!(access, Access::Read | Access::Existing)
             && !live_task_write
             && !live_task_process
+            && !live_pr_action
         {
             return Err(denied(label));
         }
@@ -934,12 +945,78 @@ mod tests;
 mod live_tests {
     use super::*;
     #[test]
-    fn gpui_live_keeps_production_identity_but_closes_later_slice_effects() {
+    fn live_pr_actions_are_admitted_only_in_production() {
+        let dir = tempfile::tempdir().unwrap();
+        let preview = Preview::validate(
+            &dir.path().join("preview"),
+            crate::preview::ProtectedRoots::new(
+                &dir.path().join("home"),
+                [dir.path().join("live")],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let live = ServiceContext::production(&dir.path().join("live"), "example")
+            .unwrap()
+            .for_gpui_live();
+        let sandbox = ServiceContext::preview(Arc::new(preview)).unwrap();
+        for action in [
+            crate::prs::PrAction::Approve,
+            crate::prs::PrAction::Ready,
+            crate::prs::PrAction::Merge(crate::merge_plan::MergeMethod::Squash),
+        ] {
+            let run = crate::work::pr_actions::RunPrAction {
+                action,
+                key: crate::merge_plan::PrKey::new("owner/repo", 53),
+                account: None,
+            };
+            assert!(live.pr_action(&run).is_ok());
+            assert!(sandbox.pr_action(&run).is_err());
+        }
+        assert!(live
+            .authorize(class("merge_plan_set", Access::Write), None)
+            .is_ok());
+        assert!(sandbox
+            .authorize(class("merge_plan_set", Access::Write), None)
+            .is_err());
+    }
+
+    #[test]
+    fn live_browser_admits_production_only_and_html_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = ServiceContext::production(temp.path(), "fixture-live")
+            .unwrap()
+            .for_gpui_live();
+        let protected =
+            super::super::ProtectedRoots::new(&temp.path().join("fixture-home"), []).unwrap();
+        let roots = Arc::new(Preview::validate(&temp.path().join("preview"), protected).unwrap());
+        let preview = ServiceContext::preview(roots).unwrap().for_gpui_live();
+        for access in [
+            BrowserAccess::Read,
+            BrowserAccess::Launch,
+            BrowserAccess::Interact,
+            BrowserAccess::Scratch,
+        ] {
+            assert!(live.browser("browser_fixture", access).is_ok());
+            assert_eq!(
+                preview.browser("browser_fixture", access).is_ok(),
+                access == BrowserAccess::Read
+            );
+        }
+        assert!(!live.browser_read_only());
+        assert!(preview.browser_read_only());
+        assert!(live.runner(RunnerEffect::HtmlPreview, None).is_ok());
+        assert!(preview.runner(RunnerEffect::HtmlPreview, None).is_err());
+        assert!(live.runner(RunnerEffect::AutomaticDelivery, None).is_ok());
+    }
+
+    #[test]
+    fn live_pr_integration_keeps_production_identity_but_closes_later_slice_effects() {
         let temp = tempfile::tempdir().unwrap();
         let production = ServiceContext::production(temp.path(), "274").unwrap();
         let live = production.clone().for_gpui_live();
         assert!(!live.is_preview());
-        assert!(live.browser_read_only());
+        assert!(!live.browser_read_only());
         assert_eq!(production.task_mcp().token(), live.task_mcp().token());
         for label in [
             "task_create",
@@ -964,20 +1041,18 @@ mod live_tests {
         ] {
             assert!(live.authorize(class(label, Access::Process), None).is_ok());
         }
-        for label in ["Dismiss delegation", "Save delivery"] {
+        for label in ["merge_plan_set", "Dismiss delegation", "Save delivery"] {
             assert!(live.authorize(class(label, Access::Write), None).is_ok());
         }
         for label in ["Automatic delivery", "Deliver results"] {
             assert!(live.authorize(class(label, Access::Process), None).is_ok());
         }
-        for label in ["merge_plan_set", "notify"] {
-            assert_eq!(
-                live.authorize(class(label, Access::Write), None)
-                    .unwrap_err()
-                    .notice(),
-                preview_notice(label)
-            );
-        }
+        assert_eq!(
+            live.authorize(class("notify", Access::Write), None)
+                .unwrap_err()
+                .notice(),
+            preview_notice("notify")
+        );
         for access in [Access::Write, Access::Process, Access::Outside] {
             let class = Class {
                 label: "Live gated effect",

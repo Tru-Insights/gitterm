@@ -280,6 +280,89 @@ fn dechunk(mut body: &str) -> String {
     out
 }
 
+/// The native Live chat descriptor and CLI environment both come from the
+/// admitted production host. A browser write reaches MCP without launching
+/// Chrome (disconnecting an owner with no targets is a successful write).
+#[gpui::test]
+fn live_browser_chat_write_and_cli_descriptors_use_the_host_context(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        preview::service::ServiceContext,
+        task_commands::mcp_protocol::{BROWSER_MCP_TOKEN_ENV, BROWSER_MCP_URL_ENV},
+    };
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    let services = Arc::new(
+        ServiceContext::production(&fixture.iced, "fixture-live-browser")
+            .unwrap()
+            .for_gpui_live(),
+    );
+    let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+    let (config, _) = fixture.config();
+    let owner = cx
+        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .unwrap();
+    cx.update(|cx| cx.set_global(crate::task_host::GpuiTaskHost(owner.clone())));
+    let descriptors = owner.read_with(cx, |host, _| host.claude_mcp_servers("fixture-live-chat"));
+    let browser = &descriptors[1];
+    let env = |key: &str| {
+        browser
+            .env
+            .iter()
+            .find(|(name, _)| name == key)
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert!(env(BROWSER_MCP_URL_ENV).ends_with("?caller=fixture-live-chat"));
+    assert!(
+        !browser
+            .config
+            .to_string()
+            .contains(&env(BROWSER_MCP_TOKEN_ENV))
+    );
+    let client = McpClient::connect(&env(BROWSER_MCP_URL_ENV), &env(BROWSER_MCP_TOKEN_ENV));
+    let result = client.call("browser_disconnect", serde_json::json!({}));
+    assert_eq!(result["isError"], false, "{result}");
+    let status = client.call("browser_status", serde_json::json!({}));
+    assert_eq!(
+        status["structuredContent"]["profile_dir"],
+        fixture
+            .iced
+            .join("browser-profile")
+            .to_string_lossy()
+            .as_ref()
+    );
+    cx.update(|cx| {
+        let mut launch = gitterm_terminal::TerminalLaunch {
+            cwd: Some(fixture.iced.clone()),
+            startup_command: Some("claude --fixture".into()),
+            ..Default::default()
+        };
+        crate::browser::terminal_environment(&mut launch, "fixture-live-cli", cx);
+        assert!(
+            launch.env[BROWSER_MCP_URL_ENV]
+                .as_ref()
+                .unwrap()
+                .ends_with("?caller=fixture-live-cli")
+        );
+        assert_eq!(
+            launch.env[BROWSER_MCP_TOKEN_ENV].as_ref().unwrap(),
+            &env(BROWSER_MCP_TOKEN_ENV)
+        );
+        assert!(launch.startup_command.is_none());
+        assert!(
+            launch.env["GITTERM_STARTUP_CMD"]
+                .as_ref()
+                .unwrap()
+                .contains("gitterm_browser")
+        );
+        assert!(!launch.args.join(" ").contains(&env(BROWSER_MCP_TOKEN_ENV)));
+    });
+    owner.update(cx, |host, _| host.shutdown());
+    assert!(!fixture.iced.join("browser-profile").exists());
+}
+
 /// H5b B7: the host's browser server, reached as a chat reaches it (its
 /// descriptor's caller URL and token), serves reads and refuses launches in
 /// its dispatch; its profile is the preview root's.
@@ -3599,4 +3682,86 @@ mod live_writes {
     include!("task_host_live_worker_tests.rs");
     include!("task_host_live_delivery_tests.rs");
     include!("task_host_live_terminal_tests.rs");
+    include!("remote_terminal_tests.rs");
+}
+
+#[gpui::test]
+fn live_pr_mcp_set_get_preserves_full_response_and_uses_live_root(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        merge_plan::{self, PrKey, PrRef, PrState},
+        preview::service::ServiceContext,
+        prs::{PullCore, WatchFile, WatchedPr},
+        task_mcp::TaskControlOperation as Op,
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    std::fs::create_dir(fixture.roots.root()).unwrap();
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open(&fixture, Some("root"), cx);
+    let mut watched = WatchedPr::new(PrKey::new("owner/repo", 53));
+    watched.snapshot.core = Some(PullCore {
+        title: "Example change".into(),
+        state: Some(PrState::Open),
+        head_sha: "head-one".into(),
+        ..Default::default()
+    });
+    let watch = WatchFile {
+        prs: [(watched.key.id(), watched)].into(),
+    };
+    watch.save(&WatchFile::path_in(&fixture.iced)).unwrap();
+    let live = crate::pr_live::LivePrs::with_client(
+        &fixture.iced,
+        Default::default(),
+        Arc::new(|| Err("no GitHub calls in this test".into())),
+    );
+    live.note_live_prs(
+        "root",
+        &[PrRef {
+            repo: "owner/repo".into(),
+            number: 54,
+            url: "https://github.com/owner/repo/pull/54".into(),
+        }],
+    )
+    .unwrap();
+    cx.update(|cx| cx.set_global(live));
+    let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+    let services = Arc::new(
+        ServiceContext::production(&fixture.iced, "example")
+            .unwrap()
+            .for_gpui_live(),
+    );
+    let (config, sender) = fixture.config();
+    let owner = cx
+        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .unwrap();
+    let set = dispatch_as(
+        cx,
+        &sender,
+        Op::MergePlanSet(req(
+            json!({"entries":[{"repo":"owner/repo","number":53,"step":1,"method":"squash"}]}),
+        )),
+        Some(&caller),
+    )
+    .unwrap();
+    assert_eq!(set["kept_holds"], json!([]));
+    assert_eq!(set["next"], "owner/repo#53");
+    assert_eq!(
+        set["entries"][0]["live"],
+        gitterm_core::prs::pr_live_value(watch.prs.get("owner/repo#53"))
+    );
+    assert_eq!(set["unplanned_prs"][0]["number"], 54);
+    assert_eq!(
+        merge_plan::load_plans(&merge_plan::plans_dir(&fixture.iced))["root"]
+            .entries
+            .len(),
+        1
+    );
+    assert!(!merge_plan::plans_dir(fixture.roots.root()).exists());
+    let get = dispatch_as(cx, &sender, Op::MergePlanGet, Some(&caller)).unwrap();
+    let mut expected = set;
+    expected.as_object_mut().unwrap().remove("kept_holds");
+    assert_eq!(get, expected);
+    owner.update(cx, |owner, _| owner.shutdown());
 }
