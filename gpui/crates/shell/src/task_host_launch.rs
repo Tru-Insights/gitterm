@@ -1069,6 +1069,21 @@ impl TaskHostOwner {
             .map(|launched| launched.live.is_some())
     }
 
+    pub(super) fn mark_panel_resume_live(&mut self, session: &str, cx: &mut Context<Self>) {
+        if let Some(launched) = self.launched.get_mut(session) {
+            launched.live = Some(TaskSessionLiveState::Working);
+        }
+        self.apply_task_session_signal(
+            self.launched
+                .get(session)
+                .map(|l| l.task_id.clone())
+                .as_deref()
+                .unwrap_or(""),
+            None,
+            cx,
+        );
+    }
+
     /// Iced's `close_task_tab` once the tab is gone: the session no longer
     /// counts for its task, whose other sessions decide its lifecycle; one
     /// that was live stopped. The pane that held the terminal stops and
@@ -1080,6 +1095,7 @@ impl TaskHostOwner {
             return;
         };
         self.host.revoke_caller(&launched.target.session_uid);
+        self.host.revoke_caller(session_id);
         self.apply_task_session_signal(
             &launched.task_id,
             launched
@@ -2472,7 +2488,7 @@ fn is_gpui_codex_notify(value: &str, task_id: &str, session_id: &str) -> bool {
 /// `projects` dir instead of ~/.claude: Claude writes
 /// `<projects>/<cwd-slug>/<id>.jsonl` on the first message. An id that is
 /// not a plain name never names a file.
-fn claude_transcript_exists(projects: &Path, session_id: &str) -> bool {
+pub(super) fn claude_transcript_exists(projects: &Path, session_id: &str) -> bool {
     if session_id.is_empty()
         || !session_id
             .chars()

@@ -84,7 +84,7 @@ wait
 
 /// Whether `pid` is a process at all; a zombie still counts, so a child
 /// counts as gone only once it was reaped.
-fn exists(pid: &str) -> bool {
+pub(super) fn exists(pid: &str) -> bool {
     !std::process::Command::new("/bin/ps")
         .args(["-p", pid, "-o", "stat="])
         .output()
