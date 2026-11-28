@@ -580,16 +580,23 @@ impl WorkspaceTarget {
                 .map(|s| s.session_name.clone()),
         }
     }
+    pub fn matches<C>(&self, workspace: &WorkspaceConfig<C>) -> bool {
+        workspace.name == self.name
+            && workspace.dir == self.dir
+            && workspace.chats == self.chats
+            && workspace.location == self.location
+            && workspace
+                .remote_session
+                .as_ref()
+                .map(|s| s.session_name.as_str())
+                == self.legacy_session.as_deref()
+    }
     pub fn index<C>(&self, file: &WorkspacesFile<C>) -> Result<usize, String> {
-        let mut matches = file.workspaces.iter().enumerate().filter(|(_, w)| {
-            w.active
-                && w.name == self.name
-                && w.dir == self.dir
-                && w.chats == self.chats
-                && w.location == self.location
-                && w.remote_session.as_ref().map(|s| s.session_name.as_str())
-                    == self.legacy_session.as_deref()
-        });
+        let mut matches = file
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.active && self.matches(w));
         let index = matches
             .next()
             .map(|(i, _)| i)

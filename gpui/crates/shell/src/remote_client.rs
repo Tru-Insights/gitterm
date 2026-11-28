@@ -1,5 +1,5 @@
-//! Read-only remote machine access for the preview: configured remotes come
-//! from Iced's config (never written), and every network read goes through
+//! Remote machine access: configured remotes come from Iced's config,
+//! and every agent call goes through
 //! `RemoteClient`, which the real app backs with core's agent client and
 //! token lookup, the same calls Iced makes. Tests install a fake.
 
@@ -9,21 +9,17 @@ use anyhow::{Context as _, Result};
 use gitterm_core::{
     chats::ChatIndexEntry,
     remote::{
-        client::{
-            RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentClientError,
-            RemoteAgentHandshake, connect_channel,
-        },
+        client::{RemoteAgentBackend, RemoteAgentClientConfig, RemoteAgentHandshake},
         config::{
             REMOTE_AGENTS_FILE, RemoteAgentConfig, RemoteAgentsFile, configured_remote_agents,
         },
-        phone_panel::PairedPhoneInfo,
-        protocol::v6::{ListPhonesRequest, git_term_agent_client::GitTermAgentClient},
+        phone_panel::{PairedPhoneInfo, PhonePairing},
         source::{SourceDirListing, SourceHost, SourcePath, WorkspaceSource},
         ssh_sessions::{RemoteHostConfig, RemoteSessionsSnapshot},
     },
 };
 
-/// Blocking reads, run on the background executor. Errors are user-facing.
+/// Blocking calls, run on the background executor. Errors are user-facing.
 pub trait RemoteClient: Send + Sync {
     fn handshake(&self, remote: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String>;
     /// Live only; Preview callers never enter this route. Default fakes stay offline.
@@ -70,8 +66,19 @@ pub trait RemoteClient: Send + Sync {
     /// A legacy SSH host's tmux sessions (Iced's remote-content Refresh).
     fn list_sessions(&self, host: &RemoteHostConfig) -> RemoteSessionsSnapshot;
     /// The phones paired with the agent (Iced's `list_phones`, capability
-    /// "phone"). Read only: pairing and revoking are not on this client.
+    /// "phone"). Write calls below require the shell's Live authorization.
     fn list_phones(&self, remote: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String>;
+    fn create_phone_pairing(
+        &self,
+        _remote: &RemoteAgentConfig,
+        _device_name: String,
+        _scope: String,
+    ) -> Result<PhonePairing, String> {
+        Err("phone pairing unavailable".into())
+    }
+    fn revoke_phone(&self, _remote: &RemoteAgentConfig, _id: String) -> Result<bool, String> {
+        Err("phone revocation unavailable".into())
+    }
 }
 
 /// The agent workspace id Iced's folder picker lists through.
@@ -216,36 +223,22 @@ impl RemoteClient for AgentClient {
     }
     fn list_phones(&self, remote: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String> {
         let backend = PreviewSourceHost::backend(remote.clone().into());
-        block_on(list_phones(&backend))?.map_err(|error| error.to_string())
+        block_on(backend.list_phones())?.map_err(|error| error.to_string())
     }
-}
-
-/// Iced's `RemoteAgentBackend::list_phones` (src/agentd/client.rs), which
-/// is not in core: the same request, bearer token and error text.
-async fn list_phones(
-    backend: &RemoteAgentBackend,
-) -> Result<Vec<PairedPhoneInfo>, RemoteAgentClientError> {
-    let mut request = tonic::Request::new(ListPhonesRequest {});
-    backend.authorize(&mut request)?;
-    let channel = connect_channel(&backend.config().endpoint).await?;
-    let response = GitTermAgentClient::new(channel)
-        .list_phones(request)
-        .await
-        .map_err(|err| {
-            RemoteAgentClientError::new(format!("list_phones failed: {}", err.message()))
-        })?
-        .into_inner();
-    Ok(response
-        .phones
-        .into_iter()
-        .map(|phone| PairedPhoneInfo {
-            id: phone.id,
-            name: phone.name,
-            scope: phone.scope,
-            created_unix_secs: phone.created_unix_secs,
-            last_seen_unix_secs: phone.last_seen_unix_secs,
-        })
-        .collect())
+    fn create_phone_pairing(
+        &self,
+        remote: &RemoteAgentConfig,
+        device_name: String,
+        scope: String,
+    ) -> Result<PhonePairing, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(backend.create_phone_pairing(device_name, scope))?
+            .map_err(|error| error.to_string())
+    }
+    fn revoke_phone(&self, remote: &RemoteAgentConfig, id: String) -> Result<bool, String> {
+        let backend = PreviewSourceHost::backend(remote.clone().into());
+        block_on(backend.revoke_phone(id))?.map_err(|error| error.to_string())
+    }
 }
 
 /// Iced's configured remotes, read-only: remote-agents.json, then the copies

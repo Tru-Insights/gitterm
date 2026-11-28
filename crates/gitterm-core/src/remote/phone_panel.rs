@@ -12,7 +12,7 @@
 //! frontend's drawn QR code for an issued pairing (`()` without one).
 
 /// A one-time phone pairing from `CreatePhonePairing`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PhonePairing {
     /// Open on the phone; the code is in its fragment.
     pub pairing_url: String,
@@ -85,7 +85,7 @@ pub struct PhoneCall<C> {
 }
 
 /// An issued pairing as the panel shows it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedPairing<Q> {
     pub url: String,
     /// `XXXX-XXXX`; empty from an agent that predates short codes.
@@ -220,7 +220,6 @@ impl<Q> PhonePanel<Q> {
                 self.error = None;
             }
             Err(error) => {
-                eprintln!("[phone] pairing on {remote_id} failed: {error}");
                 self.error = Some(format!("Could not create a pairing: {error}"));
             }
         }
@@ -235,7 +234,6 @@ impl<Q> PhonePanel<Q> {
         match result {
             Ok(phones) => self.phones = Some(phones),
             Err(error) => {
-                eprintln!("[phone] listing phones on {remote_id} failed: {error}");
                 self.phones = Some(Vec::new());
                 self.error = Some(format!("Could not list paired phones: {error}"));
             }
@@ -258,7 +256,6 @@ impl<Q> PhonePanel<Q> {
             Ok(true) => {}
             Ok(false) => self.error = Some(NO_LONGER_PAIRED.to_string()),
             Err(error) => {
-                eprintln!("[phone] revoking a phone on {remote_id} failed: {error}");
                 self.error = Some(format!("Could not revoke: {error}"));
             }
         }
@@ -422,5 +419,84 @@ mod tests {
         assert_eq!(scope_label("admin"), "admin");
         assert_eq!(requested_scope(false), "view");
         assert_eq!(requested_scope(true), "act");
+    }
+}
+
+impl std::fmt::Debug for PhonePairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhonePairing")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+impl<Q> std::fmt::Debug for IssuedPairing<Q> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedPairing")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+pub const PHONE_QR_SCALE: usize = 6;
+pub const PHONE_QR_QUIET: usize = 4;
+/// RGBA pixels from Iced's phone_pairing_qr, including the quiet zone.
+pub struct PairingQr {
+    pub side: u32,
+    pub pixels: Vec<u8>,
+}
+pub fn pairing_qr(url: &str) -> Result<PairingQr, String> {
+    let code = qrcode::QrCode::new(url.as_bytes())
+        .map_err(|err| format!("could not draw the pairing QR code: {err}"))?;
+    let modules = code.width();
+    let side = (modules + 2 * PHONE_QR_QUIET) * PHONE_QR_SCALE;
+    let mut pixels = vec![255u8; side * side * 4];
+    for (index, color) in code.to_colors().iter().enumerate() {
+        if *color != qrcode::Color::Dark {
+            continue;
+        }
+        let (mx, my) = (index % modules, index / modules);
+        for dy in 0..PHONE_QR_SCALE {
+            let y = (my + PHONE_QR_QUIET) * PHONE_QR_SCALE + dy;
+            for dx in 0..PHONE_QR_SCALE {
+                let x = (mx + PHONE_QR_QUIET) * PHONE_QR_SCALE + dx;
+                let at = (y * side + x) * 4;
+                pixels[at..at + 3].fill(0);
+            }
+        }
+    }
+    Ok(PairingQr {
+        side: side as u32,
+        pixels,
+    })
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+
+    #[test]
+    fn parity_phone_qr_pixels_match_iced_and_debug_redacts_codes() {
+        let url = "http://fixture.invalid/pair#placeholder-pairing";
+        let code = pairing_qr(url).unwrap();
+        let side = code.side as usize;
+        let quiet = PHONE_QR_QUIET * PHONE_QR_SCALE;
+        assert_eq!(code.pixels.len(), side * side * 4);
+        assert_eq!(&code.pixels[..4], &[255; 4]);
+        assert_eq!(
+            &code.pixels[(quiet * side + quiet) * 4..(quiet * side + quiet) * 4 + 4],
+            &[0, 0, 0, 255]
+        );
+        let pairing = PhonePairing {
+            pairing_url: url.into(),
+            expires_unix_secs: 1000,
+            scope: "view".into(),
+            short_code: "PLACEHOLDER-CODE".into(),
+        };
+        let debug = format!("{pairing:?}");
+        assert!(!debug.contains("placeholder-pairing") && !debug.contains("PLACEHOLDER-CODE"));
+        let mut panel = PhonePanel::<()>::open("placeholder".into(), "Example".into());
+        panel.pairing_created("placeholder", Ok(pairing), |_| Ok(()));
+        let debug = format!("{:?}", panel.pairing);
+        assert!(!debug.contains("placeholder-pairing") && !debug.contains("PLACEHOLDER-CODE"));
     }
 }

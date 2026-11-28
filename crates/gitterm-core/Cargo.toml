@@ -40,6 +40,8 @@ toml = { version = "0.8", optional = true }
 shell-words = "=1.1.1"
 
 ring = "0.17"
+# Shared Iced phone QR module matrix; no image dependency.
+qrcode = { version = "0.14", default-features = false }
 
 tonic = { version = "0.12", features = ["transport", "tls-roots"], optional = true }
 prost = { version = "0.13", optional = true }

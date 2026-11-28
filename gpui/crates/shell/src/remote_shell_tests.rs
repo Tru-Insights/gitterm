@@ -464,7 +464,7 @@ fn refresh_lists_remote_sessions_through_the_client(cx: &mut TestAppContext) {
     click("remote-session-shell", cx);
     assert_eq!(
         notice(&f, cx).as_deref(),
-        Some("Shell · not available in preview")
+        Some("Remote terminal is not available in preview")
     );
 }
 
