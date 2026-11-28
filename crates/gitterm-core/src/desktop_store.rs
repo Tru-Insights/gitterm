@@ -212,8 +212,17 @@ impl DesktopStore {
                 let mut next = serde_json::to_value(candidate)
                     .map_err(|e| format!("Encode {}: {e}", path.display()))?;
                 preserve_workspace_unknown(&raw, &known, &mut next);
-                let bytes = serde_json::to_vec_pretty(&next)
+                let typed: WorkspacesFile = serde_json::from_value(next.clone())
                     .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                // Match Iced's struct field order whenever the DTO can retain
+                // everything. Older nested records without flatten still keep
+                // their unknown fields via the merged raw representation.
+                let bytes = if serde_json::to_value(&typed).map_err(|e| e.to_string())? == next {
+                    serde_json::to_vec_pretty(&typed)
+                } else {
+                    serde_json::to_vec_pretty(&next)
+                }
+                .map_err(|e| format!("Encode {}: {e}", path.display()))?;
                 crate::atomic_file::write_atomically(&path, &bytes)?;
                 pending.dirty = false;
             } else {

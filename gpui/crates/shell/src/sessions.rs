@@ -2058,9 +2058,10 @@ impl crate::Shell {
                 )
             });
             for terminal in &saved.bottom_terminals {
-                self.new_terminal_at(
+                self.new_terminal_launch(
                     gpui_component::dock::DockPlacement::Bottom,
                     Some(terminal.dir.clone().into()),
+                    Some(crate::PaneStart::RestoreBottom),
                     window,
                     cx,
                 );
@@ -2106,7 +2107,24 @@ impl crate::Shell {
                         .position(|s| s.id == session.id)
                         .and_then(|i| saved.tabs.get(i))
                 });
-            let Some(tab) = tab.cloned() else { continue };
+            let tab = tab.cloned().or_else(|| {
+                // Iced restores an empty local inventory as one home shell.
+                // Give that shell its caller before a later action saves it.
+                (!remote
+                    && saved.tabs.is_empty()
+                    && imported.first().is_some_and(|s| s.id == session.id))
+                .then(|| {
+                    gitterm_core::workspace_config::WorkspaceTabConfig::from_terminal(
+                        std::path::Path::new(&saved.dir),
+                        std::path::Path::new(&saved.dir),
+                        None,
+                        &fresh_target(),
+                        None,
+                        false,
+                    )
+                })
+            });
+            let Some(tab) = tab else { continue };
             if tab.tab_kind.as_deref() == Some("agent") {
                 if !chats && !remote {
                     continue;
