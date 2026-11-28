@@ -2352,12 +2352,22 @@ mod tests {
         });
         let before = shell.read_with(cx, |shell, cx| shell.active(cx).sessions.len());
         shell.update_in(cx, |shell, window, cx| {
-            for kind in [
-                gitterm_core::remote::launch::SessionKind::Shell,
-                gitterm_core::remote::launch::SessionKind::Codex,
-                gitterm_core::remote::launch::SessionKind::Claude,
+            for (kind, expected) in [
+                (
+                    gitterm_core::remote::launch::SessionKind::Shell,
+                    "Shell · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Codex,
+                    "Codex · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Claude,
+                    "Claude · not available in preview",
+                ),
             ] {
                 shell.open_remote_session_terminal(kind, window, cx);
+                assert_eq!(shell.owner.read(cx).error.as_deref(), Some(expected));
             }
             shell.new_terminal(window, cx);
         });
