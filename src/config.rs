@@ -2079,6 +2079,7 @@ mod repo_action_compatibility {
         iced.repos.insert(
             1,
             RepoConfig {
+                extra: Default::default(),
                 dir: extra.to_string_lossy().into_owned(),
                 location: None,
                 run_command: Some("cargo run".into()),

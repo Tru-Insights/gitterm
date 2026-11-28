@@ -6,6 +6,7 @@ mod agent_sidebar;
 mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
+mod browser;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -58,6 +59,7 @@ mod park;
 pub mod park_sheet;
 pub mod phone;
 mod pr_confirm;
+mod pr_live;
 pub mod preview;
 #[cfg(test)]
 mod region_tests;
@@ -80,6 +82,7 @@ mod task_host_tests;
 mod task_panel;
 pub mod task_switcher;
 pub mod tasks;
+mod terminal_setup;
 mod theme;
 pub mod usage;
 pub mod work_sidebar;
@@ -206,6 +209,7 @@ pub struct Shell {
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
     bar_menu: Option<workspace_bar::Menu>,
+    browser: browser::State,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
@@ -264,6 +268,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        cx.set_global(terminal_setup::Scrollback(settings.scrollback_lines));
         let client_height = f32::from(window.viewport_size().height);
         owner.update(cx, |owner, _| {
             if let Some(notifications) = &mut owner.notifications {
@@ -393,6 +398,8 @@ impl Shell {
             bottom.read(cx).input.height,
             cx,
         );
+        subscriptions
+            .push(cx.on_app_quit(|shell: &mut Self, cx| shell.save_remote_tabs_on_quit(cx)));
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
             for workspace in &this.workspaces {
                 for pane in workspace.panes.values() {
@@ -454,6 +461,8 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
+        subscriptions
+            .push(cx.observe(&owner, |shell, _, cx| shell.sync_settings_sheet_pending(cx)));
         // Panes, their sessions and the active one change with the shell.
         subscriptions.push(cx.observe_self(|shell, cx| shell.sync_task_panes(cx)));
         let mut shell = Self {
@@ -527,6 +536,7 @@ impl Shell {
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
             bar_menu: None,
+            browser: browser::State::new(cx),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             agent_sidebars: HashMap::new(),
@@ -537,6 +547,7 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.start_browser_poll(cx);
         shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
@@ -1086,7 +1097,26 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
-        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
+        let remote = match self.remote_chat_binding(workspace, cx) {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Start remote chat: {error:#}"));
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let cwd = remote
+            .as_ref()
+            .and_then(|_| {
+                self.owner
+                    .read(cx)
+                    .iced_workspace(workspace)
+                    .map(|w| std::path::PathBuf::from(&w.dir))
+            })
+            .or_else(|| self.data.terminal_cwd(workspace, cx));
+        let Some(cwd) = cwd else {
             return;
         };
         let Some(preview) = self.owner.read(cx).preview() else {
@@ -1097,6 +1127,7 @@ impl Shell {
             Some(saved) => chat::ChatPane::history(shutdown, saved, window, cx),
             None => chat::ChatPane::new(shutdown, preview, cwd, window, cx),
         });
+        view.update(cx, |view, cx| view.bind_remote(remote, cx));
         let target = view.read(cx).target();
         let owner = self.owner.clone();
         self._subscriptions.push(
@@ -1150,6 +1181,30 @@ impl Shell {
         self.show_pane(&pane_id, window, cx);
     }
     fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.launch_remote_agent_terminal(None, window, cx) {
+            return;
+        }
+        if let Some(saved) = self
+            .active_workspace(cx)
+            .and_then(|id| self.owner.read(cx).iced_workspace(id))
+            .filter(|saved| saved.is_legacy_remote())
+        {
+            if !self.live_chat_enabled(cx) {
+                self.preview_unavailable("Remote terminal", cx);
+                return;
+            }
+            // Iced NewPlainTab falls back to a local plain terminal for legacy SSH.
+            let cwd = self
+                .active(cx)
+                .active_session
+                .and_then(|id| self.active(cx).panes.get(&session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).task_folder(cx))
+                .unwrap_or_else(|| saved.dir.clone().into());
+            let workspace = self.active(cx).workspace.id;
+            self.new_terminal_at(DockPlacement::Center, Some(cwd), window, cx);
+            self.persist_remote_tabs(workspace, cx);
+            return;
+        }
         self.new_terminal_in(DockPlacement::Center, window, cx);
     }
     fn new_terminal_in(
@@ -1177,10 +1232,30 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.owner.read(cx).workspace_save_pending {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        self.new_terminal_launch_in(workspace, placement, cwd, launch, window, cx);
+    }
+    fn new_terminal_launch_in(
+        &mut self,
+        workspace: WorkspaceId,
+        placement: DockPlacement,
+        cwd: Option<std::path::PathBuf>,
+        launch: Option<PaneStart>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| {
+                state.workspace.id == workspace
+                    && (state.on_bar() || state.parked.as_ref().is_some_and(|p| p.running))
+            })
+        {
             return;
         }
         let transient_run =
@@ -1190,11 +1265,10 @@ impl Shell {
             .iter()
             .flat_map(|w| w.sessions.iter().map(|s| s.id.0))
             .collect();
-        let active = self.active_workspace(cx);
         let state = self
             .workspaces
             .iter_mut()
-            .find(|w| Some(w.workspace.id) == active)
+            .find(|w| w.workspace.id == workspace)
             .unwrap();
         let Some(cwd) = cwd.or_else(|| self.data.terminal_cwd(state.workspace.id, cx)) else {
             self.owner.update(cx, |owner, cx| {
@@ -1317,16 +1391,25 @@ impl Shell {
         }
         match launch {
             Some(PaneStart::Launch(launch)) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.launch_run_terminal(&pane, launch, window, cx);
             }
             Some(PaneStart::Adopt { view, target, .. }) => {
-                let pane = self.active(cx).panes[&pane_id].clone();
+                let pane = self.workspace(workspace).panes[&pane_id].clone();
                 self.adopt_terminal_view(&pane, view, target, window, cx);
             }
             None => {}
         }
-        self.show_pane(&pane_id, window, cx);
+        if self.workspace(workspace).on_bar() {
+            self.show_workspace_pane(workspace, &pane_id, window, cx);
+        } else {
+            // Keep-running workspaces receive their tab without taking focus.
+            let state = self.workspace(workspace);
+            let pane = state.panes[&pane_id].clone();
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
+            });
+        }
     }
     /// Iced opens a tab for a launched task session; GPUI adopts the task
     /// host's terminal into a new center pane of the active workspace. A
@@ -1339,15 +1422,27 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Pane>> {
-        if self.owner.read(cx).workspace_save_pending
-            || !self.local
-            || !self.workspaces.iter().any(|state| state.on_bar())
-        {
+        if !self.workspaces.iter().any(|state| state.on_bar()) {
+            return None;
+        }
+        let workspace = self.active_workspace(cx)?;
+        self.adopt_task_terminal_in(workspace, host, launched, window, cx)
+    }
+    fn adopt_task_terminal_in(
+        &mut self,
+        workspace: WorkspaceId,
+        host: &Entity<task_host::TaskHostOwner>,
+        launched: &task_host::TerminalLaunched,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Pane>> {
+        if self.owner.read(cx).workspace_save_pending || !self.local {
             return None;
         }
         let view = host.update(cx, |host, _| host.take_terminal(&launched.session_id))?;
         let target = launched.target.clone();
-        self.new_terminal_launch(
+        self.new_terminal_launch_in(
+            workspace,
             DockPlacement::Center,
             Some(launched.cwd.clone()),
             Some(PaneStart::Adopt {
@@ -1358,8 +1453,9 @@ impl Shell {
             window,
             cx,
         );
+        // Update exactly the pane holding this launch, never a neighbour.
         let pane = self
-            .active(cx)
+            .workspace(workspace)
             .panes
             .values()
             .find(|pane| pane.read(cx).session.as_ref() == Some(&launched.target))?
@@ -1739,6 +1835,10 @@ fn build_workspace(
     let imported = data
         .local_owner()
         .is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some());
+    let live_remote = cx.try_global::<task_host::GpuiTaskHost>().is_some_and(|host| host.0.read(cx).is_live())
+        && data.local_owner().is_some_and(|owner| owner.read(cx).iced_workspace(workspace.id).is_some_and(|saved| {
+            saved.is_legacy_remote() || matches!(saved.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))
+        }));
     let sessions = if imported {
         let mut sessions = data.sessions(workspace.id, cx);
         let mut terminals = store
@@ -1752,7 +1852,11 @@ fn build_workspace(
             })
             .unwrap_or_default();
         terminals.retain(|terminal| {
-            !session_ids.contains(&terminal.id) && !sessions.iter().any(|s| s.id.0 == terminal.id)
+            // Live remote main tabs restore only from Iced's saved DTOs.
+            // Dock copies use different ids and would attach a second bridge.
+            (!live_remote || terminal.bottom)
+                && !session_ids.contains(&terminal.id)
+                && !sessions.iter().any(|s| s.id.0 == terminal.id)
         });
         sessions.extend(terminals.iter().map(|terminal| {
             Session {
@@ -1978,6 +2082,7 @@ fn adopt_view(
             _ = cwd_pane.update(cx, |pane, cx| {
                 if pane.session.as_ref() == Some(&cwd_target) {
                     pane.terminal_cwd = Some(cwd.into());
+                    pane.terminal_saved_dir = None;
                     cx.notify();
                 }
             });
@@ -2054,63 +2159,11 @@ impl Shell {
                         .map(|w| format!("ssh:{}", w.remote_session.as_ref().unwrap().session_name))
                         .unwrap_or_else(|| "local".into()),
                 };
-                let mut attention = vec![];
-                if let (Some(saved), Some(sidebar)) =
-                    (saved, self.work_sidebars.get(&state.workspace.id))
-                {
-                    use gitterm_core::tasks::{DelegationStatus, TaskAttentionReason};
-                    let sidebar = sidebar.read(cx);
-                    for tab in &saved.tabs {
-                        let task = tab
-                            .task_id
-                            .as_ref()
-                            .and_then(|id| sidebar.tasks().iter().find(|t| &t.task_id == id));
-                        let mut kind = task.and_then(|task| {
-                            if task.attention.reason.is_none() && !task.attention.unread {
-                                return None;
-                            }
-                            Some(match task.attention.reason {
-                                Some(TaskAttentionReason::ExecutionFailed) => {
-                                    workspace_bar::AttentionKind::Failed
-                                }
-                                Some(
-                                    TaskAttentionReason::CompletedUnread
-                                    | TaskAttentionReason::ReadyForReview,
-                                )
-                                | None => workspace_bar::AttentionKind::Review,
-                                _ => workspace_bar::AttentionKind::NeedsYou,
-                            })
-                        });
-                        for worker in sidebar.workers().iter().filter(|worker| {
-                            worker.dismissed_at.is_none()
-                                && tab.session_uid.as_deref()
-                                    == Some(worker.parent.session_uid.as_str())
-                        }) {
-                            let next = match worker.status {
-                                DelegationStatus::Failed { .. } => {
-                                    Some(workspace_bar::AttentionKind::Failed)
-                                }
-                                DelegationStatus::Blocked | DelegationStatus::Interrupted => {
-                                    Some(workspace_bar::AttentionKind::NeedsYou)
-                                }
-                                DelegationStatus::Completed => {
-                                    Some(workspace_bar::AttentionKind::Review)
-                                }
-                                _ => None,
-                            };
-                            let priority = |kind| match kind {
-                                workspace_bar::AttentionKind::NeedsYou => 0,
-                                workspace_bar::AttentionKind::Failed => 1,
-                                workspace_bar::AttentionKind::Review => 2,
-                            };
-                            kind = kind
-                                .into_iter()
-                                .chain(next)
-                                .min_by_key(|kind| priority(*kind));
-                        }
-                        attention.extend(kind);
-                    }
-                }
+                let attention: Vec<_> = state
+                    .sessions
+                    .iter()
+                    .filter_map(|session| self.session_attention(state, session.id, cx).kind)
+                    .collect();
                 workspace_bar::Workspace {
                     id: state.workspace.id,
                     name: state.workspace.name.clone(),
@@ -2141,7 +2194,13 @@ impl Shell {
                             kind: *kind,
                             reason: "Sessions need attention".into(),
                         }),
-                    woke: None,
+                    woke: self
+                        .owner
+                        .read(cx)
+                        .notifications
+                        .as_ref()
+                        .and_then(|s| s.woke.get(&state.runtime_uid))
+                        .copied(),
                     pr_news: None,
                 }
             })
@@ -2171,39 +2230,6 @@ impl Shell {
         let colors = workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark());
         let mut workspaces = self.chrome_workspaces(cx);
         let facts = self.connected_facts(self.saved_facts.snapshot(), colors);
-        for workspace in &mut workspaces {
-            // Iced's chip counts each tab with live attention; a launched
-            // task pane needing input is one, and needs-you outranks.
-            let launched = self
-                .workspaces
-                .iter()
-                .find(|state| state.workspace.id == workspace.id)
-                .map_or(0, |state| {
-                    state
-                        .sessions
-                        .iter()
-                        .filter(|session| session_needs_input(state, session.id, cx))
-                        .count()
-                });
-            let count = facts
-                .attention_counts
-                .get(&workspace.id)
-                .copied()
-                .map_or(launched, |count| count + launched);
-            let count = (count > 0).then_some(count);
-            let kind = workspace
-                .attention
-                .as_ref()
-                .filter(|_| launched == 0)
-                .map_or(workspace_bar::AttentionKind::NeedsYou, |attention| {
-                    attention.kind
-                });
-            workspace.attention = count.map(|count| workspace_bar::Attention {
-                count,
-                kind,
-                reason: "Sessions need attention".into(),
-            });
-        }
         let mut machine_news = facts.machines.clone();
         if let Some(error) = &self.saved_facts_error {
             machine_news.push(error.clone());
@@ -2233,7 +2259,7 @@ impl Shell {
             machine_news,
             repo_machines: facts.repo_machines.clone(),
             remote_workspaces: facts.remote_workspaces.clone(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             ready_count: facts.ready,
             ready_news_count: facts.news_count,
             // Iced counts both saved parks and open work hidden in Repos.
@@ -2260,13 +2286,7 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: workspace_bar::Browser {
-                color: colors.muted,
-                driving: false,
-                hint: "Browser idle".into(),
-                action: Some(workspace_bar::BrowserAction::Open),
-                has_evidence: false,
-            },
+            browser: self.browser.bar(colors),
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
@@ -2388,14 +2408,71 @@ impl Shell {
         .detach();
     }
     fn spine_input(&self, cx: &App) -> spine::Input {
+        let tab_attention: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|state| {
+                state.sessions.iter().filter_map(|session| {
+                    let facts = self.session_attention(state, session.id, cx);
+                    let kind = facts.kind?;
+                    Some(spine::AttentionRow {
+                        workspace: state.workspace.id,
+                        target: spine::Target::Tab(session.id.0),
+                        title: state.panes[&session_pane_id(session.id)]
+                            .read(cx)
+                            .tab_title(),
+                        priority: facts.reason.map_or(
+                            match kind {
+                                workspace_bar::AttentionKind::NeedsYou => 0,
+                                workspace_bar::AttentionKind::Failed => 1,
+                                workspace_bar::AttentionKind::Review => 3,
+                            },
+                            |r| r.priority(),
+                        ),
+                        icon: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => "●",
+                                    workspace_bar::AttentionKind::Failed => "!",
+                                    workspace_bar::AttentionKind::Review => "✓",
+                                },
+                                |r| r.icon(),
+                            )
+                            .into(),
+                        label: facts
+                            .reason
+                            .map_or(
+                                match kind {
+                                    workspace_bar::AttentionKind::NeedsYou => {
+                                        "Input or approval needed"
+                                    }
+                                    workspace_bar::AttentionKind::Failed => "Task failed",
+                                    workspace_bar::AttentionKind::Review => "Ready to review",
+                                },
+                                |r| r.label(),
+                            )
+                            .into(),
+                        waiting: facts.waiting,
+                    })
+                })
+            })
+            .collect();
+        let live_limits = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .and_then(|host| host.0.read(cx).chrome_plan_limits());
+        let (usage_hint, usage_badge) = spine::usage_chrome(
+            live_limits.unwrap_or(&self.usage_input.plan_limits),
+            chrono::Utc::now().timestamp(),
+            workspace_bar::Colors::new(gpui_component::Theme::global(cx).mode.is_dark()),
+        );
         spine::Input {
             workspaces: self.chrome_workspaces(cx),
             active: self.active_workspace(cx),
             repos_on_bar: self.repos_on_bar(cx),
-            attention: self
-                .workspaces
-                .iter()
-                .flat_map(|state| {
+            attention: tab_attention
+                .into_iter()
+                .chain(self.workspaces.iter().flat_map(|state| {
                     let root = self.data.terminal_cwd(state.workspace.id, cx);
                     self.work_sidebars
                         .get(&state.workspace.id)
@@ -2403,6 +2480,18 @@ impl Shell {
                             spine::task_rows(
                                 state.workspace.id,
                                 sidebar.read(cx).tasks().iter().filter(|task| {
+                                    if self.workspaces.iter().any(|state| {
+                                        state.sessions.iter().any(|session| {
+                                            self.session_task(session.id, cx).as_deref()
+                                                == Some(&task.task_id)
+                                                && self
+                                                    .session_attention(state, session.id, cx)
+                                                    .kind
+                                                    .is_some()
+                                        })
+                                    }) {
+                                        return false;
+                                    }
                                     match &task.workspace.location {
                                         gitterm_core::tasks::WorkspaceLocationIdentity::Local {
                                             directory,
@@ -2414,7 +2503,7 @@ impl Shell {
                             )
                         })
                         .unwrap_or_default()
-                })
+                }))
                 .collect(),
             frontmost: self
                 .workspaces
@@ -2429,24 +2518,16 @@ impl Shell {
                 .iter()
                 .flat_map(|state| {
                     state.sessions.iter().filter_map(|session| {
-                        state
-                            .panes
-                            .get(&session_pane_id(session.id))
-                            .and_then(|pane| match &pane.read(cx).content {
-                                pane::PaneContent::PreviewChat(view)
-                                    if view.read(cx).is_working() =>
-                                {
-                                    Some((state.workspace.id, spine::Target::Tab(session.id.0)))
-                                }
-                                _ => None,
-                            })
+                        self.session_attention(state, session.id, cx)
+                            .running
+                            .then_some((state.workspace.id, spine::Target::Tab(session.id.0)))
                     })
                 })
                 .collect(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             usage_open: self.usage_open,
-            usage_hint: "Usage".into(),
-            usage_badge: None,
+            usage_hint,
+            usage_badge,
         }
     }
     fn strip_input(&self, cx: &App) -> session_strip::Input {
@@ -2455,8 +2536,6 @@ impl Shell {
             .iter()
             .find(|w| Some(w.workspace.id) == self.active_workspace(cx));
         let saved = state.and_then(|w| self.owner.read(cx).iced_workspace(w.workspace.id));
-        let needs_input =
-            |id: SessionId| state.is_some_and(|state| session_needs_input(state, id, cx));
         session_strip::Input {
             workspace: state.map(|w| w.workspace.id),
             workspace_name: state.map(|w| w.workspace.name.clone()).unwrap_or_default(),
@@ -2494,23 +2573,10 @@ impl Shell {
                                 .map(|facts| facts.tasks.as_slice())
                         })
                         .unwrap_or_default();
-                    let workers = sidebar
-                        .map(|sidebar| sidebar.workers())
-                        .or_else(|| {
-                            self.roster_facts
-                                .as_ref()
-                                .map(|facts| facts.workers.as_slice())
-                        })
-                        .unwrap_or_default();
                     let task = tab
                         .and_then(|tab| tab.task_id.as_ref())
                         .and_then(|id| tasks.iter().find(|task| &task.task_id == id));
-                    let running = state
-                        .and_then(|state| state.panes.get(&session_pane_id(s.id)))
-                        .is_some_and(|pane| {
-                            matches!(&pane.read(cx).content,
-                            pane::PaneContent::PreviewChat(view) if view.read(cx).is_working())
-                        });
+                    let attention = self.session_attention(state.unwrap(), s.id, cx);
                     session_strip::Session {
                         id: s.id,
                         kind: s.kind,
@@ -2532,20 +2598,9 @@ impl Shell {
                                 })
                                 .map(|session| session.label.clone())
                         }),
-                        // Iced's input-needed tab attention on a launched
-                        // task terminal outranks the durable kinds.
-                        attention: needs_input(s.id)
-                            .then_some(workspace_bar::AttentionKind::NeedsYou)
-                            .or_else(|| {
-                                session_strip::attention(
-                                    task.map(|task| &task.attention),
-                                    workers,
-                                    tab.and_then(|tab| tab.session_uid.as_deref()),
-                                )
-                            }),
-                        running,
-                        // ChatPane does not yet expose its pending-request projection.
-                        pending_requests: 0,
+                        attention: attention.kind,
+                        running: attention.running,
+                        pending_requests: attention.pending,
                     }
                 })
                 .collect(),
@@ -2563,7 +2618,7 @@ impl Shell {
             branch: state
                 .map(|w| self.data.status(w.workspace.id, cx).branch)
                 .unwrap_or_default(),
-            pulse_bright: false,
+            pulse_bright: self.attention_pulse(cx),
             mic: self.dictation_indicator(cx),
             worktree_follow: None,
         }
@@ -2608,12 +2663,6 @@ impl Shell {
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.open_ready_list(window, cx),
                         O::OpenParked => shell.open_parked_list(window, cx),
-                        O::Browser(workspace_bar::BrowserAction::Open) => {
-                            shell.chrome_unavailable("Open browser", cx)
-                        }
-                        O::Browser(workspace_bar::BrowserAction::Focus) => {
-                            shell.chrome_unavailable("Focus browser", cx)
-                        }
                         outcome => shell.bar_outcome(outcome, window, cx),
                     }
                 });
@@ -3461,21 +3510,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        let launch = {
-            let mut launch = launch;
-            launch.program = "/bin/zsh".into();
-            launch.args = vec!["-d".into(), "-l".into()];
-            launch.env.insert(
-                "HOME".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch.env.insert(
-                "ZDOTDIR".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch
-        };
         let preview = self.owner.read(cx).preview();
         if let Err(error) = preview::executable(
             preview.as_deref(),
@@ -3521,17 +3555,37 @@ impl Shell {
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
+        let mut launch = launch;
+        if let Some(target) = &target {
+            browser::terminal_environment(&mut launch, &target.session_uid, cx);
+        }
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
-            gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
-                .with_exit_callback(move |_, cx| {
+            terminal_setup::launch(launch, terminal_setup::Placement::Main, cx).with_exit_callback(
+                move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
                             pane.mark_exited(cx);
                             cx.notify();
                         }
                     });
-                })
+                },
+            )
         });
         self._subscriptions
             .push(cx.observe_in(&view, window, |_, view, window, cx| {
@@ -3737,6 +3791,9 @@ impl Shell {
         if self.dictation_enabled() {
             context.push_str(" IcedStt");
         }
+        if self.browser.evidence_open {
+            return context;
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3815,6 +3872,7 @@ impl Shell {
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
         [
+            (self.browser.evidence_open, Modal::BrowserEvidence),
             (self.task_switcher.is_some(), Modal::TaskSwitcher),
             (self.usage_open, Modal::Usage),
             (Self::has_dialog(window, cx), Modal::Dialog),
@@ -3843,7 +3901,8 @@ impl Shell {
     /// switcher, the new-task form and task prompts, the New Work and Park
     /// sheets (not the Parked and Ready lists) and a PR action confirmation.
     fn pty_blocked(&self, cx: &App) -> bool {
-        self.task_switcher.is_some()
+        self.browser.evidence_open
+            || self.task_switcher.is_some()
             || self.task_panel_modal_open(cx)
             || self.new_work_sheet.is_some()
             || self
@@ -4349,7 +4408,10 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.browser.evidence_open
+                || self.plans_open
+                || self.task_switcher.is_some()
+                || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -4564,6 +4626,9 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_browser_evidence(window, cx) {
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -4708,6 +4773,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser.evidence_open {
+            if event.keystroke.key == "escape" {
+                self.close_browser_evidence(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
@@ -4853,6 +4925,7 @@ impl Render for Shell {
             ));
         }
         for state in &self.workspaces {
+            terminal_setup::sync_workspace_insets(state, cx);
             for pane in state.panes.values() {
                 if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
                     view.clone()
@@ -4873,7 +4946,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open
+            content.picker = self.browser.evidence_open
+                || self.plans_open
                 || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
@@ -4964,6 +5038,7 @@ impl Render for Shell {
                 )
                 .children(self.new_work_sheet.clone())
                 .children(self.remote_overlays())
+                .children(self.browser_evidence_view(window, cx))
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -5104,6 +5179,7 @@ impl Render for Shell {
             )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
+            .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
@@ -5268,6 +5344,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
             // namespace included), so keep a copy of the one the host gets.
             let chat_services = live_services.as_deref().cloned();
             let started = if let Some(services) = live_services {
+                pr_live::LivePrs::install(services.clone(), cx);
                 task_host::TaskHostOwner::start_live(config, host_lock, services, cx)
             } else {
                 task_host::TaskHostOwner::start_locked(config, host_lock, cx)
@@ -5635,8 +5712,9 @@ impl Shell {
             tab,
             |w| self.workspaces[w].sessions.len(),
             |w, t| {
-                self.session_task(self.workspaces[w].sessions[t].id, cx)
-                    .is_some_and(|id| tasks.iter().any(|task| task.task_id == id && needs(task)))
+                self.session_attention(&self.workspaces[w], self.workspaces[w].sessions[t].id, cx)
+                    .kind
+                    .is_some()
             },
         );
         if self.usage_open {

@@ -323,6 +323,18 @@ impl ReviewView {
         self.show_aggregate = true;
         cx.notify();
     }
+
+    /// Open Iced's resolved chat edit route without recomputing its target or source.
+    pub fn open_edit_review(
+        &mut self,
+        open: gitterm_core::review::model::EditReview,
+        host: crate::host::ReviewHost,
+        cx: &mut Context<Self>,
+    ) {
+        self.aggregate = Some(cx.new(|cx| AggregateView::open_edit(open, host, cx)));
+        self.show_aggregate = true;
+        cx.notify();
+    }
 }
 impl Focusable for ReviewView {
     fn focus_handle(&self, _: &App) -> FocusHandle {

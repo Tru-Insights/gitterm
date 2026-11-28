@@ -330,3 +330,70 @@ fn user_zdotdir_still_restored() {
         run_zsh_startup(login);
     }
 }
+
+#[test]
+fn golive19_fake_bridge_resize_disconnect_close_and_quit() {
+    use gitterm_core::task_host::command::TerminalCommand;
+    let temp = tempfile::tempdir().unwrap();
+    // Represents a daemon/tmux session: closing either local bridge must
+    // leave its durable remote state alone. No network or real agent runs.
+    let remote = temp.path().join("remote-session-running");
+    std::fs::write(&remote, "running").unwrap();
+    let spec = TerminalCommand {
+        cwd: temp.path().to_path_buf(),
+        program: "/usr/bin/python3".into(),
+        args: vec!["-u".into(), "-c".into(), r#"import os,signal,sys
+assert os.environ['PLACEHOLDER_BRIDGE'] == "value with 'quote'"
+signal.signal(signal.SIGWINCH, lambda *_: print('RESIZED_%s_%s' % os.get_terminal_size(), flush=True))
+print('BRIDGE_READY', flush=True)
+for line in sys.stdin:
+    if line.strip() == 'disconnect':
+        print('connection lost: placeholder', flush=True)
+        sys.exit(7)
+"#.into()],
+        env: [("PLACEHOLDER_BRIDGE".into(), "value with 'quote'".into())].into(),
+    };
+    let launch = TerminalLaunch::from_command(spec.clone());
+    assert_eq!(launch.args, spec.args);
+    assert_eq!(
+        launch.env["PLACEHOLDER_BRIDGE"],
+        Some("value with 'quote'".into())
+    );
+    let mut bridge = launch.start();
+    wait(|| {
+        bridge
+            .get_all_text()
+            .is_some_and(|text| text.contains("BRIDGE_READY"))
+    });
+    bridge.resize_cells(103, 39);
+    wait(|| {
+        bridge.sync();
+        bridge
+            .get_all_text()
+            .is_some_and(|text| text.contains("RESIZED_103_39"))
+    });
+    assert!(bridge.write(b"disconnect\n".to_vec()));
+    wait(|| matches!(bridge.state(), SessionState::Exited(_)));
+    assert!(
+        bridge
+            .get_all_text()
+            .unwrap()
+            .contains("connection lost: placeholder")
+    );
+    assert_eq!(std::fs::read_to_string(&remote).unwrap(), "running");
+    for quit in [false, true] {
+        let mut bridge = TerminalLaunch::from_command(spec.clone()).start();
+        wait(|| {
+            bridge
+                .get_all_text()
+                .is_some_and(|text| text.contains("BRIDGE_READY"))
+        });
+        if quit {
+            drop(bridge);
+        } else {
+            bridge.cancel();
+            assert_eq!(bridge.state(), SessionState::Cancelled);
+        }
+        assert_eq!(std::fs::read_to_string(&remote).unwrap(), "running");
+    }
+}

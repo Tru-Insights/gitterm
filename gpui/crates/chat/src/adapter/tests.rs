@@ -1553,3 +1553,62 @@ fn worker_reset_and_completion_do_not_hide_or_invalidate_parent_request() {
         assert_eq!(model.pending_rows(), vec![0]);
     }
 }
+
+#[test]
+fn golive20b_link_notices_are_transient_and_gap_replaces_history() {
+    let mut adapter = ChatAdapter::default();
+    let source = adapter.begin_runtime(target());
+    adapter.bind_session(Some("placeholder-session".into()));
+    let event = AgentEvent::Harness(HarnessEvent::RemoteDisconnected {
+        machine: "Placeholder".into(),
+        error: "synthetic disconnect".into(),
+    });
+    let update = adapter
+        .receive(&source, &target(), event.clone(), None, |_, _| {})
+        .unwrap();
+    assert!(
+        matches!(update.presentation, Some(Presentation::Append(events)) if matches!(events.as_slice(), [AgentEvent::Harness(HarnessEvent::RemoteDisconnected { machine, error })] if machine == "Placeholder" && error == "synthetic disconnect"))
+    );
+    assert!(
+        adapter.state().conversation.is_empty(),
+        "link notices never enter saved conversation"
+    );
+    let (ticket, _) = adapter.begin_history(target(), facts().config).unwrap();
+    adapter
+        .complete_history(
+            &ticket,
+            &target(),
+            AgentBackend::Claude,
+            Ok(vec![AgentEvent::user_prompt("old history")]),
+        )
+        .unwrap();
+    let reset = adapter.reset_history();
+    assert!(matches!(reset.presentation, Some(Presentation::Replay)));
+    let (ticket, _) = adapter.begin_history(target(), facts().config).unwrap();
+    adapter
+        .receive(
+            &source,
+            &target(),
+            AgentEvent::Harness(HarnessEvent::TextDelta("live after gap".into())),
+            None,
+            |_, _| {},
+        )
+        .unwrap();
+    adapter
+        .complete_history(
+            &ticket,
+            &target(),
+            AgentBackend::Claude,
+            Ok(vec![AgentEvent::user_prompt("repaired history")]),
+        )
+        .unwrap();
+    assert!(adapter.state().conversation.iter().any(
+        |event| matches!(event, AgentEvent::Other(value) if value["text"] == "repaired history")
+    ));
+    assert!(
+        !adapter.state().conversation.iter().any(
+            |event| matches!(event, AgentEvent::Other(value) if value["text"] == "old history")
+        )
+    );
+    assert!(adapter.state().conversation.iter().any(|event| matches!(event, AgentEvent::Harness(HarnessEvent::TextDelta(text)) if text == "live after gap")));
+}

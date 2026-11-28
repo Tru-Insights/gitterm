@@ -524,7 +524,7 @@ pub struct AgentPreset<C = WorkspaceColor> {
     pub color: C,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceColor {
     Lavender,

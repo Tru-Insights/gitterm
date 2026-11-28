@@ -341,3 +341,25 @@ fn paste_is_dropped_behind_iceds_capture_layers(cx: &mut TestAppContext) {
         assert!(!blocked(cx), "{blocker:?}: gate open after");
     }
 }
+
+/// Browser evidence captures raw keys even if a retained terminal regains focus.
+#[gpui::test]
+fn browser_evidence_captures_typed_keys_and_escape_before_the_terminal(cx: &mut TestAppContext) {
+    let (_root, shell, cx) = h6_tests::sample(cx);
+    dispatch(TabSelect { index: 1 }, cx);
+    let view = terminal(&shell, cx);
+    shell.update(cx, |shell, cx| {
+        shell.browser.evidence_open = true;
+        cx.notify();
+    });
+    focus_terminal(&view, cx);
+    cx.simulate_keystrokes("q w e");
+    draw(cx);
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    cx.read(|cx| assert!(!shell.read(cx).browser.evidence_open));
+    focus_terminal(&view, cx);
+    cx.simulate_keystrokes("k l m");
+    wait_until(cx, |cx| screen(&view, cx).contains("klm"));
+    assert!(!screen(&view, cx).contains("qwe"));
+}

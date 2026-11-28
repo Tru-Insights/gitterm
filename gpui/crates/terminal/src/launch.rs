@@ -41,6 +41,21 @@ impl Default for TerminalLaunch {
     }
 }
 impl TerminalLaunch {
+    /// Keep the application launch argv/env from Iced's shared builder intact.
+    pub fn from_command(command: gitterm_core::task_host::command::TerminalCommand) -> Self {
+        Self {
+            cwd: Some(command.cwd),
+            program: command.program,
+            args: command.args,
+            env: command
+                .env
+                .into_iter()
+                .map(|(key, value)| (key, Some(value)))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     /// Failures remain renderable terminal states, including invalid cwd/program.
     pub fn start(self) -> Backend {
         let size = (self.cols, self.rows);

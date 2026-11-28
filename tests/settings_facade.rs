@@ -145,3 +145,58 @@ fn shared_park_helpers_preserve_iced_bytes_and_cross_read_both_hosts() {
         serde_json::to_value(expected).unwrap()
     );
 }
+
+#[test]
+fn workspace_settings_legacy_remote_saved_bytes_match_iced_runtime_sequence() {
+    use gitterm_core::{
+        desktop_store::DesktopStore,
+        workspace_config::WorkspaceTarget,
+        workspace_settings::{Edit, EnvEdit},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let input = serde_json::json!({"active_workspace":0,"workspaces":[{
+        "name":"Remote fixture","abbrev":"RF","color":"blue","dir":root.path().join("stand-in"),"tabs":[],
+        "remote_session":{"label":"fixture","host_name":"fixture.invalid","ssh_target":"fixture.invalid",
+            "identity_file":"","session_name":"fixture","remote_dir":"/fixture"},
+        "env":{"KEY":"old"},"env_overrides":{"KEY":"old"}
+    }]});
+    let mut iced: config::WorkspacesFile = serde_json::from_value(input.clone()).unwrap();
+    let initial: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_value(input.clone()).unwrap();
+    let target = WorkspaceTarget::of(&initial.workspaces[0]);
+    std::fs::write(root.path().join("workspaces.json"), input.to_string()).unwrap();
+    let store = DesktopStore::open(root.path()).unwrap();
+    iced.normalize_repos();
+    // Frozen Iced set_workspace_env + workspace_config: its runtime home repo
+    // retains the original env when the override changes and is then removed.
+    let mut home_env = iced.workspaces[0].env.clone();
+    for value in [Some("new"), None] {
+        let ws = &mut iced.workspaces[0];
+        let env = if ws.env_overrides.contains_key("KEY") {
+            &mut ws.env_overrides
+        } else {
+            &mut home_env
+        };
+        if let Some(value) = value {
+            env.insert("KEY".into(), value.into());
+        } else {
+            env.remove("KEY");
+        }
+        ws.env = config::layered_env(&home_env, &ws.env_overrides);
+        store
+            .edit_workspace_settings(
+                target.clone(),
+                Edit::Env(EnvEdit::Set {
+                    key: "KEY".into(),
+                    value: value.map(str::to_owned),
+                }),
+            )
+            .wait()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            serde_json::to_vec_pretty(&iced).unwrap()
+        );
+    }
+    assert_eq!(iced.workspaces[0].env["KEY"], "old");
+}

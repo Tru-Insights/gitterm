@@ -9,6 +9,7 @@
 //! tick persists identities, enforces time limits, promotes queues and closes
 //! final workers after identity-checked TERM/grace.
 //! Live creates tasks and saves handoffs through core on the locked V6 store.
+//! Live merge plans use the same root and the watch owned by `crate::pr_live`.
 //! Live delivers saved and current results; general process restore stays closed.
 //!
 //! One [`TaskHostOwner`] per preview root: a lifetime host lock is taken
@@ -361,6 +362,11 @@ pub(crate) struct TaskHostOwner {
 }
 
 impl TaskHostOwner {
+    /// Read the existing Live allowance state for the Usage rail projection.
+    pub(crate) fn chrome_plan_limits(&self) -> Option<&gitterm_core::plan_limits::PlanLimitsFile> {
+        self.plan_limits.as_ref().map(|state| state.file())
+    }
+
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
@@ -720,6 +726,31 @@ impl TaskHostOwner {
                 servers.task_mcp.claude_mcp_server(Some(caller)),
                 servers.browser.claude_mcp_server(Some(caller)),
             ]
+        })
+    }
+
+    /// The chrome uses exactly the MCP host's context, engine and runtime.
+    pub(crate) fn browser_host(&self) -> Option<crate::browser::Host> {
+        let servers = self.servers.as_ref()?;
+        if servers
+            .jobs
+            .iter()
+            .any(tokio::task::JoinHandle::is_finished)
+        {
+            return None;
+        }
+        Some(crate::browser::Host {
+            admission: servers.browser.ui_admission(),
+            browser: servers.browser.browser(),
+            engine: servers.browser.engine(),
+            runtime: servers.runtime.handle().clone(),
+            services: Arc::new(self.host.services().clone()),
+        })
+    }
+
+    pub(crate) fn browser_environment(&self, caller: &str) -> Vec<(String, String)> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            servers.browser.terminal_environment(Some(caller)).into()
         })
     }
 
@@ -1175,7 +1206,7 @@ impl TaskHostOwner {
     }
 
     /// Iced's `merge_plan_set` for the caller's root chat, written to the
-    /// preview's merge-plan dir (never Iced's). The target is the caller
+    /// admitted Live root or the fixture preview's own merge-plan dir. The target is the caller
     /// pane's directory. The write is synchronous, so no second set can
     /// interleave with it as Iced's `plan_writes` guards against.
     // shortcut: the plan file is written on the UI thread; move it to the
@@ -1200,12 +1231,25 @@ impl TaskHostOwner {
             .collect();
         self.authorize_write(label, &target)?;
         let (conversation, links) = self.caller_conversation(TOOL, caller, cx)?;
-        let root = root_chat(&self.iced_config, &links, &conversation);
+        let live_prs = self
+            .is_live()
+            .then(|| cx.try_global::<crate::pr_live::LivePrs>().cloned())
+            .flatten();
+        let root = live_prs
+            .as_ref()
+            .map(|prs| prs.root_chat(&conversation, &links))
+            .unwrap_or_else(|| root_chat(&self.iced_config, &links, &conversation));
         let entries = merge_plan::validate_entries(request.entries)?;
-        let dir = merge_plan::plans_dir(self.roots.root());
-        self.roots
-            .create_private_dir(&dir)
-            .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        let dir = if self.is_live() {
+            merge_plan::plans_dir(self.host.services().state_root())
+        } else {
+            merge_plan::plans_dir(self.roots.root())
+        };
+        if !self.is_live() {
+            self.roots
+                .create_private_dir(&dir)
+                .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        }
         let mut plan = merge_plan::load_plans(&dir)
             .remove(&root)
             .unwrap_or_else(|| MergePlan {
@@ -1215,16 +1259,23 @@ impl TaskHostOwner {
         let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let kept_holds = plan.replace_entries(entries, &stamp);
         let file = merge_plan::plan_path(&dir, &root)?;
-        self.roots
-            .scoped(&file)
-            .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        if !self.is_live() {
+            self.roots
+                .scoped(&file)
+                .map_err(|error| format!("the merge plan was not saved: {error}"))?;
+        }
         merge_plan::write_plan(&dir, &plan)
             .map_err(|error| format!("the merge plan was not saved: {error}"))?;
         eprintln!(
             "[merge-plan] {root}: plan set with {} PR(s)",
             plan.entries.len()
         );
-        let mut value = merge_plan_in(&self.iced_config, &dir, &links, &conversation);
+        if let Some(prs) = &live_prs {
+            prs.request_refresh();
+        }
+        let mut value = live_prs
+            .map(|prs| prs.merge_plan(&conversation, &links))
+            .unwrap_or_else(|| merge_plan_in(&self.iced_config, &dir, &links, &conversation));
         value["kept_holds"] =
             serde_json::Value::from(kept_holds.iter().map(|key| key.label()).collect::<Vec<_>>());
         Ok(value)
@@ -1629,6 +1680,15 @@ impl TaskHostOwner {
             Ok(resolved) => resolved,
             Err(error) => return reply.send(Err(error)),
         };
+        if self.is_live()
+            && let Some(prs) = cx.try_global::<crate::pr_live::LivePrs>().cloned()
+        {
+            cx.background_spawn(async move {
+                reply.send(Ok(prs.merge_plan(&conversation, &links)));
+            })
+            .detach();
+            return;
+        }
         let (iced_config, plans_dir) = (self.iced_config.clone(), self.plans_dir());
         cx.background_spawn(async move {
             reply.send(Ok(merge_plan_in(
@@ -2101,20 +2161,18 @@ mod live_tests {
                     )
                     .is_ok()
             );
-            for effect in [
-                gitterm_core::preview::service::RunnerEffect::HtmlPreview,
-                gitterm_core::preview::service::RunnerEffect::RestoreSession,
-            ] {
-                assert!(
-                    owner
-                        .host
-                        .services()
-                        .runner(effect, None)
-                        .unwrap_err()
-                        .notice()
-                        .ends_with("not available in preview")
-                );
-            }
+            assert!(
+                owner
+                    .host
+                    .services()
+                    .runner(
+                        gitterm_core::preview::service::RunnerEffect::RestoreSession,
+                        None
+                    )
+                    .unwrap_err()
+                    .notice()
+                    .ends_with("not available in preview")
+            );
         });
         owner.update(cx, |owner, _| owner.shutdown());
         assert_eq!(std::fs::read(&source).unwrap(), bytes);

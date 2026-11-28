@@ -23,7 +23,7 @@ pub(crate) fn worker_tab_target<T>(
     gitterm_core::delegations::worker_tab_target(delegation, find)
 }
 use crate::{FileOpen, Shell, pane};
-use gpui::{Context, Entity, Window};
+use gpui::{Context, Entity, TaskExt, Window};
 impl Shell {
     pub(crate) fn open_chat_checkout(
         &mut self,
@@ -50,6 +50,9 @@ impl Shell {
         let Some(source) = source else {
             return;
         };
+        if source.read(cx).is_remote() {
+            return;
+        }
         let current = source.read(cx).cwd();
         if let Some(path) = gitterm_core::editor::known_checkout_path(
             &[],
@@ -80,7 +83,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.local {
+        if !self.local || source.read(cx).is_remote() {
             return;
         }
         let Some(workspace) = self.workspaces.iter().find(|workspace| workspace.panes.values().any(|pane| matches!(&pane.read(cx).content, pane::PaneContent::PreviewChat(chat) if chat == source))) else { return; };
@@ -91,31 +94,57 @@ impl Shell {
         } else {
             root.join(path)
         };
-        let mut event = FileOpen {
+        if review {
+            // Match Iced open_review_from_chat: find the owning checkout rather
+            // than consulting the workspace home's status snapshot.
+            let source = source.clone();
+            let sidebar = self.work_sidebars.get(&workspace_id).cloned();
+            let work = cx.background_executor().spawn(async move {
+                gitterm_core::review::edit::checkout_containing(&path)
+                    .ok_or_else(|| format!("no git checkout contains {}.", path.display()))
+                    .map(|checkout| (checkout, path))
+            });
+            cx.spawn_in(window, async move |shell, cx| {
+                let result = work.await;
+                let resolved = match result {
+                    Ok((checkout, path)) => {
+                        let known = shell.update(cx, |_, cx| {
+                            sidebar
+                                .as_ref()
+                                .and_then(|sidebar| sidebar.read(cx).review_target(&checkout))
+                        })?;
+                        cx.background_executor()
+                            .spawn(async move {
+                                tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .map_err(|error| {
+                                        format!("create chat review executor: {error}")
+                                    })?
+                                    .block_on(gitterm_core::review::edit::resolve_edit_review(
+                                        checkout, path, known,
+                                    ))
+                            })
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                shell.update_in(cx, |shell, window, cx| match resolved {
+                    Ok(open) => shell.open_edit_review(workspace_id, open, window, cx),
+                    Err(error) => source.update(cx, |pane, cx| {
+                        pane.show_notice(format!("Not opened in review: {error}"), cx)
+                    }),
+                })
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+        let event = FileOpen {
             workspace: workspace_id,
             path: path.clone(),
             changed: None,
             from_files: !review,
         };
-        if review {
-            event.changed = self
-                .owner
-                .read(cx)
-                .model
-                .status_view(workspace_id)
-                .files
-                .into_iter()
-                .find(|file| root.join(&file.path) == path);
-            if event.changed.is_none() {
-                source.update(cx, |pane, cx| {
-                    pane.show_notice(
-                        format!("{} has no changes in this checkout.", path.display()),
-                        cx,
-                    )
-                });
-                return;
-            }
-        }
         self.open_file_viewer_at_line(&event, line, window, cx);
     }
 }
