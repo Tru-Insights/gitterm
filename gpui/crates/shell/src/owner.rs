@@ -359,6 +359,7 @@ impl WorkspaceOwner {
         workspace: crate::data::WorkspaceId,
         id: crate::data::SessionId,
         target: &gitterm_core::session::Target,
+        bottom_index: Option<usize>,
         cx: &App,
     ) -> Result<
         Option<gitterm_core::desktop_store::Receipt<crate::workspace_config::LiveWorkspaceSaved>>,
@@ -367,6 +368,34 @@ impl WorkspaceOwner {
         let Some(saved) = self.iced_workspace(workspace) else {
             return Ok(None);
         };
+        if let Some(index) = bottom_index.filter(|_| {
+            !saved.is_legacy_remote()
+                && crate::workspace_config::workspace_remote_id(saved).is_none()
+        }) {
+            let desktop = cx
+                .try_global::<crate::workspace_config::LiveWorkspaces>()
+                .ok_or("Live workspace store is unavailable; terminal was kept open")?
+                .0
+                .clone();
+            let target = gitterm_core::workspace_config::WorkspaceTarget::of(saved);
+            return Ok(Some(desktop.transact_workspaces(move |file| {
+                file.edit_desktop_sessions(
+                    &target,
+                    gitterm_core::workspace_config::DesktopSessionEdit::CloseBottom(index),
+                )?;
+                let index = target.index(file)?;
+                Ok(crate::workspace_config::LiveWorkspaceSaved {
+                    workspace: file.workspaces[index].clone(),
+                    repos: file.repos.clone(),
+                    closed: file
+                        .workspaces
+                        .iter()
+                        .filter(|w| !w.active)
+                        .cloned()
+                        .collect(),
+                })
+            })));
+        }
         let at = saved
             .tabs
             .iter()

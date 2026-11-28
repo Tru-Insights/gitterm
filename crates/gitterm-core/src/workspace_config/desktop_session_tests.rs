@@ -45,6 +45,7 @@ fn tru274_live_desktop_inventory_and_selection_have_iced_bytes() {
         DesktopSessionEdit::OpenTabs(vec![projection]),
         DesktopSessionEdit::OpenBottom {
             terminal: BottomTerminalConfig {
+                extra: Default::default(),
                 dir: "/fixture/project".into(),
             },
             initial_tabs: vec![],
@@ -62,6 +63,7 @@ fn tru274_live_desktop_inventory_and_selection_have_iced_bytes() {
     expected.workspaces[0]
         .bottom_terminals
         .push(BottomTerminalConfig {
+            extra: Default::default(),
             dir: "/fixture/project".into(),
         });
     assert_eq!(
@@ -158,4 +160,178 @@ fn tru274_session_save_preserves_unknown_nested_records() {
         saved["workspaces"][0]["bottom_terminals"][0]["future_bottom"],
         json!(true)
     );
+}
+
+#[test]
+fn tru274_f4_migrate_repo_bottom_terminals_before_append_matches_iced() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut initial = file();
+    initial.repos = vec![serde_json::from_value(json!({"dir":"/fixture/project",
+        "future_repo":9,"bottom_terminals":[{"dir":"/fixture/legacy","future_bottom":"legacy"}]}))
+    .unwrap()];
+    let mut iced = initial.clone();
+    iced.normalize_repos();
+    let terminal: BottomTerminalConfig =
+        serde_json::from_value(json!({"dir":"/fixture/new"})).unwrap();
+    iced.workspaces[0].bottom_terminals.push(terminal.clone());
+    let path = temp.path().join("workspaces.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+    let store = DesktopStore::open(temp.path()).unwrap();
+    let target = WorkspaceTarget::of(&initial.workspaces[0]);
+    let mut saved = store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(
+                &target,
+                DesktopSessionEdit::OpenBottom {
+                    terminal,
+                    initial_tabs: vec![],
+                },
+            )
+        })
+        .wait()
+        .unwrap();
+    saved.normalize_repos(); // Same startup normalization as IcedCatalog.
+    assert_eq!(
+        serde_json::to_value(saved).unwrap(),
+        serde_json::to_value(&iced).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        serde_json::to_vec_pretty(&iced).unwrap()
+    );
+}
+
+#[test]
+fn tru274_f5_equal_cwds_keep_each_bottom_descriptors_own_unknown_fields() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut raw = serde_json::to_value(file()).unwrap();
+    raw["workspaces"][0]["bottom_terminals"] = json!([
+        {"dir":"/fixture/project","future_bottom":"first"},
+        {"dir":"/fixture/project","future_bottom":"second"}]);
+    let path = temp.path().join("workspaces.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+    let store = DesktopStore::open(temp.path()).unwrap();
+    let target = WorkspaceTarget::of(&file().workspaces[0]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(
+                &target,
+                DesktopSessionEdit::OpenBottom {
+                    terminal: serde_json::from_value(json!({"dir":"/fixture/project"})).unwrap(),
+                    initial_tabs: vec![],
+                },
+            )
+        })
+        .wait()
+        .unwrap();
+    raw["workspaces"][0]["bottom_terminals"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"dir":"/fixture/project"}));
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved, raw);
+    // Removing the first of identical-cwd terminals keeps the second's metadata.
+    let target = WorkspaceTarget::of(&file().workspaces[0]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(&target, DesktopSessionEdit::CloseBottom(0))
+        })
+        .wait()
+        .unwrap();
+    raw["workspaces"][0]["bottom_terminals"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved, raw);
+}
+
+#[test]
+fn tru274_f6_explicit_local_location_accepts_terminal_inventory() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut iced = file();
+    iced.workspaces[0].location = Some(WorkspaceLocationConfig::Local {
+        root: "/fixture/project".into(),
+    });
+    let path = temp.path().join("workspaces.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&iced).unwrap()).unwrap();
+    let store = DesktopStore::open(temp.path()).unwrap();
+    let target = WorkspaceTarget::of(&iced.workspaces[0]);
+    let terminal: BottomTerminalConfig =
+        serde_json::from_value(json!({"dir":"/fixture/new"})).unwrap();
+    iced.workspaces[0].bottom_terminals.push(terminal.clone());
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_desktop_sessions(
+                &target,
+                DesktopSessionEdit::OpenBottom {
+                    terminal,
+                    initial_tabs: vec![],
+                },
+            )
+        })
+        .wait()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        serde_json::to_vec_pretty(&iced).unwrap()
+    );
+}
+
+#[test]
+fn tru274_f7_failed_runtime_inventory_stays_dirty_and_retries_in_order() {
+    for next_save in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspaces.json");
+        let mut iced = file();
+        iced.workspaces[0].location = Some(WorkspaceLocationConfig::Local {
+            root: "/fixture/project".into(),
+        });
+        let mut raw = serde_json::to_value(&iced).unwrap();
+        raw["workspaces"][0]["location"]["future_location"] = json!({"keep":true});
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let store = DesktopStore::open(temp.path()).unwrap();
+        let target = WorkspaceTarget::of(&iced.workspaces[0]);
+        let tab: WorkspaceTabConfig =
+            serde_json::from_value(json!({"dir":"/fixture/new","session_uid":"first-new"}))
+                .unwrap();
+        iced.workspaces[0].tabs.push(tab.clone());
+        iced.workspaces[0].active_tab = Some(1);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let at = target.clone();
+        assert!(store
+            .edit_runtime_workspaces(move |file| file
+                .edit_desktop_sessions(&at, DesktopSessionEdit::OpenTabs(vec![tab])))
+            .wait()
+            .is_err());
+        let snapshot = store.snapshot().wait().unwrap();
+        assert!(snapshot.workspaces.dirty);
+        assert!(snapshot.workspaces.error.is_some());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, original).unwrap();
+        if next_save {
+            let tab: WorkspaceTabConfig =
+                serde_json::from_value(json!({"dir":"/fixture/next","session_uid":"second-new"}))
+                    .unwrap();
+            iced.workspaces[0].tabs.push(tab.clone());
+            iced.workspaces[0].active_tab = Some(2);
+            store
+                .edit_runtime_workspaces(move |file| {
+                    file.edit_desktop_sessions(&target, DesktopSessionEdit::OpenTabs(vec![tab]))
+                })
+                .wait()
+                .unwrap();
+        } else {
+            store.drain().wait().unwrap();
+        }
+        assert!(!store.snapshot().wait().unwrap().workspaces.dirty);
+        let mut raw = serde_json::to_value(&iced).unwrap();
+        raw["workspaces"][0]["location"]["future_location"] = json!({"keep":true});
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            serde_json::to_vec_pretty(&raw).unwrap()
+        );
+    }
 }

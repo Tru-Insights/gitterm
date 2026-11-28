@@ -1216,6 +1216,11 @@ impl crate::Shell {
         let path_for_job = path.clone();
         let repository_for_job = repository.clone();
         let store = desktop.0.clone();
+        let mounted = if local {
+            self.live_mounted_tab_updates(workspace, cx)
+        } else {
+            vec![]
+        };
         let target_for_job = target.clone();
         let work = cx.background_executor().spawn(async move {
             match &action {
@@ -1223,6 +1228,12 @@ impl crate::Shell {
                     rules::check_open_worktree(&repository_for_job, &path_for_job)?;
                     let file = store
                         .try_edit_workspaces(move |file| {
+                            file.edit_desktop_sessions(
+                                &target_for_job,
+                                gitterm_core::workspace_config::DesktopSessionEdit::RefreshTabs(
+                                    mounted,
+                                ),
+                            )?;
                             file.open_worktree_tab(&target_for_job, &path_for_job)?;
                             Ok(())
                         })

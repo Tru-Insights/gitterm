@@ -332,6 +332,7 @@ fn tru274_live_local_sessions_and_selection_match_actual_iced_dto_bytes() {
                 &target,
                 DesktopSessionEdit::OpenBottom {
                     terminal: BottomTerminalConfig {
+                        extra: Default::default(),
                         dir: "/fixture/first".into(),
                     },
                     initial_tabs: vec![],
@@ -343,6 +344,7 @@ fn tru274_live_local_sessions_and_selection_match_actual_iced_dto_bytes() {
     iced.workspaces[0]
         .bottom_terminals
         .push(BottomTerminalConfig {
+            extra: Default::default(),
             dir: "/fixture/first".into(),
         });
     assert_eq!(

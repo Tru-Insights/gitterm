@@ -331,6 +331,9 @@ impl WorkspaceTabConfig {
 #[derive(Clone)]
 pub enum DesktopSessionEdit {
     OpenTabs(Vec<WorkspaceTabConfig>),
+    /// Current projections of mounted records, in their saved slots.
+    RefreshTabs(Vec<(usize, WorkspaceTabConfig)>),
+    CloseBottom(usize),
     OpenBottom {
         terminal: BottomTerminalConfig,
         initial_tabs: Vec<WorkspaceTabConfig>,
@@ -344,12 +347,45 @@ impl WorkspacesFile {
         edit: DesktopSessionEdit,
     ) -> Result<(), String> {
         let index = target.index(self)?;
+        if !matches!(edit, DesktopSessionEdit::Select(_))
+            && self
+                .repos
+                .iter()
+                .any(|repo| !repo.bottom_terminals.is_empty())
+        {
+            // Iced migrates repo-owned terminals before building runtime inventory.
+            self.normalize_repos();
+        }
         let workspace = &mut self.workspaces[index];
+        if !matches!(edit, DesktopSessionEdit::Select(_))
+            && (workspace.is_legacy_remote()
+                || matches!(
+                    workspace.location,
+                    Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                ))
+        {
+            return Err("Local terminal workspace changed location".into());
+        }
         match edit {
-            DesktopSessionEdit::OpenTabs(tabs) => {
-                if workspace.location.is_some() || workspace.is_legacy_remote() {
-                    return Err("Local terminal workspace changed location".into());
+            DesktopSessionEdit::RefreshTabs(tabs) => {
+                for (index, mut tab) in tabs {
+                    let saved = workspace
+                        .tabs
+                        .get_mut(index)
+                        .ok_or("Mounted terminal is no longer in the saved inventory")?;
+                    let mut extra = saved.extra.clone();
+                    extra.extend(tab.extra);
+                    tab.extra = extra;
+                    *saved = tab;
                 }
+            }
+            DesktopSessionEdit::CloseBottom(index) => {
+                if index >= workspace.bottom_terminals.len() {
+                    return Err("Bottom terminal is no longer in the saved inventory".into());
+                }
+                workspace.bottom_terminals.remove(index);
+            }
+            DesktopSessionEdit::OpenTabs(tabs) => {
                 for tab in tabs {
                     let uid = tab
                         .session_uid
@@ -372,9 +408,6 @@ impl WorkspacesFile {
                 terminal,
                 initial_tabs,
             } => {
-                if workspace.location.is_some() || workspace.is_legacy_remote() {
-                    return Err("Local terminal workspace changed location".into());
-                }
                 if workspace.tabs.is_empty() && !initial_tabs.is_empty() {
                     workspace.tabs = initial_tabs;
                     workspace.active_tab = Some(0);
@@ -461,6 +494,8 @@ impl WorkspaceTabConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BottomTerminalConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
 }
 

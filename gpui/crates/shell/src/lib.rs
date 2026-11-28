@@ -1253,7 +1253,7 @@ impl Shell {
         let Some(saved) = self.owner.read(cx).iced_workspace(workspace) else {
             return;
         };
-        if saved.location.is_some() || saved.is_legacy_remote() {
+        if saved.is_legacy_remote() || workspace_config::workspace_remote_id(saved).is_some() {
             return;
         }
         let state = self.workspace(workspace);
@@ -1267,6 +1267,7 @@ impl Shell {
         let edit = if bottom {
             DesktopSessionEdit::OpenBottom {
                 terminal: BottomTerminalConfig {
+                    extra: Default::default(),
                     dir: cwd.to_string_lossy().into_owned(),
                 },
                 initial_tabs: if saved.tabs.is_empty() {
@@ -1301,6 +1302,45 @@ impl Shell {
         self.save_live_session_edit(workspace, edit, cx);
     }
 
+    fn live_mounted_tab_updates(
+        &self,
+        workspace: WorkspaceId,
+        cx: &App,
+    ) -> Vec<(usize, gitterm_core::workspace_config::WorkspaceTabConfig)> {
+        let Some(saved) = self.owner.read(cx).iced_workspace(workspace) else {
+            return vec![];
+        };
+        let state = self.workspace(workspace);
+        let imported = self.owner.read(cx).iced_sessions(saved);
+        self.live_workspace_tabs(state.runtime_uid, cx)
+            .into_iter()
+            .filter_map(|tab| {
+                let pane_session = state.sessions.iter().find(|session| {
+                    state
+                        .panes
+                        .get(&session_pane_id(session.id))
+                        .is_some_and(|pane| {
+                            let pane = pane.read(cx);
+                            pane.session.as_ref().is_some_and(|target| {
+                                tab.session_uid.as_ref() == Some(&target.session_uid)
+                            })
+                        })
+                });
+                let at = saved
+                    .tabs
+                    .iter()
+                    .position(|saved| {
+                        saved.session_uid.is_some() && saved.session_uid == tab.session_uid
+                    })
+                    .or_else(|| {
+                        pane_session
+                            .and_then(|session| imported.iter().position(|s| s.id == session.id))
+                    });
+                at.filter(|&at| at < saved.tabs.len()).map(|at| (at, tab))
+            })
+            .collect()
+    }
+
     fn save_live_session_edit(
         &mut self,
         workspace: WorkspaceId,
@@ -1333,10 +1373,25 @@ impl Shell {
             &edit,
             gitterm_core::workspace_config::DesktopSessionEdit::OpenBottom { .. }
         );
+        let mounted = if !selection
+            && !saved.is_legacy_remote()
+            && workspace_config::workspace_remote_id(saved).is_none()
+        {
+            self.live_mounted_tab_updates(workspace, cx)
+        } else {
+            vec![]
+        };
         let root = store.root().to_path_buf();
         // Enqueue on the UI turn so a later action cannot overtake this edit.
-        let receipt =
-            store.try_edit_workspaces(move |file| file.edit_desktop_sessions(&target, edit));
+        let receipt = store.edit_runtime_workspaces(move |file| {
+            if !mounted.is_empty() {
+                file.edit_desktop_sessions(
+                    &target,
+                    gitterm_core::workspace_config::DesktopSessionEdit::RefreshTabs(mounted),
+                )?;
+            }
+            file.edit_desktop_sessions(&target, edit)
+        });
         // Iced add_bottom_terminal also saves the expanded console setting.
         let settings = expand_console
             .then(|| store.edit_settings(|settings| settings.console_expanded = true));
@@ -1481,34 +1536,43 @@ impl Shell {
         };
         // A Live action may have just added this tab to the V6 document.
         // Use its imported identity so the local layout cannot restore it twice.
-        let imported = cx
-            .try_global::<workspace_config::LiveWorkspaces>()
-            .and_then(|_| {
-                let owner = self.owner.read(cx);
-                let saved = owner.iced_workspace(state.workspace.id)?;
-                self.owner
-                    .read(cx)
-                    .iced_sessions(saved)
-                    .into_iter()
-                    .zip(&saved.tabs)
-                    .find(|(session, tab)| {
-                        !used.contains(&session.id.0)
-                            && match &launch {
-                                Some(PaneStart::Adopt { target, .. }) => {
-                                    tab.session_uid.as_deref() == Some(&target.session_uid)
-                                }
-                                _ => true,
-                            }
-                            && gitterm_core::workspace_config::RepoKey::local(Path::new(&tab.dir))
-                                == gitterm_core::workspace_config::RepoKey::local(&cwd)
+        let imported = (placement == DockPlacement::Center)
+            .then(|| {
+                cx.try_global::<workspace_config::LiveWorkspaces>()
+                    .and_then(|_| {
+                        let owner = self.owner.read(cx);
+                        let saved = owner.iced_workspace(state.workspace.id)?;
+                        self.owner
+                            .read(cx)
+                            .iced_sessions(saved)
+                            .into_iter()
+                            .zip(&saved.tabs)
+                            .find(|(session, tab)| {
+                                !used.contains(&session.id.0)
+                                    && match &launch {
+                                        Some(PaneStart::Adopt { target, .. }) => {
+                                            tab.session_uid.as_deref() == Some(&target.session_uid)
+                                        }
+                                        _ => true,
+                                    }
+                                    && gitterm_core::workspace_config::RepoKey::local(Path::new(
+                                        &tab.dir,
+                                    )) == gitterm_core::workspace_config::RepoKey::local(&cwd)
+                            })
+                            .map(|(session, tab)| (session.id.0, tab.clone()))
                     })
-                    .map(|(session, _)| session.id.0)
-            });
+            })
+            .flatten();
+        let persisted_identity = imported
+            .as_ref()
+            .and_then(|(_, tab)| tab.session_uid.clone());
         let session_uid = match &launch {
             Some(PaneStart::Adopt { target, .. }) => target.session_uid.clone(),
-            _ => sessions::fresh_target().session_uid,
+            _ => persisted_identity
+                .clone()
+                .unwrap_or_else(|| sessions::fresh_target().session_uid),
         };
-        let mut id = imported.unwrap_or_else(|| {
+        let mut id = imported.as_ref().map(|(id, _)| *id).unwrap_or_else(|| {
             if placement == DockPlacement::Center
                 && let Some(saved) = self.owner.read(cx).iced_workspace(workspace)
                 && live
@@ -1550,6 +1614,9 @@ impl Shell {
                 cx,
             )
         });
+        if let Some((_, tab)) = imported {
+            pane.update(cx, |pane, _| pane.imported_tab = Some(tab));
+        }
         self._subscriptions
             .push(sessions::subscribe(&pane, window, cx));
         self._subscriptions
@@ -1642,7 +1709,7 @@ impl Shell {
                 dock.add_panel_view(panel_handle(pane), placement, None, window, cx);
             });
         }
-        if plain {
+        if plain && persisted_identity.is_none() {
             self.persist_live_local_terminal(
                 workspace,
                 SessionId(id),
