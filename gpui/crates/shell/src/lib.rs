@@ -44,6 +44,7 @@ mod layout;
 mod lifetime;
 mod live;
 mod startup_failure;
+mod view_preferences;
 pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
@@ -268,7 +269,6 @@ impl Shell {
                 notifications.enabled = settings.notifications.needs_you;
             }
         });
-        let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
                 settings,
@@ -361,7 +361,6 @@ impl Shell {
                 state.store.regions.bottom_visible = settings.console_expanded;
             }
             load_workspace_layout(state, window, cx)?;
-            state.store.regions.resize_sidebar(sidebar_width);
             if !bottom_pane_ids(state, cx).is_empty() {
                 state.store.regions.bottom_opened = true;
             }
@@ -387,6 +386,12 @@ impl Shell {
                 }
             }
         }
+        let sidebar_width = Self::restore_view_preferences(
+            &mut workspaces,
+            settings,
+            bottom.read(cx).input.height,
+            cx,
+        );
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
             for workspace in &this.workspaces {
                 for pane in workspace.panes.values() {
@@ -2660,6 +2665,7 @@ impl Shell {
             change(&mut state.store.regions);
             save_layout(state, cx);
         }
+        self.save_global_geometry(cx);
         self.sync_git_visibility(true, cx);
         cx.notify();
     }
@@ -2947,6 +2953,8 @@ impl Shell {
             .children(pane.cloned())
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_global_geometry(f32::from(window.viewport_size().height), cx);
+        self.refresh_view_appearance(cx);
         self.run_tabs.retain(|id, _| {
             self.workspaces
                 .iter()
@@ -3162,7 +3170,7 @@ impl Shell {
                 },
                 cx,
             ),
-            O::ToggleMirroring => self.preview_unavailable("Terminal log mirroring", cx),
+            O::ToggleMirroring => self.toggle_log_mirroring(cx),
             O::AddTerminal { repo } => {
                 let cwd = match repo {
                     None => None,
@@ -3866,9 +3874,30 @@ impl Shell {
     }
     fn menu_root(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use app_menus::*;
+        let mut menu_context = self
+            .menu_context(window, cx)
+            .replace(" IcedTerminalSearch", "");
+        if self
+            .active_main_terminal(cx)
+            .is_some_and(|view| view.read(cx).is_find_open())
+        {
+            menu_context.push_str(" IcedTerminalSearch");
+        }
         div()
+            .capture_any_mouse_up(cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                if event.button == gpui::MouseButton::Left {
+                    this.finish_preference_resize(cx);
+                }
+            }))
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // The existing finish handler may already have cleared resize.
+                    this.save_global_geometry(cx);
+                }),
+            )
             .track_focus(&self.focus)
-            .key_context(self.menu_context(window, cx).as_str())
+            .key_context(menu_context.as_str())
             .capture_key_down(cx.listener(Self::guard_app_shortcut))
             // Iced's key handler closes a modal on Escape before any page-local
             // Escape (the composer's slash menu, an input, find or review).
@@ -4036,13 +4065,13 @@ impl Shell {
                     this.run_repo(repo, w, cx);
                 }
             }))
-            .on_action(Self::background(cx, |this, _: &ToggleTheme, _, cx| {
-                this.chrome_unavailable("Toggle Light/Dark Theme", cx);
+            .on_action(Self::background(cx, |this, _: &ToggleTheme, w, cx| {
+                this.toggle_view_theme(w, cx);
             }))
             .on_action(Self::background(
                 cx,
                 |this, _: &ToggleTerminalLogMirroring, _, cx| {
-                    this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
+                    this.toggle_log_mirroring(cx);
                 },
             ))
             .on_action(Self::background(
@@ -4061,7 +4090,7 @@ impl Shell {
                 }
             }))
             .on_action(Self::background(cx, |this, _: &ToggleSearch, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+                if let Some(view) = this.active_main_terminal(cx) {
                     if view.read(cx).is_find_open() {
                         view.update(cx, |v, cx| v.close_find(w, cx));
                     } else {
@@ -4070,13 +4099,23 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .on_action(Self::background(cx, |this, _: &SearchNext, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+            .on_action(Self::background(cx, |this, _: &SearchNext, _, cx| {
+                if let Some(view) = this.active_main_terminal(cx) {
                     view.update(cx, |v, cx| {
                         v.navigate_find(false, cx);
                     });
                 }
             }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &view_preferences::SearchPrev, _, cx| {
+                    if let Some(view) = this.active_main_terminal(cx) {
+                        view.update(cx, |v, cx| {
+                            v.navigate_find(true, cx);
+                        });
+                    }
+                },
+            ))
             .on_action(Self::background(cx, |this, _: &TaskSwitcherOpen, w, cx| {
                 this.open_task_switcher(w, cx)
             }))
@@ -4366,9 +4405,13 @@ impl Shell {
     }
     fn set_chat_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
         theme::set_chat_width(width, cx);
+        self.save_view_preferences(move |settings| settings.chat_width = width, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_width = Some(width);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_width = Some(width);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4459,10 +4502,17 @@ impl Shell {
     }
     fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
+        if size == theme::chat_appearance(cx).font_size {
+            return;
+        }
         theme::set_chat_font_size(size, cx);
+        self.save_view_preferences(move |settings| settings.chat_font_size = size, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_font_size = Some(size);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_font_size = Some(size);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4483,11 +4533,25 @@ impl Shell {
         } else {
             &mut fonts.terminal
         };
-        *value = (*value + delta).clamp(10., 24.);
+        let next = (*value + delta).clamp(10., 24.);
+        if next == *value {
+            return;
+        }
+        *value = next;
         theme::set_font_sizes(fonts, cx);
+        self.save_view_preferences(
+            move |settings| {
+                settings.ui_font_size = fonts.ui;
+                settings.terminal_font_size = fonts.terminal;
+            },
+            cx,
+        );
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.fonts = Some(fonts);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.fonts = Some(fonts);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 if let pane::PaneContent::Terminal(view) = &pane.read(cx).content {
                     theme::sync_terminal_typography(&view.clone(), cx);

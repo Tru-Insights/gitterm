@@ -414,3 +414,30 @@ fn tilde_display_respects_home_boundaries() {
         "/fixture/home-other/repo"
     );
 }
+
+#[gpui::test]
+fn gap7_new_work_sheet_tracks_configured_ui_font_size(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (sheet, cx, _) = fixture(cx, NewWorkSheet::default(), vec![]);
+    let initial = cx
+        .debug_bounds("workspace-sheet-title")
+        .unwrap()
+        .size
+        .height;
+    cx.update(|_, cx| {
+        let mut fonts = crate::theme::font_sizes(cx);
+        fonts.ui = 20.;
+        crate::theme::set_font_sizes(fonts, cx);
+    });
+    sheet.update(cx, |_, cx| cx.notify());
+    draw(cx);
+    let enlarged = cx
+        .debug_bounds("workspace-sheet-title")
+        .unwrap()
+        .size
+        .height;
+    assert!(
+        enlarged > initial,
+        "sheet title retained the constant UI font size"
+    );
+}
