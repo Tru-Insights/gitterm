@@ -49,31 +49,7 @@ pub use gitterm_core::work::summary::*;
 /// A whole refresh stops starting new git calls after this long.
 pub const REFRESH_DEADLINE: Duration = Duration::from_secs(45);
 
-/// Creates the home folder of a new workspace called `name` under `base`
-/// (made when missing): `<base>/<slug>`, else `<slug>-2`, `<slug>-3`, … for
-/// the first name nothing holds yet. Returns the created folder.
-pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(base)?;
-    let slug = work_folder_slug(name);
-    for n in 1u32.. {
-        let dir = if n == 1 {
-            base.join(&slug)
-        } else {
-            base.join(format!("{slug}-{n}"))
-        };
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!("create {}: {error}", dir.display()),
-                ))
-            }
-        }
-    }
-    unreachable!("u32 suffixes exhausted under {}", base.display())
-}
+pub use gitterm_core::workspace_config::create_work_folder;
 
 /// A focus the user picked by hand. `Latest` is the automatic default and
 /// is never stored.

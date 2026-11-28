@@ -498,3 +498,33 @@ pub fn default_remote_sessions() -> Vec<RemoteSessionConfig> {
 pub fn default_remote_agents() -> Vec<RemoteAgentConfig> {
     Vec::new()
 }
+
+/// Markdown roots follow the workspace home folder, including named work;
+/// starting repos and the decisions repo never replace this root.
+pub fn document_roots(workspace: &Path) -> (PathBuf, PathBuf) {
+    (workspace.join(".plans"), workspace.join("docs"))
+}
+
+/// Creates Iced's numbered ~/Work/<slug> folder. Nothing is created on cancel.
+pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(base)?;
+    let slug = crate::work::summary::work_folder_slug(name);
+    for n in 1u32.. {
+        let dir = if n == 1 {
+            base.join(&slug)
+        } else {
+            base.join(format!("{slug}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("create {}: {error}", dir.display()),
+                ))
+            }
+        }
+    }
+    unreachable!("u32 suffixes exhausted under {}", base.display())
+}

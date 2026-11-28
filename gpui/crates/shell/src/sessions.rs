@@ -64,6 +64,9 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         self.close_target_with(requested, false, window, cx);
     }
 
@@ -76,6 +79,9 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         let Some(state) = self.workspaces.iter_mut().find(|state| {
             state
                 .panes
@@ -689,6 +695,9 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         use gitterm_core::work::catalog::{
             NewWorkSheet, OpenWork, existing_work, new_work_recent_repos,
         };
@@ -704,24 +713,47 @@ impl crate::Shell {
             .iced_catalog()
             .map(|c| c.workspaces.as_slice())
             .unwrap_or_default();
-        let open: Vec<_> = saved
+        let order = owner
+            .iced_catalog()
+            .map(|c| c.ordered_indices())
+            .unwrap_or_default();
+        let open: Vec<_> = order
             .iter()
-            .enumerate()
+            .map(|&i| (i, &saved[i]))
+            .filter(|(i, _)| self.workspaces[*i].parked.as_ref().is_none_or(|p| !p.done))
             .map(|(i, w)| OpenWork {
                 uid: i as u64 + 1,
                 name: &w.name,
                 dir: &w.dir,
                 chats: &w.chats,
-                claims_new_chats: false,
+                claims_new_chats: owner.iced_catalog().is_some_and(|c| c.claims.contains(&i)),
                 running_park: self.workspaces[i].parked.is_some(),
             })
             .collect();
-        let existing = existing_work(&open, &[]);
-        // shortcut: the chat index is not hosted yet; use Iced's open-workspace
-        // and tab candidates in catalog order until that source is connected.
-        let candidates = saved.iter().filter(|w| !w.is_legacy_remote() && !matches!(w.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })))
-            .flat_map(|w| std::iter::once(std::path::PathBuf::from(w.home_dir())).chain(w.repos.iter().map(std::path::PathBuf::from)))
-            .chain(saved.iter().filter(|w| w.location.is_none() && !w.is_legacy_remote()).flat_map(|w| w.tabs.iter().filter(|t| t.task_id.is_none()).map(|t| std::path::PathBuf::from(&t.dir))));
+        let closed = owner
+            .iced_catalog()
+            .map(|c| c.closed.as_slice())
+            .unwrap_or_default();
+        let closed: Vec<_> = closed
+            .iter()
+            .filter(|w| {
+                !saved.iter().enumerate().any(|(i, open)| {
+                    open.name == w.name
+                        && open.dir == w.dir
+                        && self.workspaces[i].parked.as_ref().is_none_or(|p| !p.done)
+                })
+            })
+            .map(|w| gitterm_core::work::catalog::ClosedWork {
+                name: &w.name,
+                dir: &w.dir,
+                chats: &w.chats,
+                active: w.active,
+                parked_at: w.parked.as_ref().map(|p| p.parked_at.as_str()),
+                done_at: w.done_at.as_deref(),
+            })
+            .collect();
+        let existing = existing_work(&open, &closed);
+        let candidates = self.recent_repo_candidates(cx);
         let draft = NewWorkSheet {
             recent: new_work_recent_repos(candidates, |p| p.join(".git").is_dir()),
             ..Default::default()
@@ -756,15 +788,49 @@ impl crate::Shell {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         use crate::workspace_sheet::WorkspaceSheetOutcome as O;
         use gitterm_core::work::catalog::ExistingWorkAction as A;
         match outcome {
+            O::Create { name, start }
+                if cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some() =>
+            {
+                if let Some(home) = dirs::home_dir() {
+                    self.change_live_workspace(
+                        crate::workspace_config::LiveWorkspaceAction::Create {
+                            name: name.clone(),
+                            start: start.clone(),
+                            home,
+                        },
+                        WorkspaceCompletion::Open { created: true },
+                        window,
+                        cx,
+                    );
+                } else if let Some(sheet) = &self.new_work_sheet {
+                    sheet.update(cx, |sheet, cx| {
+                        sheet.show_error("no home directory to put ~/Work in".into(), cx)
+                    });
+                }
+            }
             O::Create { .. } => {
                 if let Some(sheet) = &self.new_work_sheet {
                     sheet.update(cx, |sheet, cx| {
                         sheet.show_error("Creating work isn't available in the preview".into(), cx)
                     });
                 }
+            }
+            O::OpenExisting {
+                id: A::Resume(key) | A::Reopen(key),
+            } if cx
+                .try_global::<crate::workspace_config::LiveWorkspaces>()
+                .is_some() =>
+            {
+                let reopen = matches!(outcome, O::OpenExisting { id: A::Reopen(_) });
+                self.resume_live_workspace(key.clone(), reopen, window, cx);
             }
             O::OpenExisting { id } => {
                 let id = match id {
@@ -1353,6 +1419,7 @@ impl crate::Shell {
         if let Some(pane) = self.workspace(workspace).panes.get(&pane_id) {
             pane.update(cx, |pane, cx| {
                 pane.content = crate::pane::PaneContent::PreviewChat(view);
+                pane.session = Some(target.clone());
                 cx.notify();
             });
         } else {
@@ -1465,6 +1532,373 @@ impl crate::Shell {
         let tab =
             crate::chat::resume::tab(&indexed.cwd, fresh_target().session_uid, Some(id.into()));
         self.mount_live_chat(workspace, tab, None, window, cx)
+    }
+}
+
+pub(crate) enum WorkspaceCompletion {
+    Park(gitterm_core::park::Effect),
+    Open { created: bool },
+}
+
+impl crate::Shell {
+    pub(crate) fn open_recent_work_sheet(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_new_work_sheet(window, cx);
+    }
+}
+
+impl crate::Shell {
+    pub(crate) fn change_live_workspace(
+        &mut self,
+        action: crate::workspace_config::LiveWorkspaceAction,
+        completion: WorkspaceCompletion,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|s| s.0.clone())
+        else {
+            return;
+        };
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        self.owner
+            .update(cx, |owner, _| owner.workspace_save_pending = true);
+        let selected = match &completion {
+            WorkspaceCompletion::Open { .. }
+            | WorkspaceCompletion::Park(gitterm_core::park::Effect::Return {
+                activate: true,
+                ..
+            }) => None,
+            WorkspaceCompletion::Park(_) => self
+                .workspaces
+                .iter()
+                .find(|w| Some(w.workspace.id) == self.active_workspace(cx) && w.on_bar())
+                .map(|w| gitterm_core::park::Key {
+                    name: w.workspace.name.clone(),
+                    dir: self
+                        .owner
+                        .read(cx)
+                        .iced_workspace(w.workspace.id)
+                        .map(|w| w.dir.clone())
+                        .unwrap_or_default(),
+                }),
+        };
+        let save = cx.background_executor().spawn(async move {
+            crate::workspace_config::save_live_workspace(&store, action, selected)
+        });
+        cx.spawn_in(window, async move |shell, cx| {
+            let saved = save.await;
+            let _ = shell.update_in(cx, |shell, window, cx| {
+                shell
+                    .owner
+                    .update(cx, |owner, _| owner.workspace_save_pending = false);
+                match saved {
+                    Err(error) => {
+                        if let Some(sheet) = &shell.new_work_sheet {
+                            sheet.update(cx, |sheet, cx| sheet.show_error(error.clone(), cx));
+                        }
+                        shell.owner.update(cx, |owner, cx| {
+                            owner.error = Some(format!("Save workspace: {error}"));
+                            cx.notify();
+                        });
+                    }
+                    Ok(saved) => {
+                        let claims_new_chats =
+                            matches!(&completion, WorkspaceCompletion::Open { created: true });
+                        let id = shell.owner.update(cx, |owner, cx| {
+                            owner.publish_workspace(saved, claims_new_chats, cx)
+                        });
+                        match completion {
+                            WorkspaceCompletion::Park(effect) => {
+                                let close_sheet = matches!(
+                                    effect,
+                                    gitterm_core::park::Effect::Park { .. }
+                                        | gitterm_core::park::Effect::Close { .. }
+                                        | gitterm_core::park::Effect::Return { activate: true, .. }
+                                );
+                                shell.apply_park(effect, window, cx);
+                                shell.select_bar_workspace(cx);
+                                if close_sheet {
+                                    shell.park_sheet = None;
+                                    shell.park_subscription = None;
+                                    shell.cover_sheet(false, window, cx);
+                                }
+                            }
+                            WorkspaceCompletion::Open { created } => {
+                                let Some(id) = id else {
+                                    return;
+                                };
+                                if shell.workspaces.iter().any(|w| {
+                                    w.workspace.id == id
+                                        && w.parked.as_ref().is_some_and(|p| !p.running)
+                                }) {
+                                    shell
+                                        .owner
+                                        .update(cx, |owner, _| owner.resumed_workspace_order(id));
+                                }
+                                if let Err(error) = shell.mount_workspace(id, window, cx) {
+                                    shell.owner.update(cx, |owner, cx| {
+                                        owner.error = Some(format!("Open workspace: {error:#}"));
+                                        cx.notify();
+                                    });
+                                    return;
+                                }
+                                if let Some(state) =
+                                    shell.workspaces.iter_mut().find(|w| w.workspace.id == id)
+                                {
+                                    state.parked = None;
+                                }
+                                shell.owner.update(cx, |owner, _| {
+                                    owner.stopped_workspaces.remove(&id);
+                                });
+                                shell.select_workspace_id(id, window, cx);
+                                shell.restore_live_workspace_sessions(id, window, cx);
+                                if created {
+                                    shell.new_work_sheet = None;
+                                    shell.new_work_subscription = None;
+                                    shell.cover_sheet(false, window, cx);
+                                }
+                            }
+                        }
+                        if let Some(sheet) = &shell.park_sheet {
+                            let rows = shell.parked_list_rows(cx);
+                            sheet.update(cx, |sheet, cx| sheet.set_rows(rows, cx));
+                        }
+                        shell.refresh_saved_facts(cx);
+                        shell.sync_git_visibility(false, cx);
+                        shell.sync_content_selection(cx);
+                        shell.focus.focus(window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Saved terminal and chat DTOs remain the source of truth when a stopped
+    /// workspace is restored. Keep-running parks never reconstruct these panes.
+    pub(crate) fn restore_live_workspace_sessions(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use gpui::AppContext as _;
+        let tabs = self
+            .owner
+            .read(cx)
+            .iced_workspace(workspace)
+            .map(|w| w.tabs.clone())
+            .unwrap_or_default();
+        let active = self.workspace(workspace).active_session;
+        let sessions = self.workspace(workspace).sessions.clone();
+        for (session, tab) in sessions.iter().zip(tabs) {
+            if tab.tab_kind.as_deref() == Some("agent") {
+                if matches!(
+                    &self.workspace(workspace).panes[&crate::session_pane_id(session.id)]
+                        .read(cx)
+                        .content,
+                    crate::pane::PaneContent::PreviewChat(_)
+                ) {
+                    continue;
+                }
+                if let Err(error) =
+                    self.mount_live_chat(workspace, tab, Some(session.id), window, cx)
+                {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some(format!("Resume chat: {error:#}"));
+                        cx.notify();
+                    });
+                }
+            } else {
+                let pane =
+                    self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
+                if pane.read(cx).session.is_none() {
+                    let identity = tab
+                        .session_identity()
+                        .open(|| fresh_target().session_uid)
+                        .identity;
+                    let target = Target {
+                        tab_id: fresh_target().tab_id,
+                        session_uid: identity.session_uid,
+                        task_id: identity.task_id,
+                        task_session_id: identity.task_session_id,
+                    };
+                    if tab.task_id.is_some() && tab.startup_command.is_some() {
+                        pane.update(cx, |pane, cx| {
+                            pane.content = crate::pane::PaneContent::Error(
+                                "This task terminal cannot be resumed in Live yet.".into(),
+                            );
+                            cx.notify();
+                        });
+                        continue;
+                    }
+                    let cwd = std::path::PathBuf::from(&tab.dir);
+                    let cwd = if cwd.is_dir() {
+                        cwd
+                    } else {
+                        tab.repo_dir
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or(cwd)
+                    };
+                    let catalog = self.owner.read(cx).iced_catalog().expect("Live catalog");
+                    let file = gitterm_core::workspace_config::WorkspacesFile {
+                        workspaces: catalog.workspaces.clone(),
+                        repos: catalog.repos.clone(),
+                        ..Default::default()
+                    };
+                    let launch = gitterm_terminal::TerminalLaunch {
+                        env: file
+                            .workspace_env(&self.workspace(workspace).workspace.name, Some(&cwd))
+                            .into_iter()
+                            .map(|(k, v)| (k, Some(v)))
+                            .collect(),
+                        cwd: Some(cwd),
+                        startup_command: tab.startup_command.clone(),
+                        ..Default::default()
+                    };
+                    #[cfg(test)]
+                    let launch = gitterm_terminal::TerminalLaunch {
+                        program: "/bin/zsh".into(),
+                        args: vec!["-d".into(), "-f".into(), "-i".into()],
+                        ..launch
+                    };
+                    pane.update(cx, |pane, _| {
+                        pane.terminal_cwd = launch.cwd.clone();
+                        pane.exited = false;
+                    });
+                    let cwd_pane = pane.downgrade();
+                    let title_pane = pane.downgrade();
+                    let weak = pane.downgrade();
+                    let exit_target = target.clone();
+                    let cwd_target = target.clone();
+                    let title_target = target.clone();
+                    let view = cx.new(|cx| {
+                        gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
+                            .with_cwd_callback(move |_, cx, cwd| {
+                                let _ = cwd_pane.update(cx, |pane, cx| {
+                                    if pane.session.as_ref() == Some(&cwd_target) {
+                                        pane.terminal_cwd = Some(cwd.into());
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .with_title_callback(move |_, cx, title| {
+                                let _ = title_pane.update(cx, |pane, cx| {
+                                    if pane.session.as_ref() == Some(&title_target) {
+                                        pane.terminal_title = Some(title.into());
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .with_exit_callback(move |_, cx| {
+                                let _ = weak.update(cx, |pane, cx| {
+                                    if pane.session.as_ref() == Some(&exit_target) {
+                                        pane.mark_exited(cx);
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                    });
+                    let subscription = crate::adopt_view(&pane, view, target, window, cx);
+                    self._subscriptions.push(subscription);
+                }
+            }
+        }
+        if let Some(active) = active {
+            self.select_session_id(active, window, cx);
+        }
+    }
+}
+
+impl crate::Shell {
+    pub(crate) fn live_workspace_tabs(
+        &self,
+        uid: u64,
+        cx: &gpui::App,
+    ) -> Vec<gitterm_core::workspace_config::WorkspaceTabConfig> {
+        let Some(state) = self.workspaces.iter().find(|w| w.runtime_uid == uid) else {
+            return vec![];
+        };
+        let Some(saved) = self.owner.read(cx).iced_workspace(state.workspace.id) else {
+            return vec![];
+        };
+        let imported = crate::data::iced_sessions(saved);
+        state
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let pane = state
+                    .panes
+                    .get(&crate::session_pane_id(session.id))?
+                    .read(cx);
+                let target = match &pane.content {
+                    crate::pane::PaneContent::PreviewChat(view) => Some(view.read(cx).target()),
+                    _ => pane.session.clone(),
+                };
+                let existing = target
+                    .as_ref()
+                    .and_then(|target| {
+                        saved
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.session_uid.as_deref() == Some(&target.session_uid))
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        imported
+                            .iter()
+                            .position(|s| s.id == session.id)
+                            .and_then(|i| saved.tabs.get(i))
+                            .cloned()
+                    });
+                let cwd = pane.task_folder(cx).unwrap_or_else(|| {
+                    existing
+                        .as_ref()
+                        .map(|t| t.dir.clone())
+                        .unwrap_or_else(|| saved.dir.clone())
+                        .into()
+                });
+                let mut tab = if let Some(tab) = existing {
+                    tab
+                } else if let crate::pane::PaneContent::PreviewChat(view) = &pane.content {
+                    crate::chat::resume::tab(
+                        &cwd,
+                        view.read(cx).target().session_uid,
+                        view.read(cx).chat_session_id(),
+                    )
+                } else {
+                    gitterm_core::workspace_config::WorkspaceTabConfig {
+                        dir: cwd.to_string_lossy().into_owned(),
+                        repo_dir: Some(saved.dir.clone()),
+                        startup_command: None,
+                        tab_kind: None,
+                        agent_config: None,
+                        chat_session_id: None,
+                        task_id: target.as_ref().and_then(|t| t.task_id.clone()),
+                        task_session_id: target.as_ref().and_then(|t| t.task_session_id.clone()),
+                        worker_shutdown_refused: false,
+                        session_uid: target.as_ref().map(|t| t.session_uid.clone()),
+                    }
+                };
+                if let Some(target) = target {
+                    tab.session_uid = Some(target.session_uid);
+                }
+                tab.dir = cwd.to_string_lossy().into_owned();
+                if let crate::pane::PaneContent::PreviewChat(view) = &pane.content {
+                    tab.chat_session_id = view.read(cx).chat_session_id();
+                }
+                Some(tab)
+            })
+            .collect()
     }
 }
 

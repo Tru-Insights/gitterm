@@ -1,4 +1,5 @@
-//! Terminal-only adapter over core parking policy. The dock retains PTY ownership.
+//! Workspace parking adapters. Live saves through DesktopStore before applying
+//! process/UI effects; Preview retains its isolated terminal-only metadata.
 use crate::{Shell, WorkspaceDock};
 use anyhow::{Result, ensure};
 use gitterm_core::park::{self, Effect, Info, Intent, Key, Mode, Target};
@@ -72,18 +73,21 @@ impl WorkspaceDock {
         let dir = self
             .panes
             .values()
-            .next()
-            .and_then(|pane| pane.read(cx).workspace_dir(cx));
+            .find_map(|pane| pane.read(cx).workspace_dir(cx));
         Key {
             name: self.workspace.name.clone(),
             dir: dir.unwrap_or_default().to_string_lossy().into_owned(),
         }
     }
+
     pub(crate) fn park_target(&self, cx: &App) -> Target {
         let mut tabs: Vec<_> = self
             .panes
             .values()
-            .filter_map(|pane| pane.read(cx).session.clone())
+            .filter_map(|pane| match &pane.read(cx).content {
+                crate::pane::PaneContent::PreviewChat(view) => Some(view.read(cx).target()),
+                _ => pane.read(cx).session.clone(),
+            })
             .collect();
         tabs.sort_by_key(|tab| tab.tab_id);
         Target {
@@ -109,6 +113,20 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+        {
+            if let Some(state) = self
+                .workspaces
+                .iter()
+                .find(|w| w.workspace.id == id && w.parked.is_some())
+            {
+                let key = state.park_key(cx);
+                self.resume_live_workspace(key, true, window, cx);
+            }
+            return;
+        }
         let Some(state) = self
             .workspaces
             .iter_mut()
@@ -189,7 +207,7 @@ impl Shell {
         }
         state
     }
-    fn select_bar_workspace(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn select_bar_workspace(&mut self, cx: &mut Context<Self>) {
         if self
             .workspaces
             .iter()
@@ -197,11 +215,28 @@ impl Shell {
         {
             return;
         }
-        if let Some(id) = self
-            .workspaces
+        let order = if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+        {
+            self.owner
+                .read(cx)
+                .iced_catalog()
+                .map(|c| c.ordered_indices())
+                .unwrap_or_default()
+        } else {
+            (0..self.workspaces.len()).collect()
+        };
+        let from = order
             .iter()
-            .find(|state| state.on_bar())
-            .map(|state| state.workspace.id)
+            .position(|&i| Some(self.workspaces[i].workspace.id) == self.active_workspace(cx))
+            .unwrap_or(0);
+        let parked: Vec<_> = order
+            .iter()
+            .map(|&i| !self.workspaces[i].on_bar())
+            .collect();
+        if let Some(id) = gitterm_core::workspace::next_on_bar(from, &parked)
+            .map(|index| self.workspaces[order[index]].workspace.id)
         {
             self.owner.update(cx, |owner, cx| {
                 owner.dispatch(crate::Intent::Activate(id), Instant::now(), cx)
@@ -253,6 +288,13 @@ impl Shell {
             return;
         }
         let effect = state.reduce(intent);
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+        {
+            self.save_live_park(effect, window, cx);
+            return;
+        }
         self.apply_park(effect, window, cx);
         self.select_bar_workspace(cx);
         self.save_parked(cx);
@@ -278,10 +320,30 @@ impl Shell {
                     .iter_mut()
                     .find(|state| state.runtime_uid == target.uid)
                     .unwrap();
-                // Save the existing terminal DTOs/layout before recording the park.
+                // Live has just promoted this inventory into the shared DTOs.
+                // Retaining its preview copy would restore each terminal twice.
+                if cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some()
+                {
+                    state.store.terminals = Some(vec![]);
+                }
                 crate::save_layout(state, cx);
                 if mode == Mode::Stop {
                     for pane in state.panes.values() {
+                        if let crate::pane::PaneContent::PreviewChat(view) = &pane.read(cx).content
+                        {
+                            let view = view.clone();
+                            let target = view.read(cx).target();
+                            view.update(cx, |view, cx| view.close(cx));
+                            self.owner.update(cx, |owner, _| {
+                                owner.chats.remove(&target.session_uid);
+                            });
+                            pane.update(cx, |pane, _| {
+                                pane.content =
+                                    crate::pane::PaneContent::IcedSession("Stopped chat".into());
+                            });
+                        }
                         if let Some(target) = pane.read(cx).session.clone() {
                             pane.update(cx, |pane, cx| pane.stop_target(&target, cx));
                         }
@@ -550,15 +612,30 @@ impl Shell {
             &sheet,
             window,
             move |shell, _, outcome: &crate::park_sheet::Outcome, window, cx| {
+                if shell.owner.read(cx).workspace_save_pending {
+                    return;
+                }
+                let live = cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some();
+                let stamp = if live {
+                    chrono::Utc::now().to_rfc3339()
+                } else {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .to_string()
+                };
+                let intent = outcome.intent(Some(&target), stamp);
+                if live && let Some(intent) = intent {
+                    shell.park_intent(Some(&target), intent, window, cx);
+                    return;
+                }
                 shell.park_sheet = None;
                 shell.park_subscription = None;
                 shell.cover_sheet(false, window, cx);
-                let stamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .to_string();
-                if let Some(intent) = outcome.intent(Some(&target), stamp) {
+                if let Some(intent) = intent {
                     shell.park_intent(Some(&target), intent, window, cx);
                 } else {
                     previous_focus.focus(window, cx);
@@ -609,6 +686,25 @@ impl Shell {
             }
         }
         for saved in self.saved_facts.snapshot().parked_rows {
+            if cx
+                .try_global::<crate::workspace_config::LiveWorkspaces>()
+                .is_some()
+                && self.own_parked(&saved.key, cx)
+            {
+                continue;
+            }
+            if cx
+                .try_global::<crate::workspace_config::LiveWorkspaces>()
+                .is_some()
+                && !owner.iced_catalog().is_some_and(|catalog| {
+                    catalog
+                        .closed
+                        .iter()
+                        .any(|w| saved.key.matches(w) && w.is_parked())
+                })
+            {
+                continue;
+            }
             let at = saved
                 .info
                 .as_ref()
@@ -646,6 +742,18 @@ impl Shell {
             window,
             move |shell, sheet, outcome: &crate::park_sheet::Outcome, window, cx| {
                 use crate::park_sheet::Outcome;
+                if shell.owner.read(cx).workspace_save_pending {
+                    return;
+                }
+                if cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some()
+                    && let Outcome::Resume { id }
+                    | Outcome::ReadyGo(crate::park_sheet::ReadyHome::Parked(id)) = outcome
+                {
+                    shell.resume_live_workspace(id.clone(), false, window, cx);
+                    return;
+                }
                 if matches!(outcome, Outcome::Done { .. }) {
                     // Iced keeps the list open and refreshes its rows.
                     if let Outcome::Done { id } = outcome {
@@ -701,6 +809,13 @@ impl Shell {
     /// Resume restores this preview's own parks; plain terminals restart, but
     /// chats are a launch, and an Iced-saved park would write Iced's file.
     fn resume_parked(&mut self, id: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+        {
+            self.resume_live_workspace(id, false, window, cx);
+            return;
+        }
         if !self.own_parked(&id, cx) {
             self.chrome_unavailable("Resume", cx);
             return;
@@ -715,6 +830,19 @@ impl Shell {
         }
     }
     fn done_parked(&mut self, id: Key, window: &mut Window, cx: &mut Context<Self>) {
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+            && !self.own_parked(&id, cx)
+        {
+            self.change_live_workspace(
+                crate::workspace_config::LiveWorkspaceAction::Done(id),
+                crate::sessions::WorkspaceCompletion::Park(Effect::None),
+                window,
+                cx,
+            );
+            return;
+        }
         if !self.own_parked(&id, cx) {
             self.chrome_unavailable("Done", cx);
             return;
@@ -725,5 +853,380 @@ impl Shell {
             .find(|state| state.park_key(cx) == id)
             .map(|state| state.park_target(cx));
         self.park_intent(target.as_ref(), Intent::Done(id), window, cx);
+    }
+}
+
+impl Shell {
+    pub(crate) fn resume_live_workspace(
+        &mut self,
+        key: Key,
+        reopen: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self
+            .workspaces
+            .iter()
+            .find(|w| w.park_key(cx) == key && w.parked.as_ref().is_some_and(|p| p.running))
+        {
+            let effect = self
+                .park_projection(cx)
+                .reduce(Intent::Resume(state.park_key(cx)));
+            self.save_live_park(effect, window, cx);
+        } else {
+            let open = self
+                .workspaces
+                .iter()
+                .filter(|w| w.on_bar() || w.parked.as_ref().is_some_and(|p| p.running))
+                .map(|w| w.park_key(cx))
+                .collect();
+            self.change_live_workspace(
+                crate::workspace_config::LiveWorkspaceAction::Resume { key, reopen, open },
+                crate::sessions::WorkspaceCompletion::Open { created: false },
+                window,
+                cx,
+            );
+        }
+    }
+    fn save_live_park(&mut self, effect: Effect, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::workspace_config::LiveWorkspaceAction as A;
+        let key_of = |uid| {
+            self.workspaces
+                .iter()
+                .find(|w| w.runtime_uid == uid)
+                .map(|w| w.park_key(cx))
+        };
+        let action = match &effect {
+            Effect::Park { target, info, .. } => key_of(target.uid).map(|key| A::Park {
+                active_tab: self.live_active_tab(target.uid),
+                tabs: self.live_workspace_tabs(target.uid, cx),
+                key,
+                info: info.clone(),
+                done: false,
+            }),
+            Effect::Return { uid, .. } => key_of(*uid).map(|key| {
+                let order = self
+                    .owner
+                    .read(cx)
+                    .iced_catalog()
+                    .map(|c| c.ordered_indices())
+                    .unwrap_or_default();
+                let ordinal = order
+                    .iter()
+                    .filter(|&&i| {
+                        self.workspaces[i].on_bar() || self.workspaces[i].runtime_uid == *uid
+                    })
+                    .position(|&i| self.workspaces[i].runtime_uid == *uid)
+                    .unwrap_or(0);
+                A::Return { key, ordinal }
+            }),
+            Effect::Done {
+                stop: Some((target, info)),
+                ..
+            } => key_of(target.uid).map(|key| A::Park {
+                active_tab: self.live_active_tab(target.uid),
+                tabs: self.live_workspace_tabs(target.uid, cx),
+                key,
+                info: info.clone(),
+                done: true,
+            }),
+            Effect::Done { stop: None, finish } => self
+                .workspaces
+                .iter()
+                .filter(|w| w.parked.as_ref().is_some_and(|p| !p.running))
+                .nth(*finish)
+                .map(|w| A::Done(w.park_key(cx))),
+            Effect::Close { key, target } => Some(A::Park {
+                active_tab: self.live_active_tab(target.uid),
+                tabs: self.live_workspace_tabs(target.uid, cx),
+                key: key.clone(),
+                info: Info::new("", chrono::Utc::now().to_rfc3339()),
+                done: true,
+            }),
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.change_live_workspace(
+                action,
+                crate::sessions::WorkspaceCompletion::Park(effect),
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+impl Shell {
+    fn live_active_tab(&self, uid: u64) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .find(|w| w.runtime_uid == uid)
+            .and_then(|w| {
+                w.sessions
+                    .iter()
+                    .position(|s| Some(s.id) == w.active_session)
+            })
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use gpui::AppContext as _;
+
+    #[gpui::test]
+    fn live_stop_and_keep_running_apply_only_after_save(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let desktop = root.join("desktop");
+        let home = root.join("home");
+        std::fs::create_dir(&desktop).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let folders: Vec<_> = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let dir = home.join(name);
+                std::fs::create_dir(&dir).unwrap();
+                dir
+            })
+            .collect();
+        let document = serde_json::json!({"active_workspace":0,"workspaces":folders.iter().map(|dir| serde_json::json!({"name":dir.file_name().unwrap().to_str().unwrap(),"abbrev":"FX","dir":dir,"color":"blue","tabs":[]})).collect::<Vec<_>>()});
+        std::fs::write(
+            desktop.join("workspaces.json"),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let live = gitterm_core::desktop_store::DesktopStore::open(&desktop).unwrap();
+        cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(live.clone())));
+        let mut store = crate::preview::tests::guarded_store(&root.join("preview"));
+        store.iced = Some(crate::workspace_config::IcedCatalog::read(&desktop).unwrap());
+        let model =
+            crate::workspace_status::WorkspaceStatus::from_iced(store.iced.as_ref().unwrap());
+        let layout = root.join("preview");
+        let (shell, cx) = cx.add_window_view(|window, cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            let data = std::rc::Rc::new(crate::data::LocalData(owner.clone()));
+            Shell::with_owner(data, owner, &layout, true, window, cx).unwrap()
+        });
+        let (terminal, key) = cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.new_terminal(window, cx);
+                let state = &shell.workspaces[0];
+                let pane =
+                    state.panes[&crate::session_pane_id(state.active_session.unwrap())].clone();
+                let crate::pane::PaneContent::Terminal(terminal) = &pane.read(cx).content else {
+                    panic!("terminal")
+                };
+                let terminal = terminal.clone();
+                let target = state.park_target(cx);
+                let key = state.park_key(cx);
+                let before = std::fs::read(desktop.join("workspaces.json")).unwrap();
+                // Opening and cancelling the park sheet has no persistence effect.
+                shell.open_park_sheet(window, cx);
+                shell.park_sheet = None;
+                shell.park_subscription = None;
+                shell.cover_sheet(false, window, cx);
+                assert_eq!(
+                    std::fs::read(desktop.join("workspaces.json")).unwrap(),
+                    before
+                );
+                shell.park_workspace(&target, Mode::KeepRunning, window, cx);
+                assert!(shell.workspaces[0].parked.is_none());
+                (terminal, key)
+            })
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(
+                shell.read(cx).workspaces[0]
+                    .parked
+                    .as_ref()
+                    .unwrap()
+                    .running
+            );
+            assert_ne!(
+                terminal.read(cx).backend().state(),
+                gitterm_terminal::SessionState::Cancelled
+            );
+        });
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.resume_live_workspace(key.clone(), false, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.read(|cx| assert!(shell.read(cx).workspaces[0].parked.is_none()));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bytes = std::fs::read(desktop.join("workspaces.json")).unwrap();
+            std::fs::set_permissions(&desktop, std::fs::Permissions::from_mode(0o555)).unwrap();
+            cx.update(|window, cx| {
+                shell.update(cx, |shell, cx| {
+                    let target = shell.workspaces[0].park_target(cx);
+                    shell.park_workspace(&target, Mode::Stop, window, cx);
+                })
+            });
+            cx.run_until_parked();
+            std::fs::set_permissions(&desktop, std::fs::Permissions::from_mode(0o755)).unwrap();
+            cx.read(|cx| {
+                assert!(shell.read(cx).workspaces[0].parked.is_none());
+                assert!(shell.read(cx).owner.read(cx).error.is_some());
+                assert_ne!(
+                    terminal.read(cx).backend().state(),
+                    gitterm_terminal::SessionState::Cancelled
+                );
+            });
+            assert_eq!(
+                std::fs::read(desktop.join("workspaces.json")).unwrap(),
+                bytes
+            );
+        }
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                let target = shell.workspaces[0].park_target(cx);
+                shell.park_workspace(&target, Mode::Stop, window, cx);
+                assert!(shell.workspaces[0].parked.is_none());
+            })
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert!(
+                !shell.read(cx).workspaces[0]
+                    .parked
+                    .as_ref()
+                    .unwrap()
+                    .running
+            );
+            assert_eq!(
+                terminal.read(cx).backend().state(),
+                gitterm_terminal::SessionState::Cancelled
+            );
+            assert_eq!(shell.read(cx).data.workspaces(cx).len(), 2);
+        });
+        let saved: gitterm_core::workspace_config::WorkspacesFile =
+            serde_json::from_slice(&std::fs::read(desktop.join("workspaces.json")).unwrap())
+                .unwrap();
+        let stopped = saved.workspaces.iter().find(|w| w.name == "one").unwrap();
+        assert!(!stopped.active);
+        assert!(!stopped.tabs.is_empty());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.resume_live_workspace(key.clone(), false, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(shell.read(cx).visible_workspace_indices(cx), [1, 0]);
+        });
+        let resumed: gitterm_core::workspace_config::WorkspacesFile =
+            serde_json::from_slice(&std::fs::read(desktop.join("workspaces.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            resumed
+                .workspaces
+                .iter()
+                .filter(|w| w.active)
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>(),
+            ["two", "one"]
+        );
+        assert_eq!(resumed.active_workspace, 1);
+        live.drain().wait().unwrap();
+    }
+    #[gpui::test]
+    fn done_on_a_saved_park_does_not_add_a_runtime_workspace(cx: &mut gpui::TestAppContext) {
+        cx.background_executor.allow_parking();
+        let root = tempfile::tempdir().unwrap();
+        let file = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[
+            {"name":"Open","abbrev":"O","dir":"/fixture/open","color":"blue","tabs":[]},
+            {"name":"Saved","abbrev":"S","dir":"/fixture/saved","color":"blue","tabs":[],"active":false,"done_at":"2026-11-27T00:00:00Z"}
+        ]})).unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::from_document(root.path(), file);
+        let model = crate::workspace_status::WorkspaceStatus::from_iced(&catalog);
+        let mut store = crate::workspace_config::WorkspaceStore::new(root.path());
+        let saved = crate::workspace_config::LiveWorkspaceSaved {
+            workspace: catalog.closed[0].clone(),
+            closed: catalog.closed.clone(),
+            repos: catalog.repos.clone(),
+        };
+        store.iced = Some(catalog);
+        cx.update(|cx| {
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            let id = owner.update(cx, |owner, cx| owner.publish_workspace(saved, false, cx));
+            assert!(id.is_none());
+            assert_eq!(owner.read(cx).model.workspaces.len(), 1);
+            assert_eq!(owner.read(cx).iced_catalog().unwrap().workspaces.len(), 1);
+            assert!(
+                owner.read(cx).iced_catalog().unwrap().closed[0]
+                    .done_at
+                    .is_some()
+            );
+        });
+    }
+    #[gpui::test]
+    fn confirmed_tab_publishes_only_after_save_and_failed_save_keeps_catalog(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        cx.background_executor.allow_parking();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap();
+        std::fs::write(path.join("workspaces.json"), br#"{"active_workspace":0,"workspaces":[{"name":"Open","abbrev":"O","dir":"/fixture/open","color":"blue","tabs":[]}]}"#).unwrap();
+        let desktop = gitterm_core::desktop_store::DesktopStore::open(&path).unwrap();
+        let mut store = crate::workspace_config::WorkspaceStore::new(&path);
+        store.iced = Some(crate::workspace_config::IcedCatalog::read(&path).unwrap());
+        let model =
+            crate::workspace_status::WorkspaceStatus::from_iced(store.iced.as_ref().unwrap());
+        let tab = crate::chat::resume::tab(
+            std::path::Path::new("/fixture/open"),
+            "caller".into(),
+            Some("owned".into()),
+        );
+        let owner = cx.update(|cx| {
+            cx.set_global(crate::workspace_config::LiveWorkspaces(desktop.clone()));
+            let owner = cx.new(|cx| crate::WorkspaceOwner::new(model, Some(store), cx));
+            owner.update(cx, |owner, cx| {
+                owner.confirm_live_tab("Open", "/fixture/open", tab.clone(), cx)
+            });
+            assert!(
+                owner.read(cx).iced_catalog().unwrap().workspaces[0]
+                    .tabs
+                    .is_empty()
+            );
+            owner
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(
+                owner.read(cx).iced_catalog().unwrap().workspaces[0].tabs[0]
+                    .chat_session_id
+                    .as_deref(),
+                Some("owned")
+            )
+        });
+        let bytes = std::fs::read(path.join("workspaces.json")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut changed = tab;
+        changed.chat_session_id = Some("changed".into());
+        cx.update(|cx| {
+            owner.update(cx, |owner, cx| {
+                owner.confirm_live_tab("Open", "/fixture/open", changed, cx)
+            })
+        });
+        cx.run_until_parked();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cx.read(|cx| {
+            assert!(owner.read(cx).error.is_some());
+            assert_eq!(
+                owner.read(cx).iced_catalog().unwrap().workspaces[0].tabs[0]
+                    .chat_session_id
+                    .as_deref(),
+                Some("owned")
+            );
+        });
+        assert_eq!(std::fs::read(path.join("workspaces.json")).unwrap(), bytes);
+        desktop.drain().wait().unwrap();
     }
 }
