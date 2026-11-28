@@ -178,6 +178,7 @@ pub struct Shell {
     task_panel: Option<Entity<task_panel::TaskPanel>>,
     /// Iced's configured agent presets, read once with the host settings.
     agent_presets: Vec<gitterm_core::settings::AgentPreset>,
+    chat_defaults: gitterm_core::settings::ChatDefaults,
     /// Background actions the modal guard refused, for the guard's tests.
     #[cfg(test)]
     blocked_actions: Vec<&'static str>,
@@ -201,6 +202,7 @@ pub struct Shell {
     find_views: HashMap<String, find_sidebar::FindViews>,
     #[cfg(test)]
     find_home: Option<std::path::PathBuf>,
+    chat_backfill_running: bool,
     work_state: Rc<RefCell<gitterm_core::work::state::State>>,
     saved_facts: workspace_bar::SavedFactsCache,
     saved_facts_error: Option<workspace_bar::News>,
@@ -501,6 +503,7 @@ impl Shell {
             #[cfg(feature = "stt")]
             dictation: dictation::Dictation::new(settings.stt_enabled),
             agent_presets: settings.agent_presets.clone(),
+            chat_defaults: settings.chat.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
             task_switcher_subscription: None,
@@ -523,6 +526,7 @@ impl Shell {
             find_views: HashMap::new(),
             #[cfg(test)]
             find_home: None,
+            chat_backfill_running: false,
             work_state: Default::default(),
             saved_facts: workspace_bar::SavedFactsCache::default(),
             saved_facts_error: None,
@@ -1071,6 +1075,7 @@ impl Shell {
         if let Some(task) = &self.selected_task {
             self.task_last_session.insert(task.clone(), id);
         }
+        self.sync_task_git_changes(cx);
         self.show_pane(&session_pane_id(id), window, cx);
         self.load_active_iced_history(window, cx);
     }

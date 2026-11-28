@@ -1,7 +1,7 @@
 #[cfg(test)]
 use git2::Status;
 use git2::{DiffOptions, Repository};
-use gitterm::chats::ChatEntryResume;
+use gitterm::chats::{can_resume_as_chat, new_claude_chat_config, ChatEntryResume, ChatMachine};
 #[cfg(test)]
 use gitterm::task_worktree::DEFAULT_TASK_BASE;
 use gitterm::tasks::task_handoff_prompt;
@@ -2458,8 +2458,7 @@ where
 /// tabs left (at least one): a later tab shifts down one; the removed
 /// tab's place goes to the tab after it, else the last.
 fn active_tab_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
-    let active = if active > removed { active - 1 } else { active };
-    active.min(remaining.saturating_sub(1))
+    gitterm_core::workspace_config::active_tab_after_removal(active, removed, remaining)
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -3976,42 +3975,6 @@ fn conversation_backend_glyph(backend: HarnessConversationBackend) -> &'static s
 /// (`ClaudeChat` / `ClaudeChatHistory`, TRU-152).
 const CLAUDE_CHAT_CAPABILITY: &str = "claude_chat";
 
-/// Which machine a Chats-panel entry is on, for "Resume as Chat".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatMachine {
-    Local,
-    /// `claude_chat`: the remote's agent is reachable and advertises it.
-    Remote {
-        claude_chat: bool,
-    },
-}
-
-/// Whether the Chats panel offers "Resume as Chat" for an entry: a Claude
-/// conversation whose recorded directory still exists and that no tab owns
-/// yet (an owned one shows "Go to Session"), on this Mac or on a remote
-/// whose agent runs native Claude chats. Codex and pi chats, chats on
-/// older or unreachable agents and dead-cwd chats keep only their
-/// existing action.
-fn can_resume_as_chat(entry: &chats::ChatIndexEntry, machine: ChatMachine, is_live: bool) -> bool {
-    let machine_ok = match machine {
-        ChatMachine::Local => true,
-        ChatMachine::Remote { claude_chat } => claude_chat,
-    };
-    entry.backend == chats::ChatBackend::Claude && machine_ok && !is_live && !entry.dead_cwd
-}
-
-/// The config a new Claude chat tab starts with: the remembered or configured
-/// model and effort ("default" leaves the model to the user's Claude
-/// settings) and the default permission mode.
-fn new_claude_chat_config(chat_config: &config::ChatDefaults) -> AgentBackendConfig {
-    let selection = chat_config.new_chat_selection();
-    AgentBackendConfig::Claude {
-        model: selection.model,
-        permission_mode: Some(tab::DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
-        effort: selection.effort,
-    }
-}
-
 /// A mode, model or effort value from the chat page that can be handed to
 /// an ACP agent, which validates it against what it offers: one short
 /// token without whitespace.
@@ -4156,18 +4119,7 @@ fn new_acp_chat_config(
     chat_config: &config::ChatDefaults,
     agent: gitterm::harness::acp::AcpAgent,
 ) -> AgentBackendConfig {
-    use gitterm::harness::acp::AcpAgent;
-    let model = match agent {
-        AcpAgent::Antigravity => chat_config.antigravity_model.trim().to_string(),
-        AcpAgent::Gemini => String::new(),
-        AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
-    };
-    AgentBackendConfig::Acp {
-        agent,
-        model,
-        mode: Some(agent.default_mode().to_string()),
-        effort: None,
-    }
+    gitterm_core::harness::acp_launch::new_chat_config(chat_config, agent)
 }
 
 /// The session of a chat tab resuming Claude session `session_id`: the new

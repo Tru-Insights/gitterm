@@ -202,16 +202,41 @@ impl TaskHostOwner {
     pub(crate) fn launch_from_ui(
         &mut self,
         task_id: &str,
-        preset_name: Option<&str>,
+        preset_index: Option<usize>,
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value, String> {
+        let label = "task_launch_session";
+        if !self.own_tasks.contains(task_id) {
+            return Err(preview_notice(label));
+        }
+        self.authorize_process(label, &self.task_worktree(task_id))?;
+        let settings = crate::workspace_config::load_iced_settings_from(&self.iced_config);
+        let preset_name = preset_index
+            .map(|index| {
+                settings
+                    .agent_presets
+                    .get(index)
+                    .map(|p| p.name.clone())
+                    .ok_or_else(|| "The selected agent preset is unavailable".to_owned())
+            })
+            .transpose()?;
         let launch = SessionLaunch {
             task_id: task_id.to_string(),
-            preset_name: preset_name.map(str::to_string),
+            preset_name,
             origin: TaskLaunchOrigin::User,
             user_model_choice: false,
         };
-        self.launch_task_session(launch, "task_launch_session", cx)
+        let facts = self.launch_facts(&settings, cx);
+        // Like Iced's try_launch_task_child, retain the UI's index through
+        // command construction and queue admission. Names are MCP selectors.
+        match self.try_launch(&launch, preset_index, &settings, facts, label, cx)? {
+            Started::Session(session) => Ok(session),
+            Started::Queued(position) => Ok(serde_json::json!({
+                "task_id": task_id,
+                "queued": true,
+                "queue_position": position,
+            })),
+        }
     }
 
     /// The launched terminal of `session_id`, for the shell's new pane; the
@@ -934,9 +959,25 @@ impl TaskHostOwner {
         ended: Option<TaskSessionOutcome>,
         cx: &App,
     ) {
-        let Some(store) = self.host.store().as_ref() else {
+        let Some((target, detail)) = self.task_session_outcome(task_id, ended, cx) else {
             return;
         };
+        if let Err(error) = self.writable_store().and_then(|store| {
+            store
+                .record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
+                .map_err(|error| error.to_string())
+        }) {
+            eprintln!("GitTerm GPUI dropped a task lifecycle signal: {error}");
+        }
+    }
+
+    pub(super) fn task_session_outcome(
+        &self,
+        task_id: &str,
+        ended: Option<TaskSessionOutcome>,
+        cx: &App,
+    ) -> Option<TaskSessionOutcome> {
+        let store = self.host.store().as_ref()?;
         let is_final = |session: Option<&str>| store.worker_session_is_final(task_id, session);
         let terminals = self
             .launched
@@ -956,17 +997,7 @@ impl TaskHostOwner {
                 is_final: is_final(chat.task_session_id.as_deref()),
             });
         let sessions: Vec<LinkedSession> = terminals.chain(chats).collect();
-        let Some((target, detail)) = gitterm_core::task_host::task_session_signal(&sessions, ended)
-        else {
-            return;
-        };
-        if let Err(error) = self.writable_store().and_then(|store| {
-            store
-                .record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
-                .map_err(|error| error.to_string())
-        }) {
-            eprintln!("GitTerm GPUI dropped a task lifecycle signal: {error}");
-        }
+        gitterm_core::task_host::task_session_signal(&sessions, ended)
     }
 
     /// The reducer's session facts for launched terminals still open, as
@@ -1069,6 +1100,21 @@ impl TaskHostOwner {
             .map(|launched| launched.live.is_some())
     }
 
+    pub(super) fn mark_panel_resume_live(&mut self, session: &str, cx: &mut Context<Self>) {
+        if let Some(launched) = self.launched.get_mut(session) {
+            launched.live = Some(TaskSessionLiveState::Working);
+        }
+        self.apply_task_session_signal(
+            self.launched
+                .get(session)
+                .map(|l| l.task_id.clone())
+                .as_deref()
+                .unwrap_or(""),
+            None,
+            cx,
+        );
+    }
+
     /// Iced's `close_task_tab` once the tab is gone: the session no longer
     /// counts for its task, whose other sessions decide its lifecycle; one
     /// that was live stopped. The pane that held the terminal stops and
@@ -1080,6 +1126,7 @@ impl TaskHostOwner {
             return;
         };
         self.host.revoke_caller(&launched.target.session_uid);
+        self.host.revoke_caller(session_id);
         self.apply_task_session_signal(
             &launched.task_id,
             launched
@@ -2552,7 +2599,7 @@ fn is_gpui_codex_notify(value: &str, task_id: &str, session_id: &str) -> bool {
 /// `projects` dir instead of ~/.claude: Claude writes
 /// `<projects>/<cwd-slug>/<id>.jsonl` on the first message. An id that is
 /// not a plain name never names a file.
-fn claude_transcript_exists(projects: &Path, session_id: &str) -> bool {
+pub(super) fn claude_transcript_exists(projects: &Path, session_id: &str) -> bool {
     if session_id.is_empty()
         || !session_id
             .chars()

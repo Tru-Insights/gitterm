@@ -90,7 +90,10 @@ impl ChatPane {
     ) -> Result<()> {
         match &self.remote {
             Some(remote) => claim.remote_provider_id(&remote.agent.id, id),
-            None => claim.provider_id(id),
+            None => match self.controller.config.backend() {
+                gitterm_core::chat::types::AgentBackend::Acp(agent) => claim.acp_id(agent, id),
+                _ => claim.provider_id(id),
+            },
         }
     }
     pub(super) fn launch_remote(

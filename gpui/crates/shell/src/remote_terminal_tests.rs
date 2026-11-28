@@ -163,11 +163,11 @@ fn golive19_live_ssh_routes_deduplicate_and_restore_saved_bytes(cx: &mut TestApp
     shell.update_in(vcx, |shell, window, cx| {
         shell.close_target(&closed, window, cx)
     });
-    shell.read_with(vcx, |shell, cx| {
-        assert_eq!(shell.active(cx).sessions.len(), 2)
-    });
     wait_until(vcx, |cx| {
         !shell.read_with(cx, |shell, cx| shell.owner.read(cx).workspace_save_pending)
+    });
+    shell.read_with(vcx, |shell, cx| {
+        assert_eq!(shell.active(cx).sessions.len(), 2)
     });
     let saved = golive19_disk_tabs(&fixture);
     assert_eq!(saved.len(), 2, "close removes the saved remote tab");

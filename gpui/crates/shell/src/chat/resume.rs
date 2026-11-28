@@ -269,10 +269,15 @@ impl ChatPane {
         #[cfg(test)]
         let projects = None;
         #[cfg(not(test))]
-        let projects = if remote.is_some() {
-            None
-        } else {
+        let projects = if remote.is_none()
+            && tab
+                .agent_config
+                .as_ref()
+                .is_some_and(|config| config.backend() == AgentBackend::Claude)
+        {
             Some(provider::live_provider_root()?.join("projects"))
+        } else {
+            None
         };
         Self::resume_configured(
             shutdown, preview, workspace, tab, projects, remote, window, cx,
@@ -308,7 +313,8 @@ impl ChatPane {
             .clone()
             .context("Saved chat has no recorded backend configuration")?;
         anyhow::ensure!(
-            config.backend() == AgentBackend::Claude,
+            config.backend() == AgentBackend::Claude
+                || (policy::is_live(cx) && matches!(config.backend(), AgentBackend::Acp(_))),
             "Resume for this recorded backend is unavailable"
         );
         let id = tab.chat_session_id.clone();
@@ -363,15 +369,32 @@ impl ChatPane {
             &pane.saved.uid,
         )?);
         if let Some(id) = &id {
-            match &pane.remote {
-                Some(remote) => claim.remote_provider_id(&remote.agent.id, id)?,
-                None => claim.provider_id(id)?,
+            match config.backend() {
+                AgentBackend::Acp(agent) => claim.acp_id(agent, id)?,
+                _ => match &pane.remote {
+                    Some(remote) => claim.remote_provider_id(&remote.agent.id, id)?,
+                    None => claim.provider_id(id)?,
+                },
             }
         }
         pane.live_claim = Some(claim);
         let mut tab = tab;
         tab.session_uid = Some(pane.saved.uid.clone());
         pane.live_tab = Some(LiveTab::new(services, &workspace, tab));
+        if matches!(config.backend(), AgentBackend::Acp(_)) {
+            let restoring = config.read_only_note().is_none() && id.is_some();
+            if restoring {
+                pane.controller
+                    .adapter
+                    .begin_history(pane.controller.target.clone(), config.clone())
+                    .context("Saved ACP history cannot be restored")?;
+            }
+            pane.configure_acp(config, cx);
+            if restoring {
+                pane.history_loading = true;
+            }
+            return Ok(pane);
+        }
         let AgentBackendConfig::Claude {
             model,
             permission_mode,
@@ -488,7 +511,9 @@ impl ChatPane {
         }
         self.live_claim = None;
         let old_target = self.controller.target.clone();
+        let config = self.controller.config.clone();
         self.controller = Controller::new();
+        self.controller.config = config;
         self.controller.live = true;
         self.controller.remote = self.remote.is_some();
         self.controller.target.task_id = old_target.task_id;

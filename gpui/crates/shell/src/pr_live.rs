@@ -429,6 +429,40 @@ impl LivePrs {
         self.wake.notify_one();
         result
     }
+    pub fn local_control(
+        &self,
+        store: &gitterm_core::desktop_store::DesktopStore,
+        control: gitterm_core::work::pr_actions::LocalControl,
+    ) -> Result<(), String> {
+        let _serial = self.serial.lock().map_err(|_| "PR watch lock poisoned")?;
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err("PR watch is shutting down".into());
+        }
+        let mut snapshot = self.snapshot.lock().unwrap();
+        // Flush any earlier failed poll save before changing a local field.
+        if snapshot.watch_dirty {
+            snapshot.save_watch(&prs::WatchFile::path_in(&self.root))?;
+        }
+        if store.root() != self.root {
+            return Err("PR persistence root changed".into());
+        }
+        store
+            .pr_control(control, chat_facts::runtime::now_stamp())
+            .wait()?;
+        snapshot.reload_watch(&prs::WatchFile::path_in(&self.root))?;
+        snapshot.plans = merge_plan::load_plans(&merge_plan::plans_dir(&self.root));
+        let watch = snapshot.watch.clone();
+        for groups in snapshot.groups.values_mut() {
+            for group in groups {
+                for pr in &mut group.prs {
+                    if let Some(saved) = watch.prs.get(&pr.key.id()) {
+                        *pr = saved.clone();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn request_refresh(&self) {
         self.refresh_requested.store(true, Ordering::SeqCst);
         self.wake.notify_one();
@@ -440,6 +474,8 @@ impl LivePrs {
         }
         let dir = chat_facts::facts_dir(&self.root);
         let path = chat_facts::facts_path(&dir, gitterm_core::chats::ChatBackend::Claude, chat)?;
+        let lock = chat_facts::runtime::facts_write_lock(&path);
+        let _facts = lock.lock().map_err(|_| "PR facts lock poisoned")?;
         let mut facts = chat_facts::load_facts(&path)?.unwrap_or_default();
         for pr in prs {
             facts.add_pr(pr.clone());
@@ -615,6 +651,88 @@ pub(crate) mod tests {
         );
         (dir, live, fake)
     }
+    #[test]
+    fn work_sidebar_review_f1_backfill_and_live_prs_share_merge_lock() {
+        use gitterm_core::{chat_facts::runtime as facts, chats::ChatBackend};
+        use std::{io::Write, sync::mpsc};
+        let (dir, live, fake) = fixture();
+        let transcript = dir.path().join("placeholder.jsonl");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&transcript)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let facts_dir = chat_facts::facts_dir(dir.path());
+        let path = chat_facts::facts_path(&facts_dir, ChatBackend::Claude, "placeholder").unwrap();
+        let lock = facts::facts_write_lock(&path);
+        let source = transcript.clone();
+        let scan = std::thread::spawn(move || {
+            facts::backfill_claude(
+                vec![facts::BackfillTarget {
+                    id: "placeholder".into(),
+                    path: source,
+                    mtime: std::time::SystemTime::now(),
+                }],
+                &facts_dir,
+                &Default::default(),
+                &[],
+                1,
+                facts::FactPaths::default(),
+            )
+        });
+        // Connecting the FIFO proves backfill has read the old facts and is
+        // waiting for transcript bytes, while it still holds the core lock.
+        let (connected, pipe) = mpsc::channel();
+        std::thread::spawn(move || {
+            connected
+                .send(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(transcript)
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        let mut fifo = pipe.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(lock.try_lock().is_err());
+        let pr = PrRef {
+            repo: fake.watched.key.repo.clone(),
+            number: fake.watched.key.number,
+            url: format!(
+                "https://github.com/{}/pull/{}",
+                fake.watched.key.repo, fake.watched.key.number
+            ),
+        };
+        let expected = pr.key().id();
+        let (started, begin) = mpsc::channel();
+        let (finished, end) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = live.note_live_prs("placeholder", &[pr]);
+            finished.send(()).unwrap();
+            result
+        });
+        begin.recv_timeout(Duration::from_secs(5)).unwrap();
+        let blocked = end.recv_timeout(Duration::from_millis(100)).is_err();
+        // Always release the scanner before asserting, including on regression.
+        writeln!(
+            fifo,
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"Implement TRU-274 placeholder\"}}}}"
+        )
+        .unwrap();
+        drop(fifo);
+        assert_eq!(scan.join().unwrap().scanned, 1);
+        writer.join().unwrap().unwrap();
+        let saved = chat_facts::load_facts(&path).unwrap().unwrap();
+        assert!(saved.backfilled && saved.documents_backfilled);
+        assert_eq!(saved.issue_keys, ["TRU-274"]);
+        assert!(saved.prs.iter().any(|pr| pr.key().id() == expected));
+        assert!(saved.live_created_prs.contains(&expected));
+        assert!(blocked, "live PR writer bypassed backfill's merge lock");
+    }
+
     #[test]
     fn live_pr_f3_failed_save_retains_news_and_retries_without_refetch() {
         struct FailSaveOnce {

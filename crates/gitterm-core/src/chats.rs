@@ -298,6 +298,86 @@ pub struct ChatPreview {
     pub message_count: Option<u64>,
 }
 
+/// Shared resume command construction for a chat backend.
+pub trait ChatBackendResume {
+    fn resume_command(&self, base: &str, id: &str) -> String;
+}
+
+impl ChatBackendResume for ChatBackend {
+    /// Shell command that resumes conversation `id` using harness
+    /// launch command `base`. Must run in the conversation's recorded
+    /// cwd.
+    fn resume_command(&self, base: &str, id: &str) -> String {
+        match self {
+            ChatBackend::Claude => format!("{base} --resume {id}"),
+            ChatBackend::Codex => format!("{base} resume {id}"),
+            // pi resumes a specific session via --session (`--resume`
+            // is the interactive picker).
+            ChatBackend::Pi => format!("{base} --session {id}"),
+        }
+    }
+}
+
+/// Shared resume command construction for an indexed conversation.
+pub trait ChatEntryResume {
+    fn resume_command(&self) -> String;
+    fn resume_command_with(&self, base: &str) -> String;
+}
+
+impl ChatEntryResume for ChatIndexEntry {
+    /// Shell command that resumes this conversation. Must run in the
+    /// conversation's recorded cwd (or the rescue dir when cwd is dead).
+    fn resume_command(&self) -> String {
+        self.resume_command_with(self.backend.label())
+    }
+    /// Resume command with an explicit harness binary/launch command —
+    /// remote machines resolve the binary through the remote's
+    /// session_commands map (agent daemons run with a minimal PATH).
+    fn resume_command_with(&self, base: &str) -> String {
+        self.backend.resume_command(base, &self.id)
+    }
+}
+
+/// Which machine a Chats-panel entry is on, for "Resume as Chat".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMachine {
+    Local,
+    /// `claude_chat`: the remote's agent is reachable and advertises it.
+    Remote {
+        claude_chat: bool,
+    },
+}
+
+/// Whether the Chats panel offers "Resume as Chat" for an entry: a Claude
+/// conversation whose recorded directory still exists and that no tab owns
+/// yet (an owned one shows "Go to Session"), on this Mac or on a remote
+/// whose agent runs native Claude chats. Codex and pi chats, chats on
+/// older or unreachable agents and dead-cwd chats keep only their
+/// existing action.
+pub fn can_resume_as_chat(entry: &ChatIndexEntry, machine: ChatMachine, is_live: bool) -> bool {
+    let machine_ok = match machine {
+        ChatMachine::Local => true,
+        ChatMachine::Remote { claude_chat } => claude_chat,
+    };
+    entry.backend == ChatBackend::Claude && machine_ok && !is_live && !entry.dead_cwd
+}
+
+pub const DEFAULT_CLAUDE_PERMISSION_MODE: &str = "default";
+
+/// The config a new Claude chat tab starts with: the remembered or configured
+/// model and effort ("default" leaves the model to the user's Claude
+/// settings) and the default permission mode.
+pub fn new_claude_chat_config(
+    chat_config: &crate::settings::ChatDefaults,
+) -> crate::chat::types::AgentBackendConfig {
+    let selection = chat_config.new_chat_selection();
+    crate::chat::types::AgentBackendConfig::Claude {
+        model: selection.model,
+        permission_mode: Some(DEFAULT_CLAUDE_PERMISSION_MODE.to_string()),
+        effort: selection.effort,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +527,35 @@ mod tests {
             Some(QueryMatch::Child("Fable review of identity design".into()))
         );
         assert_eq!(QueryMatch::Title.label(), None);
+    }
+    #[test]
+    fn resume_commands_match_iced() {
+        for (backend, id, expected) in [
+            (ChatBackend::Claude, "fixture", "claude --resume fixture"),
+            (ChatBackend::Codex, "019e-abc", "codex resume 019e-abc"),
+            (ChatBackend::Pi, "019f-xyz", "pi --session 019f-xyz"),
+        ] {
+            let entry = ChatIndexEntry {
+                id: id.into(),
+                backend,
+                path: PathBuf::new(),
+                cwd: PathBuf::new(),
+                repo_root: None,
+                is_worktree: false,
+                branch: None,
+                title: String::new(),
+                latest: None,
+                mtime: std::time::UNIX_EPOCH,
+                size: 0,
+                dead_cwd: true,
+                facts: None,
+                root_id: None,
+            };
+            assert_eq!(entry.resume_command(), expected);
+            assert_eq!(
+                entry.resume_command_with("custom"),
+                backend.resume_command("custom", id)
+            );
+        }
     }
 }

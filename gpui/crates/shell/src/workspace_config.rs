@@ -268,7 +268,7 @@ mod tests {
 
 /// Explicit read authority only. This reader never enters the preview writer or
 /// claims an Iced lease, including when the source is absent or half-written.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct IcedCatalog {
     pub source: PathBuf,
     pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
@@ -908,6 +908,10 @@ impl gpui::Global for LiveWorkspaces {}
 
 #[derive(Clone)]
 pub(crate) enum LiveWorkspaceAction {
+    ChatFolder {
+        name: String,
+        dir: PathBuf,
+    },
     Create {
         name: String,
         start: gitterm_core::work::catalog::WorkStart,
@@ -924,6 +928,7 @@ pub(crate) enum LiveWorkspaceAction {
     Resume {
         key: gitterm_core::park::Key,
         reopen: bool,
+        for_chat: bool,
         open: Vec<gitterm_core::park::Key>,
     },
     Done(gitterm_core::park::Key),
@@ -979,13 +984,20 @@ pub(crate) fn save_live_workspace(
             let previous_active = active.as_ref().and_then(|key| file.workspaces.iter().filter(|w| w.active).position(|w| key.matches(w))).unwrap_or(file.active_workspace);
             let returning_at = if let LiveWorkspaceAction::Return { ordinal, .. } = &action { Some(*ordinal) } else { None };
             let target = match &action {
-                LiveWorkspaceAction::Create { .. } => None,
+                LiveWorkspaceAction::Create { .. } | LiveWorkspaceAction::ChatFolder { .. } => None,
                 LiveWorkspaceAction::Park { key, .. } | LiveWorkspaceAction::Resume { key, .. } | LiveWorkspaceAction::Done(key) | LiveWorkspaceAction::Return { key, .. } => Some(key),
             };
             if let Some(key) = target && file.workspaces.iter().filter(|w| key.matches(w)).count() > 1 {
                 return Err(format!("Several saved workspaces are named {} in {}; this workspace cannot be changed in Live.", key.name, key.dir));
             }
             let mut workspace = match action {
+                LiveWorkspaceAction::ChatFolder { name, dir } => {
+                    use gitterm_core::settings::WorkspaceColor as C;
+                    let colors = [C::Lavender, C::Blue, C::Green, C::Peach, C::Pink, C::Yellow, C::Red, C::Teal];
+                    let used: Vec<_> = file.workspaces.iter().filter(|w| w.active).map(|w| w.color).collect();
+                    let color = colors.iter().copied().find(|c| !used.contains(c)).unwrap_or(colors[used.len() % colors.len()]);
+                    new_work_config(&name, &dir, color, Default::default())
+                }
                 LiveWorkspaceAction::Create { name, start, .. } => {
                     use gitterm_core::settings::WorkspaceColor as C;
                     let used: Vec<_> = file
@@ -1064,7 +1076,12 @@ pub(crate) fn save_live_workspace(
                     }
                     workspace
                 }
-                LiveWorkspaceAction::Resume { key, reopen, open } => {
+                LiveWorkspaceAction::Resume { key, reopen, for_chat, open } => {
+                    if for_chat && let Some(workspace) = file.workspaces.iter_mut().find(|w| key.matches(w) && w.done_at.is_some()) {
+                        workspace.tabs.clear();
+                        workspace.bottom_terminals.clear();
+                        workspace.active_tab = None;
+                    }
                     if reopen {
                         park::reopen_done(&mut file.workspaces, &key);
                     }
@@ -1191,54 +1208,7 @@ pub(crate) fn save_live_workspace(
     result
 }
 
-fn new_work_config(
-    name: &str,
-    dir: &Path,
-    color: gitterm_core::settings::WorkspaceColor,
-    start: gitterm_core::work::catalog::WorkStart,
-) -> gitterm_core::workspace_config::WorkspaceConfig {
-    use gitterm_core::workspace_config::WorkspaceConfig;
-    let dir = dir.to_string_lossy().into_owned();
-    let added: Vec<String> = start
-        .repos
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    WorkspaceConfig {
-        extra: Default::default(),
-        collapsed_issue_groups: gitterm_core::issues::IssueGroup::default_collapsed(),
-        name: name.into(),
-        abbrev: name.chars().take(2).collect::<String>().to_uppercase(),
-        dir: dir.clone(),
-        color,
-        location: Some(
-            gitterm_core::remote::config::WorkspaceLocationConfig::Local { root: dir.clone() },
-        ),
-        remote_session: None,
-        active_tab: Some(0),
-        tabs: vec![],
-        run_command: None,
-        bottom_terminals: vec![],
-        env: Default::default(),
-        legacy_env_base: None,
-        active: true,
-        chats: vec![],
-        parked: None,
-        done_at: None,
-        guidelines_off: false,
-        claude_in_chrome: false,
-        decisions_repo: start
-            .decisions_repo
-            .map(|p| p.to_string_lossy().into_owned()),
-        repos: std::iter::once(dir.clone())
-            .chain(added.iter().filter(|r| **r != dir).cloned())
-            .collect(),
-        home: Some(dir),
-        env_overrides: Default::default(),
-        repos_added: added,
-        repos_removed: vec![],
-    }
-}
+use gitterm_core::workspace_config::new_work_config;
 
 #[cfg(test)]
 mod live_workspace_tests {
@@ -1320,6 +1290,7 @@ mod live_workspace_tests {
             LiveWorkspaceAction::Resume {
                 key: key.clone(),
                 reopen: false,
+                for_chat: false,
                 open: vec![],
             },
             None,
@@ -1352,6 +1323,7 @@ mod live_workspace_tests {
             LiveWorkspaceAction::Resume {
                 key,
                 reopen: true,
+                for_chat: false,
                 open: vec![],
             },
             None,
@@ -1392,6 +1364,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key: key.clone(),
                     reopen: false,
+                    for_chat: false,
                     open: vec![],
                 },
                 None,
@@ -1435,6 +1408,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key,
                     reopen: true,
+                    for_chat: false,
                     open: vec![],
                 },
                 None,
@@ -1477,6 +1451,7 @@ mod live_workspace_tests {
                     LiveWorkspaceAction::Resume {
                         key,
                         reopen: false,
+                        for_chat: false,
                         open: vec![],
                     },
                     None,
@@ -1582,6 +1557,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key,
                     reopen: false,
+                    for_chat: false,
                     open: vec![running],
                 },
                 None,
@@ -1615,6 +1591,7 @@ mod live_workspace_tests {
                         LiveWorkspaceAction::Resume {
                             key,
                             reopen: false,
+                            for_chat: false,
                             open: vec![]
                         },
                         None

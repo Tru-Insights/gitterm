@@ -402,11 +402,11 @@ impl ShellData for LocalData {
             .tabs
             .get(index)
             .filter(|t| {
+                use gitterm_core::chat::types::AgentBackendConfig;
                 t.tab_kind.as_deref() == Some("agent")
-                    && matches!(
-                        t.agent_config,
-                        Some(gitterm_core::chat::types::AgentBackendConfig::Claude { .. })
-                    )
+                    && (matches!(t.agent_config, Some(AgentBackendConfig::Claude { .. }))
+                        || (crate::chat::policy::is_live(cx)
+                            && matches!(t.agent_config, Some(AgentBackendConfig::Acp { .. }))))
             })
             .cloned()
     }
@@ -637,6 +637,7 @@ impl IcedWorkData {
             chat_owners: catalog
                 .workspaces
                 .iter()
+                .chain(&catalog.closed)
                 .flat_map(|w| w.chats.iter().map(|chat| (chat.clone(), w.name.clone())))
                 .collect(),
             running_by_repo: HashMap::new(),

@@ -197,6 +197,24 @@ fn find_open_resume_select_existing_history_and_refuse_new_process(cx: &mut Test
         draw(cx);
     }
     cx.read(|cx| {
+        assert!(
+            shell
+                .read(cx)
+                .owner
+                .read(cx)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not available in preview")
+        );
+    });
+    sidebar.update(cx, |_, cx| {
+        cx.emit(FindOutcome::Open {
+            id: ChatRef::local("first"),
+        })
+    });
+    draw(cx);
+    cx.read(|cx| {
         let shell = shell.read(cx);
         assert_eq!(shell.find_owner(cx), owner);
         assert_eq!(shell.active(cx).sessions.len(), 2);

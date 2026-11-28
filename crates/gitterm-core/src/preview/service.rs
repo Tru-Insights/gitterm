@@ -240,6 +240,9 @@ pub fn classify_task_action(action: &TaskMutationAction) -> Class {
         A::PersistPreparation { .. } => class("Save task", Access::Write),
         A::PersistDelivery { .. } => class("Save delivery", Access::Write),
         A::PersistHandoff { .. } => class("Save handoff", Access::Write),
+        A::StopTask { .. } => class("Close session", Access::Process),
+        A::CancelQueue { .. } => class("Save task", Access::Write),
+        A::ResumeConversation { .. } => class("Launch session", Access::Process),
         A::ArchiveTask { .. } => class("Close task", Access::Write),
         A::RemoveWorktree { .. } => class("Remove worktree", Access::Write),
         A::ClearWorktree { .. } => class("Remove worktree", Access::Write),
@@ -605,6 +608,10 @@ impl ServiceContext {
                     | "merge_plan_set"
                     | "Dismiss delegation"
                     | "Save delivery"
+                    | "Create task"
+                    | "Save task"
+                    | "Close task"
+                    | "Remove worktree"
             );
         let live_task_process = access == Access::Process
             && matches!(
@@ -621,13 +628,16 @@ impl ServiceContext {
                     | "Stop delegation"
                     | "Automatic delivery"
                     | "Deliver results"
+                    | "Close session"
             );
+        let live_task_publish = access == Access::Outside && label == "Publish";
         let live_pr_action =
             access == Access::Outside && matches!(label, "Approve" | "Merge" | "Ready for review");
         if self.gpui_live
             && !matches!(access, Access::Read | Access::Existing)
             && !live_task_write
             && !live_task_process
+            && !live_task_publish
             && !live_pr_action
         {
             return Err(denied(label));
@@ -947,6 +957,71 @@ mod tests;
 #[cfg(test)]
 mod live_tests {
     use super::*;
+    #[test]
+    fn task_panel_effects_are_live_only_and_access_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let live = ServiceContext::production(temp.path(), "panel")
+            .unwrap()
+            .for_gpui_live();
+        let protected = crate::preview::ProtectedRoots::new(&temp.path().join("home"), []).unwrap();
+        let preview = Preview::validate(&temp.path().join("preview"), protected).unwrap();
+        let preview = ServiceContext::preview(std::sync::Arc::new(preview)).unwrap();
+        use TaskMutationAction as A;
+        let actions = [
+            A::PrepareTask(crate::task_commands::TaskCreate {
+                title: "Placeholder".into(),
+                objective: "Placeholder".into(),
+                repository_path: "/tmp/repo".into(),
+                workspace_name: None,
+                issue_key: None,
+                base_reference: Some("main".into()),
+                stopping_boundary: crate::tasks::StoppingBoundary::PlanOnly,
+                origin: crate::task_commands::TaskCreateOrigin::Form,
+            }),
+            A::CancelQueue {
+                task_id: "placeholder".into(),
+            },
+            A::ArchiveTask {
+                task_id: "placeholder".into(),
+            },
+            A::StopTask {
+                task_id: "placeholder".into(),
+                targets: vec![],
+            },
+            A::ClearWorktree {
+                task_id: "placeholder".into(),
+            },
+            A::RemoveWorktree {
+                task_id: "placeholder".into(),
+                repository: "/tmp/repo".into(),
+                path: "/tmp/worktree".into(),
+            },
+            A::Publish {
+                task_id: "placeholder".into(),
+                action: crate::task_commands::TaskPublish::PushBranch,
+                path: "/tmp/worktree".into(),
+                branch: "task/placeholder".into(),
+                base: "main".into(),
+                title: "Placeholder".into(),
+                body: "Placeholder".into(),
+            },
+        ];
+        for action in actions {
+            assert!(live.task_action(&action, None).is_ok(), "{action:?}");
+            assert_eq!(
+                preview.task_action(&action, None).unwrap_err().notice(),
+                preview_notice(classify_task_action(&action).label)
+            );
+        }
+        for (label, access) in [
+            ("Publish", Access::Write),
+            ("Close session", Access::Outside),
+            ("notify", Access::Write),
+        ] {
+            assert!(live.authorize(class(label, access), None).is_err());
+        }
+    }
+
     #[test]
     fn live_pr_actions_are_admitted_only_in_production() {
         let dir = tempfile::tempdir().unwrap();

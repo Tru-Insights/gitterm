@@ -114,4 +114,12 @@ pub mod desktop_store;
 
 pub mod editor;
 
+#[cfg(feature = "runtime")]
+pub mod shutdown;
+
+#[cfg(feature = "runtime")]
+pub mod chat_overview;
+#[cfg(feature = "runtime")]
+pub mod chat_summary;
+
 pub mod terminal;

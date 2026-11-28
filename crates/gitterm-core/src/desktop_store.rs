@@ -141,6 +141,16 @@ impl DesktopStore {
         self.submit(|state, _| Ok(state.clone()))
     }
 
+    /// Local Work controls share the desktop writer queue. The PR owner holds
+    /// its poll lock until this receipt completes, then reloads its projection.
+    pub fn pr_control(
+        &self,
+        control: crate::work::pr_actions::LocalControl,
+        at: String,
+    ) -> Receipt<()> {
+        self.submit(move |_, root| control.save(root, &at))
+    }
+
     /// A Missing file gains defaults only through an explicit mutation. A
     /// Refused file never gains defaults or write authority in this owner.
     pub fn edit_workspaces(
@@ -194,7 +204,29 @@ impl DesktopStore {
                 dirty: true,
                 error: None,
             };
-            save(&mut pending, &root.join("workspaces.json"))?;
+            let path = root.join("workspaces.json");
+            if matches!(&state.workspaces.loaded, LoadState::Valid(_)) {
+                let original =
+                    std::fs::read(&path).map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let raw: serde_json::Value = serde_json::from_slice(&original)
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let decoded: WorkspacesFile = serde_json::from_value(raw.clone())
+                    .map_err(|e| format!("Read {}: {e}", path.display()))?;
+                let known = serde_json::to_value(decoded)
+                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                let LoadState::Valid(candidate) = &pending.loaded else {
+                    unreachable!()
+                };
+                let mut next = serde_json::to_value(candidate)
+                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                preserve_workspace_unknown(&raw, &known, &mut next);
+                let bytes = serde_json::to_vec_pretty(&next)
+                    .map_err(|e| format!("Encode {}: {e}", path.display()))?;
+                crate::atomic_file::write_atomically(&path, &bytes)?;
+                pending.dirty = false;
+            } else {
+                save(&mut pending, &path)?;
+            }
             state.workspaces = pending;
             Ok(result)
         })
@@ -410,6 +442,109 @@ fn keep_unknown_fields(
             }
         }
         _ => {}
+    }
+}
+
+// Reinsert fields this version cannot deserialize, including a moved tab's
+// nested provider config. Known fields always come from the candidate.
+fn preserve_unknown(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    match (raw, known, next) {
+        (
+            serde_json::Value::Object(raw),
+            serde_json::Value::Object(known),
+            serde_json::Value::Object(next),
+        ) => {
+            for (key, value) in raw {
+                if let Some(before) = known.get(key) {
+                    if let Some(after) = next.get_mut(key) {
+                        preserve_unknown(value, before, after);
+                    }
+                } else {
+                    next.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        (
+            serde_json::Value::Array(raw),
+            serde_json::Value::Array(known),
+            serde_json::Value::Array(next),
+        ) => {
+            for after in next {
+                if let Some(index) = known.iter().position(|before| before == after) {
+                    if let Some(original) = raw.get(index) {
+                        preserve_unknown(original, &known[index], after);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+fn preserve_workspace_unknown(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    preserve_unknown(raw, known, next);
+    for section in ["workspaces", "repos"] {
+        let Some(before) = known[section].as_array() else {
+            continue;
+        };
+        let Some(after) = next[section].as_array_mut() else {
+            continue;
+        };
+        for entry in after {
+            let matches: Vec<_> = before
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    b["dir"] == entry["dir"]
+                        && b["location"] == entry["location"]
+                        && (section != "workspaces" || b["name"] == entry["name"])
+                })
+                .collect();
+            if let [(index, before)] = matches.as_slice() {
+                preserve_unknown(&raw[section][*index], before, entry);
+            }
+        }
+    }
+    // A coordinator and its shown child can cross workspace/tab arrays.
+    let before: Vec<_> = known["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(w, workspace)| {
+            workspace["tabs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(move |(t, tab)| (w, t, tab))
+        })
+        .collect();
+    for workspace in next["workspaces"].as_array_mut().into_iter().flatten() {
+        for tab in workspace["tabs"].as_array_mut().into_iter().flatten() {
+            let identity = if tab["session_uid"].is_string() {
+                "session_uid"
+            } else {
+                "chat_session_id"
+            };
+            if !tab[identity].is_string() {
+                continue;
+            }
+            let matches: Vec<_> = before
+                .iter()
+                .filter(|(_, _, b)| b[identity] == tab[identity])
+                .collect();
+            if let [(w, t, before)] = matches.as_slice() {
+                preserve_unknown(&raw["workspaces"][*w]["tabs"][*t], before, tab);
+            }
+        }
     }
 }
 
@@ -792,6 +927,63 @@ mod transaction_tests {
             std::fs::read(root.path().join("workspaces.json")).unwrap(),
             bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod remaining_unknown_fields_tests {
+    use super::*;
+    use crate::workspace_config::{ChatWorkspaceEdit, WorkspaceTarget};
+    use serde_json::json;
+    #[test]
+    fn remaining_workspace_move_keeps_unknown_nested_provider_repo_and_location_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("workspaces.json");
+        let raw = json!({"active_workspace":0,"workspaces":[
+            {"name":"Source","abbrev":"S","dir":"/fixture/source","color":"blue","chats":["root"],"tabs":[{"dir":"/fixture/source","chat_session_id":"root","session_uid":"root-tab","tab_kind":"agent","agent_config":{"backend":"claude","model":"default","future_provider":{"version":2}}}]},
+            {"name":"Target","abbrev":"T","dir":"/fixture/target","color":"green","location":{"kind":"local","root":"/fixture/target","future_location":true},"tabs":[]}
+        ],"repos":[{"dir":"/fixture/source","future_repo":"keep"}]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let initial: WorkspacesFile = serde_json::from_value(raw).unwrap();
+        let target = WorkspaceTarget::of(&initial.workspaces[1]);
+        let store = DesktopStore::open(root.path()).unwrap();
+        let saved = store
+            .try_edit_workspaces(move |file| {
+                file.chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "root".into(),
+                    target,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["workspaces"][1]["tabs"][0]["agent_config"]["future_provider"]["version"],
+            2
+        );
+        assert_eq!(raw["workspaces"][1]["location"]["future_location"], true);
+        assert_eq!(raw["repos"][0]["future_repo"], "keep");
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<WorkspacesFile>(raw).unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        let before = std::fs::read(&path).unwrap();
+        let target = WorkspaceTarget::of(&saved.workspaces[1]);
+        store
+            .try_edit_workspaces(move |file| {
+                file.chat_workspace(ChatWorkspaceEdit::Add {
+                    root: "root".into(),
+                    chat: "root".into(),
+                    target,
+                })
+                .map(|_| ())
+            })
+            .wait()
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }
 
