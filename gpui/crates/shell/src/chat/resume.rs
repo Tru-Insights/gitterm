@@ -56,8 +56,26 @@ impl LiveTab {
         &self,
         file: &mut gitterm_core::workspace_config::WorkspacesFile,
     ) -> Result<()> {
+        let uid = self.tab.session_uid.as_deref();
+        let bound = uid.is_some_and(|uid| {
+            file.workspaces.iter().any(|workspace| {
+                workspace.dir == self.workspace_dir
+                    && workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.session_uid.as_deref() == Some(uid))
+            })
+        });
         let mut matches = file.workspaces.iter_mut().filter(|workspace| {
-            workspace.name == self.workspace_name && workspace.dir == self.workspace_dir
+            workspace.dir == self.workspace_dir
+                && if bound {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.session_uid.as_deref() == uid)
+                } else {
+                    workspace.name == self.workspace_name
+                }
         });
         let workspace = matches
             .next()
@@ -139,6 +157,20 @@ pub(crate) fn tab(cwd: &Path, uid: String, id: Option<String>) -> WorkspaceTabCo
 }
 
 impl ChatPane {
+    pub(crate) fn rebind_live_workspace(
+        &mut self,
+        previous: &WorkspaceConfig,
+        next: &WorkspaceConfig,
+    ) {
+        if let Some(live) = &mut self.live_tab
+            && live.workspace_name == previous.name
+            && live.workspace_dir == previous.dir
+        {
+            live.workspace_name = next.name.clone();
+            live.workspace_dir = next.dir.clone();
+        }
+    }
+
     pub(super) fn init_live_tab(&mut self, cx: &mut Context<Self>) {
         let Some(launch) = &self.deferred_live else {
             return;
@@ -531,6 +563,7 @@ mod tests {
     fn async_history_is_shown_once_claims_before_send_and_requires_explicit_fresh(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let (dir, preview) = super::super::tests::fixture();
         let services = ServiceContext::production(&dir.path().join("live"), "resume-test").unwrap();
@@ -711,6 +744,7 @@ mod tests {
     fn missing_saved_cwd_offers_fresh_in_the_workspace_without_launching(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let (dir, preview) = super::super::tests::fixture();
         let services =

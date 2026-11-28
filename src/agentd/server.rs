@@ -33,7 +33,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Handshake capability of an agent that owns its Claude chats (TRU-152):
 /// streams attach and detach, events carry a seq, `ListClaudeChats`.
-pub const CLAUDE_CHAT_PERSISTENT_CAPABILITY: &str = "claude_chat_persistent";
+pub use gitterm_core::harness::remote_chat::CLAUDE_CHAT_PERSISTENT_CAPABILITY;
 
 /// Handshake capability of an agent serving the phone web app (TRU-151):
 /// `CreatePhonePairing`, `ListPhones`, `RevokePhone`.

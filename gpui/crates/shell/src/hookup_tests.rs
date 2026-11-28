@@ -59,6 +59,7 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 
 #[gpui::test]
 fn session_trigger_opens_picker_and_new_chat_is_native_not_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();
@@ -111,6 +112,7 @@ fn session_trigger_opens_picker_and_new_chat_is_native_not_terminal(cx: &mut Tes
 fn header_and_shortcut_open_same_sheet_with_bottom_terminal_and_chat_facts(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -176,6 +178,7 @@ fn header_and_shortcut_open_same_sheet_with_bottom_terminal_and_chat_facts(
 
 #[gpui::test]
 fn work_outcomes_select_existing_chat_and_other_controls_do_not_mutate(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();
@@ -231,6 +234,7 @@ fn shell_renders_the_iced_components() {
 fn changing_workspace_dismisses_picker_and_unavailable_outcomes_keep_the_iced_label(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();

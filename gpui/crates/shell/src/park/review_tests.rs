@@ -46,6 +46,7 @@ fn fixture(
 fn review_f1_filtered_resume_reconciles_roster_and_reparks_the_right_identity(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let cwd = tempfile::tempdir_in("/private/tmp").unwrap();
     let (root, live, shell, cx) = fixture(
         cx,
@@ -101,6 +102,12 @@ fn review_f1_filtered_resume_reconciles_roster_and_reparks_the_right_identity(
                 pane.session.as_ref().unwrap().session_uid,
                 "terminal-caller"
             );
+            assert!(pane.exited);
+            assert!(matches!(
+                &pane.content,
+                crate::pane::PaneContent::Error(error)
+                    if error == "Restore terminal: Live terminal host is unavailable"
+            ));
             assert_eq!(
                 shell.live_workspace_tabs(state.runtime_uid, cx)[0].extra["future_tab"],
                 "keep"
@@ -130,6 +137,7 @@ fn review_f1_filtered_resume_reconciles_roster_and_reparks_the_right_identity(
 fn review_f2_owner_confirmation_refuses_ambiguous_workspace_without_writing(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let root = tempfile::tempdir_in("/private/tmp").unwrap();
     let path = root.path().join("workspaces.json");
@@ -196,6 +204,7 @@ fn review_f2_owner_confirmation_refuses_ambiguous_workspace_without_writing(
 
 #[gpui::test]
 fn review_f3_park_separates_bottom_cwds_and_excludes_run_panes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let cwd = tempfile::tempdir_in("/private/tmp").unwrap();
     let bottom = cwd.path().join("bottom");
     std::fs::create_dir(&bottom).unwrap();

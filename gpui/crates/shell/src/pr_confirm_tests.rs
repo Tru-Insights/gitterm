@@ -74,6 +74,7 @@ pub(super) fn open_panel(
 
 #[gpui::test]
 fn approve_merge_and_ready_open_iceds_panel_with_its_labels(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, events) = open_panel(cx);
     let before = sidebar.read_with(cx, |s, _| s.error.clone());
 
@@ -149,6 +150,7 @@ fn approve_merge_and_ready_open_iceds_panel_with_its_labels(cx: &mut gpui::TestA
 
 #[gpui::test]
 fn merge_method_defaults_like_iced_and_is_selectable_locally(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, events) = open_panel(cx);
     let root = tempfile::tempdir().unwrap();
     let before = tree_snapshot(root.path());
@@ -199,6 +201,7 @@ fn merge_method_defaults_like_iced_and_is_selectable_locally(cx: &mut gpui::Test
 
 #[gpui::test]
 fn cancel_and_escape_close_the_panel_with_no_other_effect(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, events) = open_panel(cx);
     let notice = sidebar.read_with(cx, |s, _| s.error.clone());
 
@@ -220,6 +223,7 @@ fn cancel_and_escape_close_the_panel_with_no_other_effect(cx: &mut gpui::TestApp
 
 #[gpui::test]
 fn execute_shows_the_preview_notice_and_changes_nothing(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, events) = open_panel(cx);
     let root = tempfile::tempdir().unwrap();
     let before = tree_snapshot(root.path());
@@ -248,6 +252,7 @@ fn execute_shows_the_preview_notice_and_changes_nothing(cx: &mut gpui::TestAppCo
 
 #[gpui::test]
 fn account_line_and_run_gate_follow_iced(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, _) = open_panel(cx);
     sidebar.update(cx, |s, cx| {
         s.pr_accounts = [("example".to_string(), "not a login".to_string())].into();
@@ -285,6 +290,7 @@ fn account_line_and_run_gate_follow_iced(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn disabled_actions_and_direct_notices_do_not_open_the_panel(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (sidebar, cx, events) = open_panel(cx);
     sidebar.update(cx, |s, cx| {
         s.pull_requests[0].prs[1].snapshot.check_runs = vec![gitterm_core::prs::CheckItem {
@@ -316,6 +322,7 @@ fn disabled_actions_and_direct_notices_do_not_open_the_panel(cx: &mut gpui::Test
 
 #[gpui::test]
 fn gh_active_login_decides_own_pr_and_names_the_account(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let has_approve = |s: &WorkSidebar| {
         s.rows()
             .into_iter()

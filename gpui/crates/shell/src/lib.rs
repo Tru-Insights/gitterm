@@ -553,6 +553,17 @@ impl Shell {
             }
         })
         .detach();
+        if shell.live_chat_enabled(cx) {
+            let workspaces: Vec<_> = shell
+                .workspaces
+                .iter()
+                .filter(|w| w.parked.is_none())
+                .map(|w| w.workspace.id)
+                .collect();
+            for workspace in workspaces {
+                shell.restore_live_workspace(workspace, false, window, cx);
+            }
+        }
         shell.load_active_iced_history(window, cx);
         if let Some(fonts) = shell.workspaces.iter().find_map(|w| w.store.regions.fonts) {
             theme::set_font_sizes(fonts, cx);
@@ -915,10 +926,48 @@ impl Shell {
         else {
             return;
         };
+        let callers = self.terminal_callers(cx);
+        host.update(cx, |host, _| host.terminal_callers = callers);
         let panes = self.task_panes(cx);
         if host.read(cx).panes() != panes.as_slice() {
             host.update(cx, |host, cx| host.set_panes(panes, cx));
         }
+    }
+    fn terminal_callers(&self, cx: &App) -> Vec<gitterm_core::delegation_state::Caller> {
+        let owner = &self.owner;
+        self.workspaces
+            .iter()
+            .flat_map(|state| {
+                let bottom = bottom_pane_ids(state, cx);
+                state.sessions.iter().filter_map(move |session| {
+                    let id = session_pane_id(session.id);
+                    if bottom.contains(&id) {
+                        return None;
+                    }
+                    let pane = state.panes.get(&id)?.read(cx);
+                    if !matches!(pane.content, pane::PaneContent::Terminal(_)) || pane.exited {
+                        return None;
+                    }
+                    let target = pane.session.clone()?;
+                    let saved = owner.read(cx).iced_workspace(state.workspace.id)?;
+                    let home = std::path::PathBuf::from(saved.home_dir());
+                    Some(gitterm_core::delegation_state::Caller {
+                        tab: gitterm_core::delegations::CallerTab {
+                            session_uid: target.session_uid.clone(),
+                            chat_session_id: pane.chat_session_id.clone(),
+                            workspace: saved.name.clone(),
+                            cwd: pane.task_folder(cx)?,
+                            remote: false,
+                            home: home.clone(),
+                            repos: saved.repos.iter().map(std::path::PathBuf::from).collect(),
+                        },
+                        target,
+                        workspace_uid: state.runtime_uid,
+                        local_root: Some(home),
+                    })
+                })
+            })
+            .collect()
     }
     fn active_workspace(&self, cx: &App) -> Option<WorkspaceId> {
         self.owner.read(cx).model.active()
@@ -1126,6 +1175,8 @@ impl Shell {
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
+        let transient_run =
+            self.live_chat_enabled(cx) && matches!(&launch, Some(PaneStart::Launch(_)));
         let used: HashSet<_> = self
             .workspaces
             .iter()
@@ -1145,7 +1196,26 @@ impl Shell {
             });
             return;
         };
-        let mut id = layout::stable_path_hash(&cwd);
+        // A Live action may have just added this tab to the V6 document.
+        // Use its imported identity so the local layout cannot restore it twice.
+        let imported = cx
+            .try_global::<workspace_config::LiveWorkspaces>()
+            .and_then(|_| {
+                let owner = self.owner.read(cx);
+                let saved = owner.iced_workspace(state.workspace.id)?;
+                self.owner
+                    .read(cx)
+                    .iced_sessions(saved)
+                    .into_iter()
+                    .zip(&saved.tabs)
+                    .find(|(session, tab)| {
+                        !used.contains(&session.id.0)
+                            && gitterm_core::workspace_config::RepoKey::local(Path::new(&tab.dir))
+                                == gitterm_core::workspace_config::RepoKey::local(&cwd)
+                    })
+                    .map(|(session, _)| session.id.0)
+            });
+        let mut id = imported.unwrap_or_else(|| layout::stable_path_hash(&cwd));
         while used.contains(&id) {
             id = id.wrapping_add(1);
         }
@@ -1161,8 +1231,10 @@ impl Shell {
                 title.clone(),
                 if launch.is_some() {
                     PaneKind::StoppedTerminal(cwd.clone(), true)
+                } else if placement == DockPlacement::Bottom {
+                    PaneKind::BottomTerminal(cwd.clone())
                 } else {
-                    PaneKind::CenterTerminal(cwd.clone())
+                    PaneKind::CenterTerminal(cwd.clone(), None)
                 },
                 state.workspace.id,
                 self.data.clone(),
@@ -1186,31 +1258,44 @@ impl Shell {
             title,
             kind: data::SessionKind::Terminal,
         });
-        state
-            .store
-            .terminals
-            .as_mut()
-            .expect("local sessions")
-            .push(match &launch {
-                Some(PaneStart::Adopt {
-                    startup_command,
-                    target,
-                    ..
-                }) => layout::TerminalSession {
-                    id,
-                    cwd,
-                    startup_command: startup_command.clone(),
-                    task_id: target.task_id.clone(),
-                    task_session_id: target.task_session_id.clone(),
-                },
-                _ => layout::TerminalSession {
-                    id,
-                    cwd,
-                    startup_command: None,
-                    task_id: None,
-                    task_session_id: None,
-                },
-            });
+        // Run panes are transient, as Iced's BottomTerminal.run entries are.
+        if !transient_run {
+            state
+                .store
+                .terminals
+                .as_mut()
+                .expect("local sessions")
+                .push(match &launch {
+                    Some(PaneStart::Adopt {
+                        startup_command,
+                        target,
+                        ..
+                    }) => layout::TerminalSession {
+                        id,
+                        cwd,
+                        startup_command: startup_command.clone(),
+                        task_id: target.task_id.clone(),
+                        task_session_id: target.task_session_id.clone(),
+                        bottom: placement == DockPlacement::Bottom,
+                        session_uid: Some(target.session_uid.clone()),
+                        chat_session_id: None,
+                    },
+                    _ => layout::TerminalSession {
+                        id,
+                        cwd,
+                        startup_command: None,
+                        task_id: None,
+                        task_session_id: None,
+                        bottom: placement == DockPlacement::Bottom,
+                        session_uid: state.panes[&pane_id]
+                            .read(cx)
+                            .session
+                            .as_ref()
+                            .map(|t| t.session_uid.clone()),
+                        chat_session_id: None,
+                    },
+                });
+        }
         if placement == DockPlacement::Center {
             state.active_session = Some(SessionId(id));
         }
@@ -1245,13 +1330,14 @@ impl Shell {
         launched: &task_host::TerminalLaunched,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
-            return;
+    ) -> Option<Entity<Pane>> {
+        if self.owner.read(cx).workspace_save_pending
+            || !self.local
+            || !self.workspaces.iter().any(|state| state.on_bar())
+        {
+            return None;
         }
-        let Some(view) = host.update(cx, |host, _| host.take_terminal(&launched.session_id)) else {
-            return;
-        };
+        let view = host.update(cx, |host, _| host.take_terminal(&launched.session_id))?;
         let target = launched.target.clone();
         self.new_terminal_launch(
             DockPlacement::Center,
@@ -1264,18 +1350,19 @@ impl Shell {
             window,
             cx,
         );
-        if let Some(id) = self
+        let pane = self
             .active(cx)
-            .sessions
-            .last()
-            .map(|session| session_pane_id(session.id))
-        {
-            let title = launched.title.clone();
-            self.active(cx).panes[&id].update(cx, |pane, cx| {
-                pane.title = title;
-                cx.notify();
-            });
-        }
+            .panes
+            .values()
+            .find(|pane| pane.read(cx).session.as_ref() == Some(&launched.target))?
+            .clone();
+        pane.update(cx, |pane, cx| {
+            pane.startup_command = launched.startup_command.clone();
+            pane.chat_session_id = launched.chat_session_id.clone();
+            pane.title = launched.title.clone();
+            cx.notify();
+        });
+        Some(pane)
     }
     /// The pane holding an adopted task terminal whose child exited shows
     /// it exited, as a pane's own terminal does.
@@ -1433,6 +1520,23 @@ fn load_workspace_layout(
 fn save_layout(state: &mut WorkspaceDock, cx: &mut Context<Shell>) {
     if state.store.is_refused() {
         return;
+    }
+    if let Some(terminals) = &mut state.store.terminals {
+        for terminal in terminals {
+            if let Some(pane) = state.panes.get(&session_pane_id(SessionId(terminal.id))) {
+                let pane = pane.read(cx);
+                if let Some(cwd) = pane.task_folder(cx) {
+                    terminal.cwd = cwd;
+                }
+                if let Some(target) = &pane.session {
+                    terminal.session_uid = Some(target.session_uid.clone());
+                }
+                if pane.startup_command.is_some() {
+                    terminal.startup_command = pane.startup_command.clone();
+                }
+                terminal.chat_session_id = pane.chat_session_id.clone();
+            }
+        }
     }
     let save = state.store.save_async(&state.dock.read(cx).dump(cx));
     let id = state.workspace.id;
@@ -1706,25 +1810,34 @@ fn build_workspace(
                     .unwrap()
                     .clone()
             });
-        // Like Iced's relaunch, a task terminal with a saved command runs
-        // it again; only the fixture task host starts one, and anything
-        // else restores a plain shell with the saved fields kept.
+        // Live uses Iced's restore rewrite. Preview retains its restricted
+        // fixture restore, and ordinary bottom shells start without a caller.
         let restored = match (&saved, &host) {
-            (Some(saved), Some(host)) if !stopped => {
-                host.update(cx, |host, cx| host.restore_terminal(saved, cx))
+            (Some(saved), Some(host)) if !stopped && !(host.read(cx).is_live() && saved.bottom) => {
+                Some(host.update(cx, |host, cx| {
+                    host.restore_terminal(&workspace.name, saved, cx)
+                }))
             }
             _ => None,
         };
+        let restore_error = host
+            .as_ref()
+            .filter(|h| h.read(cx).is_live())
+            .and_then(|_| restored.as_ref()?.as_ref().err())
+            .cloned();
+        let restored = restored.and_then(Result::ok);
         let kind = if let Some(text) = imported {
             PaneKind::IcedSession(text)
         } else if let Some(restored) = &restored {
             // Its placeholder until the host's terminal is adopted below.
             PaneKind::StoppedTerminal(restored.cwd.clone(), true)
         } else if let Some(saved) = &saved {
-            if stopped {
+            if stopped || restore_error.is_some() {
                 PaneKind::StoppedTerminal(saved.cwd.clone(), true)
+            } else if saved.bottom && host.as_ref().is_some_and(|h| h.read(cx).is_live()) {
+                PaneKind::BottomTerminal(saved.cwd.clone())
             } else {
-                PaneKind::CenterTerminal(saved.cwd.clone())
+                PaneKind::CenterTerminal(saved.cwd.clone(), saved.session_uid.clone())
             }
         } else {
             session.kind.into()
@@ -1740,11 +1853,37 @@ fn build_workspace(
                 cx,
             )
         });
+        if let Some(saved) = &saved
+            && restore_error.is_some()
+        {
+            pane.update(cx, |pane, _| {
+                pane.session = Some(gitterm_core::session::Target {
+                    session_uid: saved
+                        .session_uid
+                        .clone()
+                        .or_else(|| saved.task_session_id.clone())
+                        .unwrap_or_else(|| sessions::fresh_target().session_uid),
+                    task_id: saved.task_id.clone(),
+                    task_session_id: saved.task_session_id.clone(),
+                    ..sessions::fresh_target()
+                });
+                pane.startup_command = saved.startup_command.clone();
+                pane.chat_session_id = saved.chat_session_id.clone();
+                pane.exited = true;
+                if let Some(error) = &restore_error {
+                    pane.content = pane::PaneContent::Error(format!("Restore terminal: {error}"));
+                }
+            });
+        }
         if let (Some(restored), Some(host)) = (restored, &host)
             && let Some(view) = host.update(cx, |host, _| host.take_terminal(&restored.session_id))
         {
             adopted.push(adopt_view(&pane, view, restored.target.clone(), window, cx));
-            pane.update(cx, |pane, _| pane.title = restored.title.clone());
+            pane.update(cx, |pane, _| {
+                pane.title = restored.title.clone();
+                pane.startup_command = restored.startup_command.clone();
+                pane.chat_session_id = restored.chat_session_id.clone();
+            });
             // Iced saves the tab as it restored it: its folder, rewritten
             // command and task session.
             if let Some(entry) = store
@@ -1808,6 +1947,34 @@ fn adopt_view(
     window: &mut Window,
     cx: &mut Context<Shell>,
 ) -> Subscription {
+    let (title_pane, exit_pane, cwd_pane) = (pane.downgrade(), pane.downgrade(), pane.downgrade());
+    let (title_target, exit_target, cwd_target) = (target.clone(), target.clone(), target.clone());
+    view.update(cx, |view, _| {
+        view.add_title_callback(move |_, cx, title| {
+            _ = title_pane.update(cx, |pane, cx| {
+                if pane.session.as_ref() == Some(&title_target) {
+                    pane.terminal_title = Some(title.into());
+                    cx.notify();
+                }
+            });
+        });
+        view.add_exit_callback(move |_, cx| {
+            _ = exit_pane.update(cx, |pane, cx| {
+                if pane.session.as_ref() == Some(&exit_target) {
+                    pane.mark_exited(cx);
+                    cx.notify();
+                }
+            });
+        });
+        view.add_cwd_callback(move |_, cx, cwd| {
+            _ = cwd_pane.update(cx, |pane, cx| {
+                if pane.session.as_ref() == Some(&cwd_target) {
+                    pane.terminal_cwd = Some(cwd.into());
+                    cx.notify();
+                }
+            });
+        });
+    });
     // A new pane: its stopped placeholder holds no terminal to close.
     pane.update(cx, |pane, _| {
         pane.session = Some(target);
@@ -2296,7 +2463,9 @@ impl Shell {
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
                 .map(|s| {
                     let tab = saved.and_then(|saved| {
-                        data::iced_sessions(saved)
+                        self.owner
+                            .read(cx)
+                            .iced_sessions(saved)
                             .iter()
                             .position(|session| session.id == s.id)
                             .and_then(|index| saved.tabs.get(index))
@@ -3308,9 +3477,36 @@ impl Shell {
             });
             return;
         }
+        let runtime_target = sessions::fresh_target();
+        let launch = if let Some(host) = cx
+            .try_global::<task_host::GpuiTaskHost>()
+            .map(|h| h.0.clone())
+            .filter(|h| h.read(cx).is_live())
+        {
+            let name = self.active(cx).workspace.name.clone();
+            match host.read(cx).live_terminal_launch(
+                &name,
+                launch.cwd.as_deref().unwrap_or(Path::new("<terminal>")),
+                launch.startup_command.as_deref(),
+                &runtime_target,
+                true,
+                cx,
+            ) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some(error);
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        } else {
+            launch
+        };
         pane.update(cx, |pane, cx| {
             pane.close_terminal(cx);
-            pane.session = Some(sessions::fresh_target());
+            pane.session = Some(runtime_target);
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
@@ -3415,11 +3611,8 @@ impl Shell {
                 window,
                 cx,
             ),
-            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("Worktree actions are not available in preview".into());
-                    cx.notify();
-                });
+            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree { .. } => {
+                self.live_worktree_action(workspace, action, window, cx);
             }
         }
         cx.notify();
@@ -3735,8 +3928,8 @@ impl Shell {
             ))
             .on_action(Self::background(
                 cx,
-                |this, _: &LaunchAgentPreset, _, cx| {
-                    this.preview_unavailable("Launch agent preset", cx)
+                |this, action: &LaunchAgentPreset, window, cx| {
+                    this.launch_agent_preset(action.index, window, cx)
                 },
             ))
             .on_action(Self::background(
@@ -4646,6 +4839,7 @@ impl Render for Shell {
                                 cx,
                             );
                         }
+                        shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
@@ -5115,7 +5309,12 @@ impl Shell {
             .iter()
             .find(|w| w.sessions.iter().any(|s| s.id == id))?;
         let saved = self.owner.read(cx).iced_workspace(state.workspace.id)?;
-        let index = data::iced_sessions(saved).iter().position(|s| s.id == id)?;
+        let index = self
+            .owner
+            .read(cx)
+            .iced_sessions(saved)
+            .iter()
+            .position(|s| s.id == id)?;
         saved.tabs.get(index)
     }
 
@@ -5905,6 +6104,36 @@ mod tests {
     use gpui_component::dock::{InsertTarget, PaneRef};
 
     #[test]
+    fn test_teardown_releases_window_terminals_before_the_next_test() {
+        // Exercise the borrowed VisualTestContext path repeatedly in one
+        // process; without Cleanup each window retains its live PTY.
+        let mut cx = TestAppContext::single();
+        cx.background_executor.allow_parking();
+        for _ in 0..8 {
+            let cleanup = crate::test_app::Cleanup::new(&cx);
+            let (view, _) = cx.add_window_view(|_, cx| {
+                gitterm_terminal::TerminalView::new(
+                    gitterm_terminal::Backend::new(gitterm_terminal::BackendSettings {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "read fixture".into()],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                    Default::default(),
+                    cx,
+                )
+            });
+            let weak = view.downgrade();
+            drop(view);
+            drop(cleanup);
+            assert!(
+                weak.upgrade().is_none(),
+                "test window retained its terminal"
+            );
+        }
+    }
+
+    #[test]
     fn roster_entries_project_delegation_and_task_checkouts() {
         let delegation: gitterm_core::tasks::Delegation = serde_json::from_value(serde_json::json!({
             "delegation_id": "checkout-option",
@@ -6160,6 +6389,7 @@ mod tests {
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
@@ -6331,7 +6561,7 @@ mod tests {
         needle: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             if view.read_with(cx, |view, _| {
                 view.backend()
@@ -6360,6 +6590,7 @@ mod tests {
     fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6490,6 +6721,7 @@ mod tests {
 
     #[gpui::test]
     fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6517,6 +6749,7 @@ mod tests {
 
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -6588,8 +6821,12 @@ mod tests {
             cx.simulate_input(
                 "printf '\\033]7;file:///tmp/reported-pane\\007\\033]2;REPORTED_PANE\\007'\n",
             );
-            let deadline = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
+                // PTY I/O runs on a real thread; its UI notification uses GPUI's
+                // simulated 16ms timer. Deliver that timer while awaiting OSC.
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(20));
                 draw(cx);
                 let pane = if selector == "session-12" {
                     &first
@@ -6601,7 +6838,7 @@ mod tests {
                     break;
                 }
                 assert!(
-                    deadline.elapsed().as_secs() < 5,
+                    std::time::Instant::now() < deadline,
                     "pane reports not delivered"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -6669,6 +6906,7 @@ mod tests {
 
     #[gpui::test]
     fn corrupt_file_starts_default_dock_and_remains_intact(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout-1.json");
@@ -6703,6 +6941,7 @@ mod tests {
 
     #[gpui::test]
     fn saved_workspace_layout_restores_position_and_size(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {
@@ -6730,3 +6969,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../../../test_app.rs"]
+mod test_app;

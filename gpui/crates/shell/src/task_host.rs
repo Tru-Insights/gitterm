@@ -287,6 +287,7 @@ pub(crate) struct TaskHostOwner {
     host: TaskHost,
     /// The shell's panes holding task sessions, as last pushed.
     panes: Vec<TaskPane>,
+    pub(crate) terminal_callers: Vec<gitterm_core::delegation_state::Caller>,
     /// Iced's steady-state tab label for each pane folder: `None` while its
     /// background read runs. Held only while a pane has the folder.
     pub(crate) folder_labels: std::collections::HashMap<PathBuf, Option<String>>,
@@ -325,6 +326,9 @@ pub(crate) struct TaskHostOwner {
     pub(crate) delegation_waiting_counts: std::collections::HashMap<String, usize>,
     /// Launched terminals no pane has adopted yet, by task session.
     terminals: std::collections::HashMap<String, launch::HostTerminal>,
+    /// Conversation ownership includes terminals already adopted by a pane.
+    terminal_conversations:
+        std::collections::HashMap<String, gpui::WeakEntity<gitterm_terminal::TerminalView>>,
     /// Every launched task session, adopted or not.
     launched: std::collections::HashMap<String, launch::Launched>,
     /// Runs on a prepared worktree path before its post-preparation recheck.
@@ -649,6 +653,7 @@ impl TaskHostOwner {
             Self {
                 host,
                 panes: Vec::new(),
+                terminal_callers: Vec::new(),
                 folder_labels: std::collections::HashMap::new(),
                 roots,
                 plan_limits: live
@@ -676,6 +681,7 @@ impl TaskHostOwner {
                 own_tasks,
                 delegation_waiting_counts: Default::default(),
                 terminals: Default::default(),
+                terminal_conversations: Default::default(),
                 launched: Default::default(),
                 #[cfg(test)]
                 before_recheck: None,
@@ -2037,6 +2043,7 @@ mod live_tests {
     use super::*;
     #[gpui::test]
     fn live_uses_direct_store_shared_namespace_and_no_fixture_jobs(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();

@@ -495,6 +495,7 @@ mod tests {
     // No native window or network: GPUI's in-memory test platform.
     #[gpui::test]
     fn live_connect_round_trip_validation_redaction_and_preview_gate(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let temp = tempfile::tempdir_in("/private/tmp").unwrap();

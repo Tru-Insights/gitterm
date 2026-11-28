@@ -89,6 +89,7 @@ fn terminal(shell: &Shell, workspace: usize, cx: &App) -> Entity<gitterm_termina
 
 #[gpui::test]
 fn create_park_keep_resume_stop_close_and_stale_targets(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();
@@ -194,6 +195,7 @@ fn create_park_keep_resume_stop_close_and_stale_targets(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn restart_is_stopped_and_resume_never_replays_commands(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();
@@ -298,6 +300,7 @@ fn invalid_park_files_are_rejected_without_rewriting() {
 
 #[gpui::test]
 fn terminal_exit_wakes_parked_workspace_without_changing_selection(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();
@@ -337,6 +340,7 @@ fn terminal_exit_wakes_parked_workspace_without_changing_selection(cx: &mut Test
 
 #[gpui::test]
 fn delayed_dock_close_never_stops_a_resumed_replacement(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();

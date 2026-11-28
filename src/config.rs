@@ -2001,3 +2001,129 @@ impl RemoteAgentsFileStore for RemoteAgentsFile {
 #[cfg(test)]
 #[path = "../tests/support/settings_characterization.rs"]
 mod settings_characterization;
+
+#[cfg(test)]
+mod repo_action_compatibility {
+    use super::*;
+    use gitterm_core::{
+        desktop_store::DesktopStore,
+        workspace_config::{RepoEdit, WorkspaceTarget},
+    };
+
+    #[test]
+    fn iced_reads_live_repo_edits_with_identical_bytes_and_writes_them_back() {
+        if std::env::var_os("GITTERM_ICED_REPO_COMPAT_CHILD").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().canonicalize().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::repo_action_compatibility::iced_reads_live_repo_edits_with_identical_bytes_and_writes_them_back", "--nocapture"])
+                .env("HOME", &home).env("GITTERM_V6_CONFIG_DIR", home.join("v6"))
+                .env("GITTERM_ICED_REPO_COMPAT_CHILD", "1").env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = global_config_dir();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(root.is_absolute() && root.starts_with(&home));
+        let main = home.join("repo");
+        let extra = home.join("extra");
+        for dir in [&main, &extra] {
+            std::fs::create_dir_all(dir).unwrap();
+            git2::Repository::init(dir).unwrap();
+        }
+        let mut iced: WorkspacesFile = serde_json::from_value(serde_json::json!({
+            "active_workspace":0, "workspaces":[
+                {"name":"Original","abbrev":"O","dir":main,"color":"blue","tabs":[],"env":{"ONE":"retained"}},
+                {"name":"Closed","abbrev":"C","dir":home.join("closed"),"color":"red","tabs":[],"active":false}
+            ]
+        })).unwrap();
+        iced.normalize_repos();
+        iced.save_for_shutdown().unwrap();
+        let store = DesktopStore::open(&root).unwrap();
+        let apply = |iced: &WorkspacesFile, action: RepoEdit| {
+            let core: gitterm_core::workspace_config::WorkspacesFile =
+                serde_json::from_value(serde_json::to_value(iced).unwrap()).unwrap();
+            let target = WorkspaceTarget::of(&core.workspaces[0]);
+            store
+                .try_edit_workspaces(move |file| file.edit_repo(&target, action))
+                .wait()
+                .unwrap();
+        };
+        let assert_bytes = |expected: &WorkspacesFile| {
+            let bytes = std::fs::read(WorkspacesFile::file_path()).unwrap();
+            // The actual Iced consumer, including its restore normalization.
+            let loaded = WorkspacesFile::load_normalized().unwrap();
+            assert_eq!(serde_json::to_vec_pretty(expected).unwrap(), bytes);
+            assert_eq!(serde_json::to_vec_pretty(&loaded).unwrap(), bytes);
+            loaded.save_for_shutdown().unwrap();
+            assert_eq!(std::fs::read(WorkspacesFile::file_path()).unwrap(), bytes);
+        };
+        apply(&iced, RepoEdit::Rename("  Renamed  ".into()));
+        iced.workspaces[0].name = "Renamed".into();
+        assert_bytes(&iced);
+        apply(
+            &iced,
+            RepoEdit::Add {
+                dir: extra.clone(),
+                detected_command: Some("cargo run".into()),
+            },
+        );
+        iced.workspaces[0]
+            .repos
+            .push(extra.to_string_lossy().into_owned());
+        iced.workspaces[0]
+            .repos_added
+            .push(extra.to_string_lossy().into_owned());
+        iced.repos.insert(
+            1,
+            RepoConfig {
+                dir: extra.to_string_lossy().into_owned(),
+                location: None,
+                run_command: Some("cargo run".into()),
+                env: HashMap::new(),
+                bottom_terminals: vec![],
+            },
+        );
+        assert_bytes(&iced);
+        apply(
+            &iced,
+            RepoEdit::RunCommand {
+                dir: main.clone(),
+                draft: " npm run dev ".into(),
+            },
+        );
+        iced.repos[0].run_command = Some("npm run dev".into());
+        iced.workspaces[0].run_command = Some("npm run dev".into());
+        assert_bytes(&iced);
+        apply(&iced, RepoEdit::Remove(vec![extra.clone()]));
+        iced.workspaces[0].repos.retain(|d| Path::new(d) != extra);
+        iced.workspaces[0].repos_added.clear();
+        iced.workspaces[0]
+            .repos_removed
+            .push(extra.to_string_lossy().into_owned());
+        iced.repos.retain(|r| Path::new(&r.dir) != extra);
+        assert_bytes(&iced);
+        // Iced writes its own edit; a fresh GPUI owner reads that exact command.
+        drop(store);
+        iced.repos[0].run_command = Some("cargo test".into());
+        iced.workspaces[0].run_command = Some("cargo test".into());
+        iced.save_for_shutdown().unwrap();
+        let store = DesktopStore::open(&root).unwrap();
+        let gitterm_core::desktop_store::LoadState::Valid(file) =
+            store.snapshot().wait().unwrap().workspaces.loaded
+        else {
+            panic!("GPUI reads Iced")
+        };
+        assert_eq!(file.repos[0].run_command.as_deref(), Some("cargo test"));
+        let before = std::fs::read(WorkspacesFile::file_path()).unwrap();
+        store.drain().wait().unwrap();
+        assert_eq!(std::fs::read(WorkspacesFile::file_path()).unwrap(), before);
+    }
+}

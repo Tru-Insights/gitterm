@@ -59,6 +59,7 @@ fn emit(shell: &Entity<Shell>, outcome: bottom_panel::Outcome, cx: &mut VisualTe
 
 #[gpui::test]
 fn explicit_bottom_toggle_add_select_last_close_and_restore(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let source = root.path().join("iced");
     let before =
@@ -175,6 +176,7 @@ fn explicit_bottom_toggle_add_select_last_close_and_restore(cx: &mut TestAppCont
 
 #[gpui::test]
 fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let source = root.path().join("iced");
     let before = std::fs::read(source.join("workspaces.json")).unwrap();
@@ -210,7 +212,10 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
     for action in [
         pane::git_view::GitAction::OpenWorktree(root.path().join("MUST NOT CREATE")),
         pane::git_view::GitAction::AdoptWorktree(root.path().join("MUST NOT CREATE")),
-        pane::git_view::GitAction::RemoveWorktree(root.path().join("work")),
+        pane::git_view::GitAction::RemoveWorktree {
+            path: root.path().join("work"),
+            force: false,
+        },
     ] {
         git.update(cx, |_, cx| cx.emit(action));
         draw(cx);
@@ -240,6 +245,7 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
 
 #[gpui::test]
 fn work_mode_has_no_git_header_and_git_requires_entry(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     assert!(cx.debug_bounds("work-sidebar").is_some());
     assert!(cx.debug_bounds("git-back-work").is_none());

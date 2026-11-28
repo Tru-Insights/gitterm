@@ -45,6 +45,7 @@ const MONO: &str = "Menlo";
 pub enum Outcome {
     Close,
     EditGuidelines,
+    Rename(String),
     /// A control that would write; the label names it for the notice.
     Unavailable(String),
 }
@@ -167,6 +168,7 @@ fn load_profiles(config_dir: &Path, env: &HashMap<String, String>) -> Option<Vec
 }
 
 pub struct WorkspaceSettingsSheet {
+    pub(crate) workspace_id: Option<crate::WorkspaceId>,
     model: SheetModel,
     focus: FocusHandle,
     key: Entity<InputState>,
@@ -210,6 +212,7 @@ impl WorkspaceSettingsSheet {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         Self {
+            workspace_id: None,
             model,
             focus,
             key,
@@ -222,6 +225,10 @@ impl WorkspaceSettingsSheet {
 
     pub fn model(&self) -> &SheetModel {
         &self.model
+    }
+    pub(crate) fn saved_name(&mut self, name: String, cx: &mut Context<Self>) {
+        self.model.name = name;
+        cx.notify();
     }
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
@@ -242,11 +249,19 @@ impl WorkspaceSettingsSheet {
             input.focus(window, cx);
             input
         });
-        let sub = cx.subscribe(&input, |this, _, event, cx| {
+        let sub = cx.subscribe(&input, |this, input, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                // Submitting would write; the name stays.
+                let draft = input.read(cx).value().to_string();
                 this.rename = None;
-                this.unavailable("Rename", cx);
+                if cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some()
+                {
+                    cx.emit(Outcome::Rename(draft));
+                    cx.notify();
+                } else {
+                    this.unavailable("Rename", cx);
+                }
             }
         });
         self._subscriptions.push(sub);
@@ -684,7 +699,11 @@ impl crate::Shell {
         self.new_work_sheet = None;
         self.new_work_subscription = None;
         self.bar_menu = None;
-        let sheet = cx.new(|cx| WorkspaceSettingsSheet::new(model, window, cx));
+        let sheet = cx.new(|cx| {
+            let mut sheet = WorkspaceSettingsSheet::new(model, window, cx);
+            sheet.workspace_id = Some(id);
+            sheet
+        });
         self.settings_subscription = Some(cx.subscribe_in(
             &sheet,
             window,
@@ -694,6 +713,14 @@ impl crate::Shell {
                     previous_focus.focus(window, cx);
                 }
                 Outcome::Unavailable(label) => shell.chrome_unavailable(label, cx),
+                Outcome::Rename(name) => shell.repo_outcome(
+                    &crate::work_sidebar::WorkSidebarOutcome::Rename {
+                        workspace: id.0,
+                        name: name.clone(),
+                    },
+                    window,
+                    cx,
+                ),
                 Outcome::EditGuidelines => shell.edit_guidelines(id, window, cx),
             },
         ));
