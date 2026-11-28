@@ -439,6 +439,15 @@ impl Shell {
             return;
         }
         let Some(host) = host(cx) else {
+            if !crate::chat::policy::is_live(cx) {
+                let label = if action == BrowserAction::Focus {
+                    "Focus browser"
+                } else {
+                    "Open browser"
+                };
+                self.chrome_unavailable(label, cx);
+                return;
+            }
             self.owner.update(cx, |owner, cx| {
                 owner.error = Some("Managed browser controls are unavailable".into());
                 cx.notify();
