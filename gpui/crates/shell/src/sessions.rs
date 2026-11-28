@@ -948,6 +948,7 @@ impl crate::Shell {
                         session.title = title.clone();
                         pane.update(cx, |pane, cx| {
                             pane.title = title.clone();
+                            pane.notification_chat_title = Some(title.clone());
                             cx.notify();
                         });
                     }
