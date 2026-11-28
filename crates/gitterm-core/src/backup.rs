@@ -2,9 +2,16 @@
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::{CStr, CString},
     fs,
     io::{self, Read, Write},
+    ops::ControlFlow,
+    os::{
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub const MANIFEST: &str = "manifest.json";
@@ -74,14 +81,53 @@ fn private_file(path: &Path) -> io::Result<fs::File> {
     options.open(path)
 }
 fn sync_dir(path: &Path) -> io::Result<()> {
-    fs::File::open(path)?.sync_all()
+    sync_file(&fs::File::open(path)?)?;
+    #[cfg(test)]
+    trace_durability("directory-sync", path);
+    Ok(())
+}
+fn full_sync(path: &Path) -> io::Result<()> {
+    read_regular(path)?.sync_all()?;
+    #[cfg(test)]
+    trace_durability("full-sync", path);
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static DURABILITY_TRACE: std::cell::RefCell<Option<Vec<(&'static str, PathBuf)>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn trace_durability(operation: &'static str, path: &Path) {
+    DURABILITY_TRACE.with_borrow_mut(|trace| {
+        if let Some(trace) = trace {
+            trace.push((operation, path.to_owned()));
+        }
+    });
+}
+fn sync_file(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Rust's sync_all uses F_FULLFSYNC on macOS. Flush the drive cache once,
+    // after verification, rather than once for every snapshot and directory.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = private_file(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    #[cfg(test)]
+    trace_durability("write", path);
+    sync_file(&file)?;
+    #[cfg(test)]
+    trace_durability("file-sync", path);
+    Ok(())
 }
-fn hash(file: &mut fs::File) -> io::Result<(u64, String)> {
+fn transfer(
+    file: &mut fs::File,
+    mut target: Option<&mut fs::File>,
+    mut chunk: impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<(u64, String)> {
     let mut context = Context::new(&SHA256);
     let mut size = 0;
     let mut buffer = [0; 65536];
@@ -90,8 +136,12 @@ fn hash(file: &mut fs::File) -> io::Result<(u64, String)> {
         if count == 0 {
             break;
         }
+        if let Some(target) = target.as_mut() {
+            target.write_all(&buffer[..count])?;
+        }
         size += count as u64;
         context.update(&buffer[..count]);
+        chunk(count as u64)?;
     }
     Ok((
         size,
@@ -146,13 +196,174 @@ fn directory_identity(meta: &fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
 }
+// Keep the original parent open across backup creation and admission. Cleanup
+// may inspect paths to fail closed, but every deletion is relative to these fds.
+#[derive(Debug)]
+pub struct CreatedBackup {
+    destination: PathBuf,
+    parent: fs::File,
+    // Pin the inode so removing/replacing the directory cannot recycle its id.
+    _directory: fs::File,
+    identity: (u64, u64),
+}
+impl CreatedBackup {
+    pub fn path(&self) -> &Path {
+        &self.destination
+    }
+
+    pub fn remove(self) -> io::Result<()> {
+        let parent_path = self.destination.parent().unwrap();
+        let parent_meta = fs::symlink_metadata(parent_path)?;
+        if !parent_meta.is_dir()
+            || directory_identity(&parent_meta) != directory_identity(&self.parent.metadata()?)
+        {
+            return Err(invalid(
+                "backup parent identity changed; leaving backup in place",
+            ));
+        }
+        let name = CString::new(self.destination.file_name().unwrap().as_bytes())?;
+        remove_directory_at(&self.parent, &name, self.identity)
+    }
+}
+fn open_directory_at(parent: &fs::File, name: &CStr) -> io::Result<fs::File> {
+    // name is one NUL-terminated component, and the returned fd is owned here.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+fn stat_at(parent: &fs::File, name: &CStr) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::uninit();
+    // Do not follow a replacement symlink, even at the final component.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+fn stat_identity(stat: &libc::stat) -> (u64, u64) {
+    #[allow(clippy::unnecessary_cast)] // Unix stat widths differ.
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+fn check_identity(parent: &fs::File, name: &CStr, identity: (u64, u64)) -> io::Result<libc::stat> {
+    let stat = stat_at(parent, name)?;
+    if stat_identity(&stat) != identity {
+        return Err(invalid(
+            "backup entry identity changed; leaving it in place",
+        ));
+    }
+    Ok(stat)
+}
+fn directory_names(directory: fs::File) -> io::Result<Vec<CString>> {
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let fd = directory.into_raw_fd();
+    // fdopendir takes ownership only on success; Stream closes it on all exits.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        drop(unsafe { fs::File::from_raw_fd(fd) });
+        return Err(error);
+    }
+    let stream = Stream(stream);
+    let mut names = vec![];
+    loop {
+        // readdir reports end-of-stream with a null pointer and unchanged errno.
+        #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "hurd",
+            target_os = "emscripten",
+            target_os = "dragonfly"
+        ))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+        unsafe {
+            *libc::__errno() = 0;
+        }
+        #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+        unsafe {
+            *libc::___errno() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error);
+            }
+            break;
+        }
+        // Copy the name before the next readdir invalidates its storage.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+fn remove_directory_at(parent: &fs::File, name: &CStr, identity: (u64, u64)) -> io::Result<()> {
+    check_identity(parent, name, identity)?;
+    let directory = open_directory_at(parent, name)?;
+    if directory_identity(&directory.metadata()?) != identity {
+        return Err(invalid(
+            "backup directory identity changed; leaving it in place",
+        ));
+    }
+    // Open "." rather than dup: the enumerator must have its own directory offset.
+    let names = directory_names(open_directory_at(&directory, c".")?)?;
+    for child in names {
+        let stat = stat_at(&directory, &child)?;
+        let identity = stat_identity(&stat);
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            remove_directory_at(&directory, &child, identity)?;
+        } else {
+            check_identity(&directory, &child, identity)?;
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), child.as_ptr(), 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    check_identity(parent, name, identity)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn scan(
     root: &Path,
     relative: &Path,
     browser_released: bool,
     worktrees: &[(u64, u64)],
     entries: &mut Vec<Entry>,
+    progress: &mut Progress<impl FnMut(u64, u64, u64, u64) -> ControlFlow<()>>,
 ) -> io::Result<()> {
+    progress.report(false)?;
     let path = root.join(relative);
     let meta = fs::symlink_metadata(&path)?;
     let name = relative.file_name().unwrap().to_string_lossy();
@@ -180,12 +391,15 @@ fn scan(
                 browser_released,
                 worktrees,
                 entries,
+                progress,
             )?;
         }
         Kind::Directory
     } else if meta.is_file() {
-        let (size, sha256) = hash(&mut read_regular(&path)?)?;
-        Kind::File { size, sha256 }
+        Kind::File {
+            size: meta.len(),
+            sha256: String::new(),
+        }
     } else {
         Kind::Skipped {
             reason: "socket or other special file".into(),
@@ -214,16 +428,77 @@ fn available(path: &Path) -> io::Result<u64> {
 }
 
 /// `parent` must already exist, outside the source root. Nothing in the source
-/// is created, normalized or rewritten. Failure leaves an incomplete backup.
+/// is created, normalized or rewritten. Failed and cancelled copies are removed.
 pub fn create(root: &Path, parent: &Path, browser_released: bool) -> io::Result<PathBuf> {
-    create_with(root, parent, browser_released, |_| Ok(()))
+    create_with_progress(root, parent, browser_released, |_, _, _, _| {
+        ControlFlow::Continue(())
+    })
+    .map(|backup| backup.destination)
+}
+
+/// Report copied regular files and bytes, at most every 100 ms apart from the
+/// initial/plan/final reports. Return Break to cancel. Totals come from metadata and
+/// are adjusted if a source changes size while it is copied. The returned handle
+/// retains the original parent and identity for safe cancellation cleanup.
+pub fn create_with_progress(
+    root: &Path,
+    parent: &Path,
+    browser_released: bool,
+    progress: impl FnMut(u64, u64, u64, u64) -> ControlFlow<()>,
+) -> io::Result<CreatedBackup> {
+    create_with(root, parent, browser_released, progress, |_| Ok(()))
+}
+
+struct Progress<F> {
+    callback: F,
+    last: Option<Instant>,
+    files_done: u64,
+    files_total: u64,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+impl<F: FnMut(u64, u64, u64, u64) -> ControlFlow<()>> Progress<F> {
+    fn report(&mut self, force: bool) -> io::Result<()> {
+        if !force
+            && self
+                .last
+                .is_some_and(|last| last.elapsed() < Duration::from_millis(100))
+        {
+            return Ok(());
+        }
+        self.last = Some(Instant::now());
+        if (self.callback)(
+            self.files_done,
+            self.files_total,
+            self.bytes_done,
+            self.bytes_total,
+        )
+        .is_break()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "V6 backup cancelled",
+            ));
+        }
+        Ok(())
+    }
 }
 fn create_with(
     root: &Path,
     parent: &Path,
     browser_released: bool,
+    callback: impl FnMut(u64, u64, u64, u64) -> ControlFlow<()>,
     before_verify: impl FnOnce(&Path) -> io::Result<()>,
-) -> io::Result<PathBuf> {
+) -> io::Result<CreatedBackup> {
+    let mut progress = Progress {
+        callback,
+        last: None,
+        files_done: 0,
+        files_total: 0,
+        bytes_done: 0,
+        bytes_total: 0,
+    };
+    progress.report(true)?;
     let root = fs::canonicalize(root)?;
     let parent = fs::canonicalize(parent)?;
     // The shared guard also rejects case aliases and overlapping directory
@@ -274,6 +549,7 @@ fn create_with(
             browser_released,
             &worktree_identities,
             &mut manifest.entries,
+            &mut progress,
         )?;
     }
     for expected in EXPECTED {
@@ -288,14 +564,27 @@ fn create_with(
             });
         }
     }
+    for entry in &manifest.entries {
+        if let Kind::File { size, .. } = entry.kind {
+            progress.files_total += 1;
+            progress.bytes_total = progress
+                .bytes_total
+                .checked_add(size)
+                .ok_or_else(|| invalid("backup size overflow"))?;
+        }
+    }
+    progress.report(true)?;
     let bytes = serde_json::to_vec_pretty(&manifest)?;
+    // Planned hashes are empty; reserve their 64 hex characters per file.
     let needed =
         manifest
             .entries
             .iter()
             .try_fold(bytes.len() as u64 + 1024 * 1024, |sum, entry| {
                 sum.checked_add(match entry.kind {
-                    Kind::File { size, .. } => size,
+                    Kind::File { size, .. } => size
+                        .checked_add(64)
+                        .ok_or_else(|| invalid("backup size overflow"))?,
                     _ => 0,
                 })
                 .ok_or_else(|| invalid("backup size overflow"))
@@ -310,43 +599,96 @@ fn create_with(
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"),
         uuid::Uuid::new_v4().simple()
     ));
-    private_dir(&destination)?;
-    let data = destination.join("state");
-    private_dir(&data)?;
-    // Ancestors first, independently of the filesystem's enumeration order.
-    manifest.entries.sort_by(|a, b| a.path.cmp(&b.path));
-    for entry in &manifest.entries {
-        let target = data.join(&entry.path);
-        match entry.kind {
-            Kind::Directory => private_dir(&target)?,
-            Kind::File { .. } => {
-                let mut source = read_regular(&root.join(&entry.path))?;
-                let mut target = private_file(&target)?;
-                io::copy(&mut source, &mut target)?;
-                target.sync_all()?;
+    let parent_fd = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&parent)?;
+    let name = CString::new(destination.file_name().unwrap().as_bytes())?;
+    if unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = open_directory_at(&parent_fd, &name)?;
+    let identity = directory_identity(&directory.metadata()?);
+    check_identity(&parent_fd, &name, identity)?;
+    let created = CreatedBackup {
+        destination: destination.clone(),
+        parent: parent_fd,
+        _directory: directory,
+        identity,
+    };
+    // Only clean up after mkdirat created this run's unique directory.
+    // Never remove an existing backup or anything under the source root.
+    let result = (|| {
+        let data = destination.join("state");
+        private_dir(&data)?;
+        // Ancestors first, independently of the filesystem's enumeration order.
+        manifest.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        for entry in &mut manifest.entries {
+            progress.report(false)?;
+            let target = data.join(&entry.path);
+            match &mut entry.kind {
+                Kind::Directory => private_dir(&target)?,
+                Kind::File { size, sha256 } => {
+                    let mut source = read_regular(&root.join(&entry.path))?;
+                    let mut target = private_file(&target)?;
+                    let planned_total = progress.bytes_total;
+                    let (copied, digest) = transfer(&mut source, Some(&mut target), |count| {
+                        progress.bytes_done += count;
+                        progress.bytes_total = progress.bytes_total.max(progress.bytes_done);
+                        progress.report(false)
+                    })?;
+                    sync_file(&target)?;
+                    progress.bytes_total = planned_total
+                        .saturating_sub(*size)
+                        .saturating_add(copied)
+                        .max(progress.bytes_done);
+                    *size = copied;
+                    *sha256 = digest;
+                    progress.files_done += 1;
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
-    write_new(
-        &destination.join(MANIFEST),
-        &serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    before_verify(&destination)?;
-    verify_data(&destination, &root)?;
-    for entry in manifest.entries.iter().rev() {
-        if matches!(entry.kind, Kind::Directory) {
-            sync_dir(&data.join(&entry.path))?;
+        write_new(
+            &destination.join(MANIFEST),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        before_verify(&destination)?;
+        verify_data(&destination, &root, || progress.report(false))?;
+        for entry in manifest.entries.iter().rev() {
+            progress.report(false)?;
+            if matches!(entry.kind, Kind::Directory) {
+                sync_dir(&data.join(&entry.path))?;
+            }
         }
+        sync_dir(&data)?;
+        sync_dir(&destination)?;
+        sync_dir(&parent)?;
+        // Publish all data AND directory entries before flushing the drive cache.
+        full_sync(&destination.join(MANIFEST))?;
+        progress.bytes_total = progress.bytes_done;
+        progress.report(true)?;
+        write_new(&destination.join(COMPLETE), b"verified\n")?;
+        sync_dir(&destination)?;
+        sync_dir(&parent)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Err(cleanup) = created.remove() {
+            return Err(io::Error::other(format!(
+                "{error}; remove partial backup {}: {cleanup}",
+                destination.display()
+            )));
+        }
+        return Err(error);
     }
-    sync_dir(&data)?;
-    sync_dir(&destination)?;
-    write_new(&destination.join(COMPLETE), b"verified\n")?;
-    sync_dir(&destination)?;
-    sync_dir(&parent)?;
-    Ok(destination)
+    Ok(created)
 }
-fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
+fn verify_data(
+    destination: &Path,
+    root: &Path,
+    mut check: impl FnMut() -> io::Result<()>,
+) -> io::Result<Manifest> {
     let manifest: Manifest = serde_json::from_reader(read_regular(&destination.join(MANIFEST))?)?;
     if manifest.root != root {
         return Err(invalid("backup root differs from selected root"));
@@ -354,6 +696,7 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
     let data = destination.join("state");
     real_dir(&data)?;
     for entry in &manifest.entries {
+        check()?;
         if entry.path.is_absolute()
             || entry
                 .path
@@ -377,7 +720,9 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
             real_dir(&data.join(&entry.path))?;
         }
         if let Kind::File { size, ref sha256 } = entry.kind {
-            let actual = hash(&mut read_regular(&data.join(&entry.path))?)?;
+            let actual = transfer(&mut read_regular(&data.join(&entry.path))?, None, |_| {
+                check()
+            })?;
             if actual != (size, sha256.clone()) {
                 return Err(invalid(format!(
                     "backup hash mismatch: {}",
@@ -386,6 +731,8 @@ fn verify_data(destination: &Path, root: &Path) -> io::Result<Manifest> {
             }
         }
     }
+    #[cfg(test)]
+    trace_durability("verified", destination);
     Ok(manifest)
 }
 fn real_dir(path: &Path) -> io::Result<()> {
@@ -408,7 +755,7 @@ pub fn verify(destination: &Path, root: &Path) -> io::Result<Manifest> {
     if marker != b"verified\n" {
         return Err(invalid("backup completion marker invalid"));
     }
-    verify_data(&destination, &root)
+    verify_data(&destination, &root, || Ok(()))
 }
 
 #[cfg(all(test, unix))]
@@ -454,21 +801,233 @@ mod tests {
                 0o700
             );
         }
-        let error = create_with(&root, &parent, true, |path| {
-            fs::write(path.join("state/workspaces.json"), b"corrupt")
-        })
+        let error = create_with(
+            &root,
+            &parent,
+            true,
+            |_, _, _, _| ControlFlow::Continue(()),
+            |path| fs::write(path.join("state/workspaces.json"), b"corrupt"),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("hash mismatch"));
-        for entry in fs::read_dir(&parent).unwrap() {
-            let path = entry.unwrap().path();
-            if fs::canonicalize(&path).unwrap() != backup {
-                assert!(!path.join(COMPLETE).exists());
-            }
-        }
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        assert!(backup.join(COMPLETE).exists());
         assert_eq!(fs::read(root.join("workspaces.json")).unwrap(), bytes);
         fs::write(backup.join("state/workspaces.json"), b"corrupt").unwrap();
         assert!(verify(&backup, &root).is_err());
     }
+    #[test]
+    fn manifest_hashes_the_copy_even_if_source_changes_after_scan_and_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let parent = temp.path().join("backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        let source = root.join("settings.json");
+        fs::write(&source, b"before scan").unwrap();
+        let mut changed = false;
+        let backup = create_with(
+            &root,
+            &parent,
+            true,
+            |done, total, _, _| {
+                if total == 1 && done == 0 && !changed {
+                    // The plan has already inspected the old size and bytes.
+                    fs::write(&source, b"bytes actually copied").unwrap();
+                    changed = true;
+                }
+                ControlFlow::Continue(())
+            },
+            |_| fs::write(&source, b"changed again after copy"),
+        )
+        .unwrap();
+        assert!(changed);
+        let backup = backup.path();
+        let manifest = verify(backup, &root).unwrap();
+        let copy = backup.join("state/settings.json");
+        assert_eq!(fs::read(&copy).unwrap(), b"bytes actually copied");
+        let (size, sha256) = transfer(&mut read_regular(&copy).unwrap(), None, |_| Ok(())).unwrap();
+        assert!(manifest.entries.iter().any(|entry| entry.path == Path::new("settings.json")
+            && matches!(&entry.kind, Kind::File { size: n, sha256: digest } if *n == size && digest == &sha256)));
+    }
+
+    #[test]
+    fn progress_reaches_totals_and_is_throttled() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let parent = temp.path().join("backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        for i in 0..32 {
+            fs::write(root.join(format!("file-{i}")), [7; 1024]).unwrap();
+        }
+        let mut reports = vec![];
+        let began = Instant::now();
+        create_with_progress(&root, &parent, true, |a, b, c, d| {
+            reports.push((a, b, c, d));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(reports.last(), Some(&(32, 32, 32 * 1024, 32 * 1024)));
+        assert!(reports.len() >= 2);
+        assert!(reports.len() <= 3 + began.elapsed().as_millis() as usize / 100);
+    }
+
+    #[test]
+    fn cancellation_removes_only_its_own_partial_copy_and_preserves_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let parent = temp.path().join("backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.join("settings.json"), b"original").unwrap();
+        let previous = create(&root, &parent, true).unwrap();
+        let mut saw_partial = false;
+        let error = create_with_progress(&root, &parent, true, |done, total, _, _| {
+            if total == 1 && done == 1 {
+                saw_partial = fs::read_dir(&parent).unwrap().count() == 2;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(saw_partial);
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        verify(&previous, &root).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(fs::read(root.join("settings.json")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn cancellation_refuses_a_swapped_parent_and_preserves_unrelated_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("v6");
+        let parent = base.join("backups");
+        let moved = base.join("original-backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.join("settings.json"), b"original").unwrap();
+        let mut name = None;
+        let error = create_with_progress(&root, &parent, true, |done, total, _, _| {
+            if done == 1 && total == 1 {
+                let destination = fs::read_dir(&parent)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .file_name();
+                // The attack points the old destination path into live state.
+                fs::create_dir(root.join(&destination)).unwrap();
+                fs::write(root.join(&destination).join("unrelated"), b"keep me").unwrap();
+                fs::rename(&parent, &moved).unwrap();
+                std::os::unix::fs::symlink(&root, &parent).unwrap();
+                name = Some(destination);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap_err();
+        let name = name.unwrap();
+        let error = error.to_string();
+        assert!(
+            error.contains("cancelled") && error.contains("parent identity changed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(root.join(&name).join("unrelated")).unwrap(),
+            b"keep me"
+        );
+        assert_eq!(fs::read(root.join("settings.json")).unwrap(), b"original");
+        assert!(moved.join(name).join("state/settings.json").exists());
+        assert!(fs::symlink_metadata(parent).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn cleanup_refuses_a_replaced_destination_and_does_not_follow_child_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let parent = temp.path().join("backups");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.join("settings.json"), b"original").unwrap();
+        let backup =
+            create_with_progress(&root, &parent, true, |_, _, _, _| ControlFlow::Continue(()))
+                .unwrap();
+        let path = backup.path().to_owned();
+        let moved = parent.join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("unrelated"), b"keep me").unwrap();
+        assert!(backup
+            .remove()
+            .unwrap_err()
+            .to_string()
+            .contains("identity changed"));
+        assert_eq!(fs::read(path.join("unrelated")).unwrap(), b"keep me");
+        assert!(moved.join("state/settings.json").exists());
+
+        let backup =
+            create_with_progress(&root, &parent, true, |_, _, _, _| ControlFlow::Continue(()))
+                .unwrap();
+        let path = backup.path().to_owned();
+        std::os::unix::fs::symlink(&root, path.join("state/link")).unwrap();
+        backup.remove().unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read(root.join("settings.json")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn backup_directories_are_synced_before_full_flush_and_completion_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("v6");
+        let parent = base.join("backups");
+        fs::create_dir_all(root.join("chat-meta/nested")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(root.join("chat-meta/nested/message"), b"original").unwrap();
+        DURABILITY_TRACE.with_borrow_mut(|trace| *trace = Some(vec![]));
+        let backup = create(&root, &parent, true).unwrap();
+        let trace = DURABILITY_TRACE.with_borrow_mut(Option::take).unwrap();
+        let index = |operation, path: &Path| {
+            trace
+                .iter()
+                .position(|event| event == &(operation, path.to_owned()))
+                .unwrap()
+        };
+        let flush = index("full-sync", &backup.join(MANIFEST));
+        assert_eq!(
+            trace.iter().filter(|event| event.0 == "full-sync").count(),
+            1
+        );
+        for directory in [
+            &parent,
+            &backup,
+            &backup.join("state"),
+            &backup.join("state/chat-meta"),
+            &backup.join("state/chat-meta/nested"),
+        ] {
+            assert!(
+                index("directory-sync", directory) < flush,
+                "{} was not synced before drive flush: {trace:?}",
+                directory.display()
+            );
+        }
+        assert!(index("verified", &backup) < flush);
+        let marker = backup.join(COMPLETE);
+        let write = index("write", &marker);
+        let file_sync = index("file-sync", &marker);
+        assert!(flush < write && write < file_sync);
+        assert!(trace
+            .iter()
+            .enumerate()
+            .any(|(i, event)| i > file_sync && event == &("directory-sync", backup.clone())));
+        verify(&backup, &root).unwrap();
+    }
+
     #[test]
     fn verify_rejects_symlinked_backup_directories() {
         let temp = tempfile::tempdir().unwrap();
