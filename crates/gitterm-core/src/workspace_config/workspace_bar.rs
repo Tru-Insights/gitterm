@@ -86,6 +86,7 @@ impl WorkspacesFile {
             let dir = local_home.to_string_lossy().into_owned();
             WorkspaceConfig {
                 extra: Default::default(),
+                legacy_env_base: None,
                 collapsed_issue_groups: crate::issues::IssueGroup::default_collapsed(),
                 abbrev: name.chars().take(2).collect::<String>().to_uppercase(),
                 name,
