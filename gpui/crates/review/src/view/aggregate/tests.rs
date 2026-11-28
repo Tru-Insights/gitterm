@@ -292,6 +292,70 @@ fn wait_for(
     }
 }
 
+#[gpui::test]
+fn edit_review_preserves_resolved_target_and_selects_and_scrolls_to_focus(cx: &mut TestAppContext) {
+    let repo = crate::fixture::aggregate_repo();
+    std::fs::create_dir(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/first.rs"),
+        "fn first() {}\n".repeat(120),
+    )
+    .unwrap();
+    std::fs::create_dir(repo.path().join("tests")).unwrap();
+    std::fs::write(repo.path().join("tests/focus.rs"), "fn focused() {}\n").unwrap();
+    let (mut target, _) = runtime()
+        .block_on(crate::repo::aggregate_target(repo.path().into()))
+        .unwrap();
+    target.owner = "fixture Work row".into();
+    target.repo = "fixture owning repo".into();
+    let expected = target.clone();
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| {
+            AggregateView::open_edit(
+                EditReview {
+                    target,
+                    source: DiffSource::Uncommitted,
+                    focus: "tests/focus.rs".into(),
+                },
+                ReviewHost::default(),
+                cx,
+            )
+        });
+        Root::new(view, window, cx)
+    });
+    let view: Entity<AggregateView> =
+        root.read_with(cx, |root, _| root.view().clone().downcast().unwrap());
+    cx.simulate_resize(size(px(1200.), px(500.)));
+    wait_for(cx, &view, |view| {
+        view.model
+            .state()
+            .pane()
+            .is_some_and(|pane| pane.loaded.is_some())
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        let pane = view.model.state().pane().unwrap();
+        assert_eq!(pane.target, expected);
+        assert_eq!(pane.source, ReviewSource::Uncommitted);
+        assert_eq!(pane.focus.as_deref(), Some("tests/focus.rs"));
+        assert!(!pane.hide_noise);
+        assert_eq!(view.selected.as_deref(), Some("tests/focus.rs"));
+        assert!(
+            view.ui.list.logical_scroll_top().item_ix > 0,
+            "focus must scroll past the first file: offset={:?}, headers={:?}",
+            view.ui.list.logical_scroll_top(),
+            view.ui
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches!(row, AggregateRow::Header(_)))
+                .collect::<Vec<_>>()
+        );
+    });
+}
+
 fn saver(dir: &std::path::Path) -> crate::SaveMarks {
     let path = dir.join(gitterm_core::review::viewed::VIEWED_FILE);
     Arc::new(move |bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()))

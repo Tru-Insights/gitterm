@@ -22,6 +22,14 @@ fn page_pane_id(workspace: WorkspaceId) -> String {
     format!("workspace-{}-page", workspace.0)
 }
 
+enum AggregateReview {
+    Branch {
+        checkout: std::path::PathBuf,
+        vs_base: bool,
+    },
+    Edit(gitterm_core::review::model::EditReview),
+}
+
 impl Shell {
     /// Iced `open_page_in_store`: show a PR or issue in the workspace's
     /// embedded Page, in GPUI's own copy of the selected login store.
@@ -172,12 +180,43 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
+        self.open_aggregate_review(
+            workspace,
+            AggregateReview::Branch { checkout, vs_base },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn open_edit_review(
+        &mut self,
+        workspace: WorkspaceId,
+        open: gitterm_core::review::model::EditReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_aggregate_review(workspace, AggregateReview::Edit(open), window, cx);
+    }
+
+    fn open_aggregate_review(
+        &mut self,
+        workspace: WorkspaceId,
+        open: AggregateReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout = match &open {
+            AggregateReview::Branch { checkout, .. } => checkout,
+            AggregateReview::Edit(open) => &open.target.checkout,
+        };
         let host = self.review_host(workspace, cx);
-        let state = self
+        let Some(state) = self
             .workspaces
             .iter_mut()
             .find(|state| state.workspace.id == workspace)
-            .unwrap();
+        else {
+            return;
+        };
         let session = self
             .content
             .read(cx)
@@ -188,7 +227,7 @@ impl Shell {
         // Keep branch review separate from the workspace's status-driven review.
         let id = format!(
             "{}-branch-review",
-            crate::content_pane_id(workspace, &checkout)
+            crate::content_pane_id(workspace, checkout)
         );
         let pane = state
             .panes
@@ -216,8 +255,9 @@ impl Shell {
         let pane::PaneContent::Review(review) = &pane.read(cx).content else {
             unreachable!()
         };
-        review.clone().update(cx, |view, cx| {
-            view.open_branch_review(
+        review.clone().update(cx, |view, cx| match open {
+            AggregateReview::Edit(open) => view.open_edit_review(open, host, cx),
+            AggregateReview::Branch { checkout, vs_base } => view.open_branch_review(
                 checkout,
                 if vs_base {
                     gitterm_core::review::model::ReviewSource::VsBase
@@ -226,7 +266,7 @@ impl Shell {
                 },
                 host,
                 cx,
-            )
+            ),
         });
         self.selected_files.remove(&workspace);
         self.content.update(cx, |content, cx| {

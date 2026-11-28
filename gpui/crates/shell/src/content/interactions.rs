@@ -449,6 +449,133 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[gpui::test]
+fn chat_edit_review_changed_file_opens_owning_checkout_in_preview(cx: &mut TestAppContext) {
+    chat_edit_review(cx, false);
+}
+
+#[gpui::test]
+fn chat_edit_review_committed_file_opens_against_base_in_preview(cx: &mut TestAppContext) {
+    chat_edit_review(cx, true);
+}
+
+fn chat_edit_review(cx: &mut TestAppContext, committed: bool) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (_folder, _config, shell, cx) = fixture_with_preview(cx, true);
+    let repo = tempfile::tempdir_in("/private/tmp").unwrap();
+    let git = |root: &Path, args: &[&str]| {
+        let output = gitterm_core::git_status::git_command()
+            .current_dir(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(repo.path(), &["init", "-qb", "main"]);
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "base"]);
+    let checkout = repo.path().join("linked");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "feature",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir(checkout.join("tests")).unwrap();
+    let file = checkout.join("tests/[edit].rs");
+    std::fs::write(&file, "fn placeholder() {}\n").unwrap();
+    if committed {
+        git(&checkout, &["add", "."]);
+        git(&checkout, &["commit", "-qm", "edit"]);
+    }
+    let before = tree_bytes(repo.path());
+    let chat = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.new_claude_chat(None, window, cx);
+            let state = shell.active(cx);
+            let pane::PaneContent::PreviewChat(chat) = &state.panes
+                [&session_pane_id(state.active_session.unwrap())]
+                .read(cx)
+                .content
+            else {
+                panic!("chat pane")
+            };
+            chat.clone()
+        })
+    });
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open_chat_file(&chat, &file, (true, None), window, cx);
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        draw(cx);
+        let loaded = cx.read(|cx| {
+            let shell = shell.read(cx);
+            let Some(visit) = shell.content.read(cx).visits.get(&WorkspaceId(1)) else {
+                return false;
+            };
+            let pane = &shell.active(cx).panes[&visit.pane];
+            let pane::PaneContent::Review(review) = &pane.read(cx).content else {
+                panic!("aggregate review pane")
+            };
+            let Some(pane) = review.read(cx).branch_review(cx) else {
+                return false;
+            };
+            assert!(pane.error.is_none(), "{:?}", pane.error);
+            if pane.loaded.is_none() {
+                return false;
+            }
+            assert_eq!(pane.target.checkout, checkout);
+            assert_eq!(
+                pane.source,
+                if committed {
+                    gitterm_core::review::model::ReviewSource::VsBase
+                } else {
+                    gitterm_core::review::model::ReviewSource::Uncommitted
+                }
+            );
+            assert_eq!(pane.focus.as_deref(), Some("tests/[edit].rs"));
+            assert!(!pane.hide_noise, "a focused test file must stay visible");
+            assert!(
+                pane.loaded
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .file("tests/[edit].rs")
+                    .is_some()
+            );
+            assert!(
+                shell.owner.read(cx).reviews.is_empty(),
+                "aggregate review must not use workspace status"
+            );
+            true
+        });
+        if loaded {
+            break;
+        }
+        assert!(Instant::now() < deadline, "chat edit review did not load");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        tree_bytes(repo.path()),
+        before,
+        "review must not write checkout or Git metadata"
+    );
+}
+
+#[gpui::test]
 fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
     cx: &mut TestAppContext,
 ) {

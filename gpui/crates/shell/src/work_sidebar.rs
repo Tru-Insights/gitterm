@@ -318,6 +318,30 @@ fn default_login_reader() -> LoginReader {
 }
 
 impl WorkSidebar {
+    /// Iced `overview_review_target`: prefer the Work row's owner and chosen base.
+    pub(crate) fn review_target(
+        &self,
+        checkout: &std::path::Path,
+    ) -> Option<gitterm_core::review::model::ReviewTarget> {
+        let state = self.state.borrow();
+        let row = state
+            .pane(self.workspace.id)?
+            .branches
+            .iter()
+            .find(|row| row.owned.checkout == checkout && !row.owned.gone)?;
+        Some(gitterm_core::review::model::ReviewTarget {
+            checkout: checkout.to_path_buf(),
+            repo: summary::folder_name(&row.owned.repo),
+            branch: row
+                .owned
+                .branch
+                .clone()
+                .unwrap_or_else(|| "(detached)".into()),
+            owner: row.owner_label(),
+            base: row.base.clone(),
+        })
+    }
+
     /// Iced `page_navigation_context`'s routes: mapped GitHub owners, and the
     /// Linear workspaces of cached issues.
     pub(crate) fn page_routes(&self) -> crate::content::window::PageRoutes {

@@ -3,14 +3,14 @@ use crate::model::AggregateModel;
 use gitterm_core::{
     git_facts::{BaseChoice, DiffSource},
     review::{
-        model::{FileStatus, LineOp, ReviewFile, ReviewSource},
+        model::{EditReview, FileStatus, LineOp, ReviewFile, ReviewSource},
         state::{Effect, Intent},
         viewed::ViewedState,
     },
 };
 use gpui::{
-    App, Context, Global, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement,
-    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, list,
+    App, Context, Global, InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState,
+    ParentElement, Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, list,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
@@ -45,6 +45,26 @@ impl AggregateView {
         host: ReviewHost,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::open(root, source, None, host, cx)
+    }
+
+    pub(super) fn open_edit(open: EditReview, host: ReviewHost, cx: &mut Context<Self>) -> Self {
+        Self::open(
+            open.target.checkout.clone(),
+            open.source.into(),
+            Some(open),
+            host,
+            cx,
+        )
+    }
+
+    fn open(
+        root: PathBuf,
+        source: ReviewSource,
+        edit: Option<EditReview>,
+        host: ReviewHost,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let executor = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -62,12 +82,20 @@ impl AggregateView {
             _ = view.update(cx, |view, cx| match result {
                 Ok((target, bases)) => {
                     view.bases = bases;
+                    let (target, focus) = match edit {
+                        Some(open) => (open.target, Some(open.focus)),
+                        None => (target, None),
+                    };
+                    let hide_noise = noise_choice(&target.checkout, cx)
+                        && !focus.as_deref().is_some_and(|path| {
+                            gitterm_core::review::model::classify_path(path).is_noise()
+                        });
                     view.dispatch(
                         Intent::Open {
-                            hide_noise: noise_choice(&target.checkout, cx),
+                            hide_noise,
                             target,
                             source,
-                            focus: None,
+                            focus,
                             page: AggregateModel::page(),
                         },
                         cx,
@@ -99,6 +127,12 @@ impl AggregateView {
     }
 
     pub(super) fn dispatch(&mut self, intent: Intent, cx: &mut Context<Self>) {
+        let focus = self
+            .model
+            .state()
+            .pane()
+            .filter(|pane| pane.loaded.is_none())
+            .and_then(|pane| pane.focus.clone());
         let toggle = match &intent {
             Intent::ToggleViewed { path, viewed } => Some((path.clone(), *viewed)),
             _ => None,
@@ -174,6 +208,22 @@ impl AggregateView {
             }
         }
         self.sync_rows();
+        if changed
+            && let Some(path) = focus
+            && let Some(index) = self
+                .ui
+                .rows
+                .iter()
+                .position(|row| matches!(row, AggregateRow::Header(file) if file == &path))
+        {
+            self.selected = Some(path);
+            // New rows have no measured heights yet. Anchor the section directly;
+            // scroll_to_reveal_item only works once the list has laid them out.
+            self.ui.list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+        }
         cx.notify();
     }
 
