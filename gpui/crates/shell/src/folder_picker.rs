@@ -396,6 +396,7 @@ impl FolderPicker {
     fn title(&self) -> &'static str {
         match self.purpose {
             FolderPickerPurpose::NewWorkspace => "New workspace",
+            FolderPickerPurpose::AddRepo(_) => "Add a repo to this workspace",
             FolderPickerPurpose::OpenFolder => "Open folder",
             FolderPickerPurpose::NewWork => "Add a repo to the new work",
         }
@@ -406,6 +407,7 @@ impl FolderPicker {
 pub fn native_dialog_title(purpose: FolderPickerPurpose) -> &'static str {
     match purpose {
         FolderPickerPurpose::NewWorkspace => "Select Workspace Folder",
+        FolderPickerPurpose::AddRepo(_) => "Add Repo to Workspace",
         FolderPickerPurpose::OpenFolder => "Select Folder",
         FolderPickerPurpose::NewWork => "Add a Repo to the Work",
     }

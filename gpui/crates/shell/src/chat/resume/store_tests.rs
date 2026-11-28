@@ -303,3 +303,67 @@ fn acknowledged_settings_survive_a_park_captured_for_an_already_confirmed_chat()
     );
     assert_eq!(saved.repo_dir, live.tab.repo_dir);
 }
+
+#[test]
+fn review_regression_f1_chat_confirmation_then_repo_edit_keeps_tab() {
+    use gitterm_core::workspace_config::{RepoEdit, WorkspaceTarget};
+    let (root, live, _captured) = fixture();
+    let store = DesktopStore::open(root.path()).unwrap();
+    live.persist(&store).unwrap();
+    let snapshot = store.snapshot().wait().unwrap();
+    let gitterm_core::desktop_store::LoadState::Valid(file) = snapshot.workspaces.loaded else {
+        panic!("valid")
+    };
+    let target = WorkspaceTarget::of(&file.workspaces[0]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_repo(
+                &target,
+                RepoEdit::Add {
+                    dir: PathBuf::from("/fixture/extra"),
+                    detected_command: None,
+                },
+            )
+        })
+        .wait()
+        .unwrap();
+    let file: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(root.path().join("workspaces.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        file.workspaces[0].tabs[0].chat_session_id.as_deref(),
+        Some("confirmed-id")
+    );
+    assert_eq!(file.workspaces[0].tabs.len(), 2);
+    assert!(file.workspaces[0].repos.contains(&"/fixture/extra".into()));
+}
+
+#[test]
+fn review_regression_f4_queued_chat_write_resolves_renamed_workspace_by_caller() {
+    use gitterm_core::workspace_config::{RepoEdit, WorkspaceTarget};
+    let (root, mut live, _captured) = fixture();
+    let store = DesktopStore::open(root.path()).unwrap();
+    live.persist(&store).unwrap();
+    let snapshot = store.snapshot().wait().unwrap();
+    let gitterm_core::desktop_store::LoadState::Valid(file) = snapshot.workspaces.loaded else {
+        panic!("valid")
+    };
+    let target = WorkspaceTarget::of(&file.workspaces[0]);
+    store
+        .try_edit_workspaces(move |file| {
+            file.edit_repo(&target, RepoEdit::Rename("Renamed".into()))
+        })
+        .wait()
+        .unwrap();
+    // This queued clone still carries the old display name.
+    live.tab.startup_command = Some("placeholder resume".into());
+    live.persist(&store).unwrap();
+    let file: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&std::fs::read(root.path().join("workspaces.json")).unwrap())
+            .unwrap();
+    assert_eq!(file.workspaces[0].name, "Renamed");
+    assert_eq!(
+        file.workspaces[0].tabs[0].startup_command,
+        live.tab.startup_command
+    );
+}

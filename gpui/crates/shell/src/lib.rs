@@ -1145,7 +1145,26 @@ impl Shell {
             });
             return;
         };
-        let mut id = layout::stable_path_hash(&cwd);
+        // A Live action may have just added this tab to the V6 document.
+        // Use its imported identity so the local layout cannot restore it twice.
+        let imported = cx
+            .try_global::<workspace_config::LiveWorkspaces>()
+            .and_then(|_| {
+                let owner = self.owner.read(cx);
+                let saved = owner.iced_workspace(state.workspace.id)?;
+                self.owner
+                    .read(cx)
+                    .iced_sessions(saved)
+                    .into_iter()
+                    .zip(&saved.tabs)
+                    .find(|(session, tab)| {
+                        !used.contains(&session.id.0)
+                            && gitterm_core::workspace_config::RepoKey::local(Path::new(&tab.dir))
+                                == gitterm_core::workspace_config::RepoKey::local(&cwd)
+                    })
+                    .map(|(session, _)| session.id.0)
+            });
+        let mut id = imported.unwrap_or_else(|| layout::stable_path_hash(&cwd));
         while used.contains(&id) {
             id = id.wrapping_add(1);
         }
@@ -2296,7 +2315,9 @@ impl Shell {
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
                 .map(|s| {
                     let tab = saved.and_then(|saved| {
-                        data::iced_sessions(saved)
+                        self.owner
+                            .read(cx)
+                            .iced_sessions(saved)
                             .iter()
                             .position(|session| session.id == s.id)
                             .and_then(|index| saved.tabs.get(index))
@@ -3415,11 +3436,8 @@ impl Shell {
                 window,
                 cx,
             ),
-            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("Worktree actions are not available in preview".into());
-                    cx.notify();
-                });
+            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree { .. } => {
+                self.live_worktree_action(workspace, action, window, cx);
             }
         }
         cx.notify();
@@ -4646,6 +4664,7 @@ impl Render for Shell {
                                 cx,
                             );
                         }
+                        shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
@@ -5115,7 +5134,12 @@ impl Shell {
             .iter()
             .find(|w| w.sessions.iter().any(|s| s.id == id))?;
         let saved = self.owner.read(cx).iced_workspace(state.workspace.id)?;
-        let index = data::iced_sessions(saved).iter().position(|s| s.id == id)?;
+        let index = self
+            .owner
+            .read(cx)
+            .iced_sessions(saved)
+            .iter()
+            .position(|s| s.id == id)?;
         saved.tabs.get(index)
     }
 

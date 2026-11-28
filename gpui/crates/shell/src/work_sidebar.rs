@@ -1,7 +1,8 @@
 //! Standalone Iced Work sidebar port. The host owns the core reducer, executes
 //! its effects, refreshes workspace facts, and subscribes to `WorkSidebarOutcome`.
 //! Imported catalogs grant read authority for background Work loads; actions
-//! that mutate Iced state or launch a tool report the preview limitation.
+//! that mutate Iced state report the preview limitation. Live repo mutations
+//! use the shared rules and serialized DesktopStore owner.
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
@@ -75,6 +76,10 @@ pub enum WorkSidebarOutcome {
         focus: Focus,
     },
     AddRepo,
+    Rename {
+        workspace: u64,
+        name: String,
+    },
     /// A listed repo is removed; an unlisted touched repo is hidden.
     RemoveRepo {
         workspace: u64,
@@ -134,9 +139,21 @@ pub enum WorkSidebarOutcome {
 }
 
 impl WorkSidebarOutcome {
+    fn is_repo_edit(&self) -> bool {
+        matches!(
+            self,
+            Self::AddRepo
+                | Self::Rename { .. }
+                | Self::RemoveRepo { .. }
+                | Self::UndoAutoRepo { .. }
+                | Self::EditRunCommand { .. }
+                | Self::DismissAutoRepos { .. }
+        )
+    }
     pub fn preview_error(&self) -> Option<String> {
         let action = match self {
             Self::AddRepo => "Add repo",
+            Self::Rename { .. } => "✎",
             Self::RemoveRepo { .. } => "Remove repo",
             Self::UndoAutoRepo { .. } => "Undo auto-added repos",
             Self::EditRunCommand { .. } => "Save run command",
@@ -172,6 +189,7 @@ enum Action {
     Emit(WorkSidebarOutcome),
     Toggle(Fold),
     Edit(PathBuf),
+    Rename,
     DismissAuto,
     Preview(String),
     /// Iced `Pr(ActionOpen)`: Approve, Merge and Ready for review open a
@@ -243,6 +261,8 @@ pub struct WorkSidebar {
     open: HashSet<Fold>,
     dismissed_auto: Vec<PathBuf>,
     editing: Option<(PathBuf, Entity<InputState>)>,
+    renaming: Option<Entity<InputState>>,
+    rename_subscription: Option<Subscription>,
     edit_subscription: Option<Subscription>,
     tasks: Vec<gitterm_core::tasks::TaskRecord>,
     workers: Vec<gitterm_core::tasks::Delegation>,
@@ -258,6 +278,7 @@ pub struct WorkSidebar {
     collapsed_issue_groups: Vec<gitterm_core::issues::IssueGroup>,
     loading: bool,
     loaded_at: Option<std::time::Instant>,
+    catalog_generation: u64,
     focus: Focus,
     error: Option<String>,
     /// The checkout whose review is shown, as Iced's `open_review_checkout`.
@@ -325,6 +346,8 @@ impl WorkSidebar {
             open: HashSet::new(),
             dismissed_auto: vec![],
             editing: None,
+            renaming: None,
+            rename_subscription: None,
             edit_subscription: None,
             tasks: vec![],
             workers: vec![],
@@ -340,6 +363,7 @@ impl WorkSidebar {
             collapsed_issue_groups: vec![],
             loading: false,
             loaded_at: None,
+            catalog_generation: 0,
             focus: Default::default(),
             error: None,
             review_checkout: None,
@@ -431,6 +455,7 @@ impl WorkSidebar {
         }
         self.loading = true;
         let id = self.workspace.id;
+        let catalog_generation = self.catalog_generation;
         let focus = self.focus.clone();
         let requested_focus = focus.clone();
         // The catalog is already loaded. Never display an invented Repos 0
@@ -467,6 +492,11 @@ impl WorkSidebar {
         let config = source.config.clone();
         let tasks = crate::data::TaskSource::resolve(&source.config, cx);
         let previous = self.previous_data.clone();
+        let join_target = gitterm_core::workspace_config::WorkspaceTarget::of(&saved);
+        let desktop = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned();
+        let owner = source.owner.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let job = cx.background_executor().spawn(async move {
             let plans = gitterm_core::merge_plan::load_plans(&gitterm_core::merge_plan::plans_dir(
@@ -487,9 +517,63 @@ impl WorkSidebar {
             _ = sender.send((result, plans, accounts));
         });
         cx.spawn(async move |view, cx| {
-            while let Some((result, plans, accounts)) = receiver.recv().await {
+            while let Some((mut result, plans, accounts)) = receiver.recv().await {
+                if let (Some(desktop), Ok(data)) = (&desktop, &result)
+                    && !data.facts.auto_added.is_empty()
+                {
+                    let desktop = desktop.clone();
+                    let root = desktop.0.root().to_path_buf();
+                    let target = join_target.clone();
+                    let dirs = data.facts.auto_added.clone();
+                    let saved = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::workspace_config::persist_auto_repo_joins(
+                                &desktop.0, target, dirs,
+                            )
+                        })
+                        .await;
+                    match saved {
+                        Ok(file) => {
+                            if let Ok(data) = &mut result
+                                && let Ok(index) = join_target.index(&file)
+                            {
+                                let saved = &file.workspaces[index];
+                                data.facts.repos.retain(|repo| {
+                                    saved.repos.iter().any(|dir| {
+                                        gitterm_core::workspace_config::RepoKey::local(
+                                            std::path::Path::new(dir),
+                                        ) == gitterm_core::workspace_config::RepoKey::local(
+                                            &repo.dir,
+                                        )
+                                    })
+                                });
+                                for repo in &mut data.facts.repos {
+                                    repo.run_command = file
+                                        .repos
+                                        .iter()
+                                        .find(|saved| {
+                                            saved.key()
+                                                == gitterm_core::workspace_config::RepoKey::local(
+                                                    &repo.dir,
+                                                )
+                                        })
+                                        .and_then(|saved| saved.run_command.clone());
+                                }
+                            }
+                            let _ = owner.update(cx, |owner, cx| {
+                                owner.apply_desktop_document(&root, file, cx)
+                            });
+                        }
+                        Err(error) => {
+                            result = Err(anyhow::anyhow!("Save discovered repos: {error}"));
+                        }
+                    }
+                }
                 let updated = view.update(cx, |this, cx| {
-                    if this.focus != requested_focus {
+                    if this.focus != requested_focus
+                        || this.catalog_generation != catalog_generation
+                    {
                         return false;
                     }
                     this.loaded_at = Some(std::time::Instant::now());
@@ -525,7 +609,7 @@ impl WorkSidebar {
             job.await;
             _ = view.update(cx, |this, cx| {
                 this.loading = false;
-                if this.focus != requested_focus {
+                if this.focus != requested_focus || this.catalog_generation != catalog_generation {
                     this.load(true, cx);
                 }
                 if this.needs_active_login() {
@@ -588,7 +672,16 @@ impl WorkSidebar {
     }
 
     fn emit(&mut self, outcome: WorkSidebarOutcome, cx: &mut Context<Self>) {
-        let error = outcome.preview_error().or_else(|| match &outcome {
+        let error = (if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_some()
+            && outcome.is_repo_edit()
+        {
+            None
+        } else {
+            outcome.preview_error()
+        })
+        .or_else(|| match &outcome {
             WorkSidebarOutcome::OpenChat { chat, .. }
                 if !self.workspace.open_chats.contains(chat)
                     && !crate::chat::policy::is_live(cx) =>
@@ -654,7 +747,7 @@ impl WorkSidebar {
         let pane = state.pane(self.workspace.id);
         let mut title = Row::text(&self.workspace.name);
         title.heading = true;
-        title.control("✎", Action::Preview("✎".into()));
+        title.control("✎", Action::Rename);
         let reading = pane.is_some() && self.loading;
         title.control(
             if reading { "reading…" } else { "↻" },
@@ -1629,7 +1722,11 @@ impl WorkSidebar {
             Action::DismissAuto => Some(WorkSidebarOutcome::DismissAutoRepos {
                 workspace: self.workspace.id,
             }),
-            Action::Edit(_) | Action::Preview(_) | Action::Confirm(..) | Action::Inert => None,
+            Action::Edit(_)
+            | Action::Rename
+            | Action::Preview(_)
+            | Action::Confirm(..)
+            | Action::Inert => None,
         }
     }
 
@@ -1642,7 +1739,33 @@ impl WorkSidebar {
             self.open_confirm(key, kind, window, cx);
             return;
         }
-        if let Action::Edit(dir) = action {
+        if let Action::Rename = action {
+            let value = self.workspace.name.clone();
+            let input = cx.new(|cx| {
+                let mut input = InputState::new(window, cx).placeholder("Workspace name");
+                input.set_value(value, window, cx);
+                input
+            });
+            self.rename_subscription =
+                Some(
+                    cx.subscribe_in(&input, window, |this, input, event, _, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            let name = input.read(cx).value().to_string();
+                            this.renaming = None;
+                            this.emit(
+                                WorkSidebarOutcome::Rename {
+                                    workspace: this.workspace.id,
+                                    name,
+                                },
+                                cx,
+                            );
+                        }
+                        cx.notify();
+                    }),
+                );
+            input.update(cx, |input, cx| input.focus(window, cx));
+            self.renaming = Some(input);
+        } else if let Action::Edit(dir) = action {
             let Some(repo) = self
                 .workspace
                 .repos
@@ -1764,10 +1887,9 @@ impl WorkSidebar {
     }
 
     fn run_command_outcome(repo: PathBuf, value: &str) -> WorkSidebarOutcome {
-        let command = value.trim();
         WorkSidebarOutcome::EditRunCommand {
             repo,
-            command: (!command.is_empty()).then(|| command.to_string()),
+            command: gitterm_core::workspace_config::run_command(value),
         }
     }
 
@@ -1832,7 +1954,9 @@ impl WorkSidebar {
         let tooltip = match control.label.as_str() {
             "↗" => "Open chat",
             "×" => "Remove or dismiss",
-            "✎" if matches!(control.action, Action::Preview(_)) => "Rename workspace",
+            "✎" if matches!(control.action, Action::Rename | Action::Preview(_)) => {
+                "Rename workspace"
+            }
             "✎" => "Edit run command",
             "▸" => "Expand",
             "▾" => "Collapse",
@@ -1875,6 +1999,7 @@ impl WorkSidebar {
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 let preview = match &control.action {
+                    Action::Rename => true,
                     Action::Edit(_) | Action::DismissAuto => true,
                     Action::Emit(outcome) => {
                         outcome.preview_error().is_some()
@@ -1886,8 +2011,16 @@ impl WorkSidebar {
                     }
                     _ => false,
                 };
+                let live = cx
+                    .try_global::<crate::workspace_config::LiveWorkspaces>()
+                    .is_some()
+                    && match &control.action {
+                        Action::Rename | Action::Edit(_) | Action::DismissAuto => true,
+                        Action::Emit(outcome) => outcome.is_repo_edit(),
+                        _ => false,
+                    };
                 this.dispatch(
-                    if preview {
+                    if preview && !live {
                         Action::Preview(preview_label.clone())
                     } else {
                         control.action.clone()
@@ -2023,6 +2156,7 @@ fn control_color(action: &Action, repo_row: bool, p: &crate::theme::Palette) -> 
     match action {
         Action::Emit(WorkSidebarOutcome::RunRepoCommand { .. }) => p.green,
         Action::Edit(_)
+        | Action::Rename
         | Action::Toggle(_)
         | Action::Inert
         | Action::Emit(WorkSidebarOutcome::RemoveRepo { .. }) => p.muted,
@@ -2085,11 +2219,20 @@ impl Render for WorkSidebar {
             .font_weight(gpui::FontWeight::NORMAL)
             .text_size(px(small))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.editing.is_some() {
-                    this.editing = None;
-                    this.edit_subscription = None;
-                    cx.stop_propagation();
-                    cx.notify();
+                if event.keystroke.key == "escape" {
+                    let cancelled = if this.renaming.take().is_some() {
+                        this.rename_subscription = None;
+                        true
+                    } else if this.editing.take().is_some() {
+                        this.edit_subscription = None;
+                        true
+                    } else {
+                        false
+                    };
+                    if cancelled {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
                 }
             }));
         for (index, mut row) in self.rows().into_iter().enumerate() {
@@ -2135,6 +2278,8 @@ impl Render for WorkSidebar {
                         })
                         .collect::<Vec<_>>(),
                 );
+            } else if index == 0 && self.renaming.is_some() {
+                label = label.child(Input::new(self.renaming.as_ref().unwrap()).small());
             } else {
                 label = label.child(row.label);
             }
@@ -2460,3 +2605,324 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "work_sidebar_login_tests.rs"]
 mod work_sidebar_login_tests;
+
+impl crate::Shell {
+    fn repo_error(&self, error: String, cx: &mut Context<Self>) {
+        self.owner.update(cx, |owner, cx| {
+            owner.error = Some(error);
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn repo_outcome(
+        &mut self,
+        outcome: &WorkSidebarOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::workspace_config::RepoEdit;
+        if cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .is_none()
+        {
+            return;
+        }
+        let workspace = match outcome {
+            WorkSidebarOutcome::RemoveRepo { workspace, .. }
+            | WorkSidebarOutcome::UndoAutoRepo { workspace, .. }
+            | WorkSidebarOutcome::Rename { workspace, .. }
+            | WorkSidebarOutcome::DismissAutoRepos { workspace } => crate::WorkspaceId(*workspace),
+            _ => match self.active_workspace(cx) {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
+            return;
+        };
+        let target = gitterm_core::workspace_config::WorkspaceTarget::of(&saved);
+        let edit = match outcome {
+            WorkSidebarOutcome::AddRepo => {
+                self.pick_repo(workspace, target, window, cx);
+                return;
+            }
+            WorkSidebarOutcome::RemoveRepo { repo, .. } => RepoEdit::Remove(vec![repo.clone()]),
+            WorkSidebarOutcome::UndoAutoRepo { repos, .. } => RepoEdit::Remove(repos.clone()),
+            WorkSidebarOutcome::Rename { name, .. } => RepoEdit::Rename(name.clone()),
+            WorkSidebarOutcome::EditRunCommand { repo, command } => RepoEdit::RunCommand {
+                dir: repo.clone(),
+                draft: command.clone().unwrap_or_default(),
+            },
+            WorkSidebarOutcome::DismissAutoRepos { .. } => {
+                if let Some(sidebar) = self.work_sidebars.get(&workspace) {
+                    sidebar.update(cx, |sidebar, cx| {
+                        sidebar.dismissed_auto = sidebar.workspace.auto_added.clone();
+                        cx.notify();
+                    });
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.save_repo_edit(target, edit, cx);
+    }
+
+    fn save_repo_edit(
+        &mut self,
+        target: gitterm_core::workspace_config::WorkspaceTarget,
+        edit: gitterm_core::workspace_config::RepoEdit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .cloned()
+        else {
+            return;
+        };
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        let alias = if let gitterm_core::workspace_config::RepoEdit::Rename(draft) = &edit {
+            match self.owner.read(cx).prepare_rename_alias(&target, draft) {
+                Ok(alias) => alias,
+                Err(error) => {
+                    self.repo_error(format!("Save workspace identity: {error:#}"), cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.owner.update(cx, |owner, cx| {
+            owner.workspace_save_pending = true;
+            cx.notify();
+        });
+        let root = store.0.root().to_path_buf();
+        let work = cx.background_executor().spawn(async move {
+            let aliases = if let Some((aliases, receipt)) = alias {
+                if let Err(error) = crate::preview::finish(Ok(receipt)).await {
+                    return (Err(format!("Save workspace identity: {error:#}")), None);
+                }
+                Some(aliases)
+            } else {
+                None
+            };
+            let result = store
+                .0
+                .try_edit_workspaces(move |file| file.edit_repo(&target, edit))
+                .wait();
+            (result, aliases)
+        });
+        cx.spawn(async move |shell, cx| {
+            let (result, aliases) = work.await;
+            _ = shell.update(cx, |shell, cx| {
+                shell.owner.update(cx, |owner, cx| {
+                    owner.workspace_save_pending = false;
+                    if let Some(aliases) = aliases {
+                        owner.install_aliases(aliases);
+                    }
+                    cx.notify();
+                });
+                match result {
+                    Ok(file) => shell.repo_document_saved(&root, file, cx),
+                    Err(error) => shell.repo_error(error, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn repo_document_saved(
+        &mut self,
+        root: &std::path::Path,
+        file: gitterm_core::workspace_config::WorkspacesFile,
+        cx: &mut Context<Self>,
+    ) {
+        self.owner
+            .update(cx, |owner, cx| owner.apply_desktop_document(root, file, cx));
+        let source = cx.global::<IcedWorkSource>().clone();
+        for state in &mut self.workspaces {
+            if let Some(saved) = source
+                .workspaces
+                .get(state.workspace.id.0.saturating_sub(1) as usize)
+            {
+                state.workspace.name = saved.name.clone();
+            }
+        }
+        if let Some(sheet) = &self.settings_sheet {
+            let id = sheet.read(cx).workspace_id;
+            if let Some(saved) =
+                id.and_then(|id| source.workspaces.get(id.0.saturating_sub(1) as usize))
+            {
+                sheet.update(cx, |sheet, cx| sheet.saved_name(saved.name.clone(), cx));
+            }
+        }
+        for sidebar in self.work_sidebars.values() {
+            sidebar.update(cx, |sidebar, cx| {
+                sidebar.catalog_generation += 1;
+                sidebar.source = Some(source.clone());
+                sidebar.previous_data = None;
+                sidebar.loaded_at = None;
+                if let Some(saved) = source
+                    .workspaces
+                    .get(sidebar.workspace.id.saturating_sub(1) as usize)
+                {
+                    sidebar.workspace.name = saved.name.clone();
+                    sidebar.workspace.removed =
+                        saved.repos_removed.iter().map(PathBuf::from).collect();
+                }
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    fn pick_repo(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        target: gitterm_core::workspace_config::WorkspaceTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::{
+            folder_picker::{FolderPicker, FolderPickerOutcome, PickerFacts},
+            workspace_sheet::FolderPickerPurpose,
+        };
+        if let Some(home) = dirs::home_dir() {
+            self.remote
+                .homes
+                .borrow_mut()
+                .entry(None)
+                .or_insert_with(|| home.to_string_lossy().into_owned());
+        }
+        let remotes = self.reload_remotes(cx);
+        let owner = self.owner.read(cx);
+        let saved = owner
+            .iced_catalog()
+            .map(|c| c.workspaces.as_slice())
+            .unwrap_or_default();
+        let find = self.find_state.borrow();
+        let recents = std::iter::once(None).chain(remotes.iter().map(|r| Some(r.id.clone())))
+            .map(|machine| {
+                let open: Vec<PathBuf> = saved.iter().filter_map(|w| match (&w.location, &machine) {
+                    (Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { remote_id, root, .. }), Some(id)) if remote_id == id => Some(root.into()),
+                    (Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }), _) => None,
+                    (_, None) if !w.is_legacy_remote() => Some((&w.dir).into()),
+                    _ => None,
+                }).collect();
+                let entries = find.index(&machine).map(|i| i.entries.as_slice()).unwrap_or_default();
+                (machine, gitterm_core::folder_picker::recents(entries, &open, usize::MAX))
+            }).collect();
+        drop(find);
+        let picker = cx.new(|cx| {
+            FolderPicker::new(
+                FolderPickerPurpose::AddRepo(workspace.0),
+                None,
+                PickerFacts {
+                    remotes,
+                    client: self.remote.client.clone(),
+                    homes: self.remote.homes.clone(),
+                    last_dirs: self.remote.last_dirs.clone(),
+                    recents,
+                    start_hint: None,
+                },
+                window,
+                cx,
+            )
+        });
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |shell, _, outcome: &FolderPickerOutcome, window, cx| {
+                match outcome {
+                    FolderPickerOutcome::Confirm {
+                        remote_id: None,
+                        dir,
+                        ..
+                    } => {
+                        shell
+                            .remote
+                            .last_dirs
+                            .borrow_mut()
+                            .insert(None, dir.clone());
+                        shell.add_picked_repo(target.clone(), dir.into(), cx);
+                    }
+                    FolderPickerOutcome::Confirm {
+                        remote_id: Some(id),
+                        ..
+                    } => {
+                        shell.repo_error(
+                            format!("a repo on {id} cannot join; repos join from this Mac"),
+                            cx,
+                        );
+                    }
+                    FolderPickerOutcome::NativeDialog { purpose } => {
+                        let response = cx.prompt_for_paths(gpui::PathPromptOptions {
+                            files: false,
+                            directories: true,
+                            multiple: false,
+                            prompt: Some(
+                                crate::folder_picker::native_dialog_title(*purpose).into(),
+                            ),
+                        });
+                        let target = target.clone();
+                        cx.spawn(async move |shell, cx| {
+                            let picked = response.await;
+                            _ = shell.update(cx, |shell, cx| match picked {
+                                Ok(Ok(Some(paths))) => {
+                                    if let Some(path) = paths.first() {
+                                        shell.add_picked_repo(target, path.clone(), cx);
+                                    }
+                                }
+                                Ok(Ok(None)) => {}
+                                Ok(Err(error)) => {
+                                    shell.repo_error(format!("Pick folder: {error}"), cx)
+                                }
+                                Err(error) => shell.repo_error(format!("Pick folder: {error}"), cx),
+                            });
+                        })
+                        .detach();
+                    }
+                    FolderPickerOutcome::ConnectMachine => {
+                        shell.open_connect_form(window, cx);
+                        return;
+                    }
+                    FolderPickerOutcome::Cancel => {}
+                }
+                shell.remote.picker = None;
+                shell.focus.focus(window, cx);
+                shell.cover_sheet(false, window, cx);
+                cx.notify();
+            },
+        );
+        self.remote.picker_return_focus = Some(self.focus.clone());
+        self.remote.picker = Some((picker, subscription));
+        self.cover_sheet(true, window, cx);
+        cx.notify();
+    }
+
+    fn add_picked_repo(
+        &mut self,
+        target: gitterm_core::workspace_config::WorkspaceTarget,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let work = cx.background_executor().spawn(async move {
+            let dir = crate::workspace_config::local_folder(&path).map_err(|e| e.to_string())?;
+            let dir = gitterm_core::workers::main_checkout(&dir);
+            let detected_command = gitterm_core::workspace_config::detect_run_command(&dir);
+            Ok::<_, String>(gitterm_core::workspace_config::RepoEdit::Add {
+                dir,
+                detected_command,
+            })
+        });
+        cx.spawn(async move |shell, cx| {
+            let result = work.await;
+            _ = shell.update(cx, |shell, cx| match result {
+                Ok(edit) => shell.save_repo_edit(target, edit, cx),
+                Err(error) => shell.repo_error(error, cx),
+            });
+        })
+        .detach();
+    }
+}

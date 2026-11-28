@@ -13,6 +13,7 @@ use std::{
 /// Process/window owner. Dock panels hold read handles only. The executor and
 /// outcome bridge survive every dock close, move, hide and reconstruction.
 pub struct WorkspaceOwner {
+    pub(crate) worktree_operations: crate::pane::git_view::WorktreeOperations,
     /// Startup park metadata blocks PTY construction until explicit resume.
     pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
     pub(crate) notifications: Option<crate::notifications::Notifications>,
@@ -191,6 +192,7 @@ impl WorkspaceOwner {
             crate::notifications::Notifications::new(Instant::now())
         });
         Self {
+            worktree_operations: Default::default(),
             notifications,
             stopped_workspaces: Default::default(),
             model,
@@ -243,6 +245,52 @@ impl WorkspaceOwner {
             .collect()
     }
 
+    pub(crate) fn layout_key(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> String {
+        self.store
+            .as_ref()
+            .map(|store| store.layout_key(saved))
+            .unwrap_or_else(|| crate::workspace_config::iced_layout_key(saved))
+    }
+    pub(crate) fn iced_sessions(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> Vec<crate::data::Session> {
+        crate::data::iced_sessions_with_key(saved, &self.layout_key(saved))
+    }
+    pub(crate) fn prepare_rename_alias(
+        &self,
+        target: &gitterm_core::workspace_config::WorkspaceTarget,
+        draft: &str,
+    ) -> anyhow::Result<
+        Option<(
+            crate::workspace_config::IdentityAliases,
+            crate::preview::SaveResult,
+        )>,
+    > {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Workspace store is unavailable"))?;
+        let catalog = store
+            .iced
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Live catalog is unavailable"))?;
+        let file = gitterm_core::workspace_config::WorkspacesFile {
+            workspaces: catalog.workspaces.clone(),
+            ..Default::default()
+        };
+        let index = target.index(&file).map_err(anyhow::Error::msg)?;
+        store.prepare_rename_alias(&file.workspaces[index], draft)
+    }
+    pub(crate) fn install_aliases(&mut self, aliases: crate::workspace_config::IdentityAliases) {
+        if let Some(store) = &mut self.store {
+            store.identity_aliases = aliases;
+        }
+    }
+
     pub(crate) fn iced_workspace(
         &self,
         id: crate::data::WorkspaceId,
@@ -254,6 +302,42 @@ impl WorkspaceOwner {
             .workspaces
             .get(id.0.checked_sub(1)? as usize)
     }
+    /// Refresh the read catalog after the Live desktop owner acknowledges a save.
+    pub(crate) fn apply_desktop_document(
+        &mut self,
+        root: &std::path::Path,
+        file: gitterm_core::workspace_config::WorkspacesFile,
+        cx: &mut Context<Self>,
+    ) {
+        let mut catalog = crate::workspace_config::IcedCatalog::from_document(root, file);
+        if let Some(previous) = self.iced_catalog() {
+            catalog.claims = previous.claims.clone();
+            if previous.workspaces.len() == catalog.workspaces.len() {
+                catalog.order = previous.ordered_indices();
+            }
+            for (old, next) in previous.workspaces.iter().zip(&catalog.workspaces) {
+                if old.name != next.name && old.dir == next.dir {
+                    for chat in self.chats.values() {
+                        chat.update(cx, |chat, _| chat.rebind_live_workspace(old, next));
+                    }
+                }
+            }
+        }
+        for (local, saved) in self.model.workspaces.iter_mut().zip(&catalog.workspaces) {
+            local.status.repo_name = saved.name.clone();
+        }
+        cx.set_global(crate::work_sidebar::IcedWorkSource {
+            config: root.to_path_buf(),
+            workspaces: catalog.workspaces.clone(),
+            repos: catalog.repos.clone(),
+            owner: cx.entity().downgrade(),
+        });
+        if let Some(store) = self.store.as_mut() {
+            store.iced = Some(catalog);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn iced_catalog(&self) -> Option<&crate::workspace_config::IcedCatalog> {
         self.store.as_ref()?.iced.as_ref()
     }

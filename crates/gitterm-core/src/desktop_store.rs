@@ -145,6 +145,17 @@ impl DesktopStore {
         })
     }
 
+    /// Repo actions publish only after the atomic replacement is acknowledged.
+    pub fn try_edit_workspaces(
+        &self,
+        edit: impl FnOnce(&mut WorkspacesFile) -> Result<(), String> + Send + 'static,
+    ) -> Receipt<WorkspacesFile> {
+        self.transact_workspaces(move |file| {
+            edit(file)?;
+            Ok(file.clone())
+        })
+    }
+
     /// Save a candidate before publishing it. A rejected edit or failed atomic
     /// replacement leaves both the owner snapshot and the previous file intact.
     pub fn transact_workspaces<T: Send + 'static>(
@@ -158,6 +169,18 @@ impl DesktopStore {
                 LoadState::Refused(error) => return Err(error.clone()),
             };
             let result = edit(&mut candidate)?;
+            let unchanged = match &state.workspaces.loaded {
+                LoadState::Valid(previous) => serde_json::to_value(previous)
+                    .and_then(|previous| {
+                        serde_json::to_value(&candidate).map(|next| previous == next)
+                    })
+                    .map_err(|error| format!("compare workspace edit: {error}"))?,
+                _ => false,
+            };
+            // No-op controls must preserve the original serialized bytes too.
+            if unchanged && !state.workspaces.dirty {
+                return Ok(result);
+            }
             let mut pending = FileState {
                 loaded: LoadState::Valid(candidate),
                 dirty: true,
