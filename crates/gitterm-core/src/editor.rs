@@ -256,9 +256,12 @@ fn split_command(command: &str) -> Result<Vec<String>, String> {
 }
 
 /// Iced's terminal-pencil route is separate from the configured GUI editor.
-/// Keep its command text unchanged; the setting is a trusted shell command.
+/// The editor setting is a trusted shell command; the path is not (it can come
+/// from any cloned repo), so it is single-quoted and no shell expansion runs on
+/// it (decision D14).
 pub fn terminal_command(editor: Option<&str>, path: &Path) -> String {
-    format!("{} \"{}\"", editor.unwrap_or("vim"), path.display())
+    let path = path.display().to_string().replace('\'', "'\\''");
+    format!("{} '{}'", editor.unwrap_or("vim"), path)
 }
 
 pub fn open_error(setting: &str, error: &str) -> String {
@@ -311,17 +314,37 @@ mod tests {
                         (Err(old), Err(new)) => assert_eq!(old, new),
                         other => panic!("changed command: {other:?}"),
                     }
-                    assert_eq!(
-                        terminal_command(Some(setting), Path::new(path)),
-                        format!("{} \"{}\"", setting, Path::new(path).display())
-                    );
                 }
             }
         }
         assert_eq!(
             terminal_command(None, Path::new("/tmp/a b")),
-            "vim \"/tmp/a b\""
+            "vim '/tmp/a b'"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_command_never_expands_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        for name in [
+            format!("a$(touch {}).rs", marker.display()),
+            format!("a`touch {}`.rs", marker.display()),
+            format!("a\"; touch {}; \".rs", marker.display()),
+            format!("a'; touch {}; '.rs", marker.display()),
+        ] {
+            // `printf %s` prints its argument verbatim, so the output must be the
+            // literal filename and the marker must never be created.
+            let command = terminal_command(Some("printf %s"), Path::new(&name));
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{command}");
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), name);
+            assert!(!marker.exists(), "path was expanded: {command}");
+        }
     }
 
     #[cfg(all(unix, feature = "runtime"))]
