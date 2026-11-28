@@ -295,9 +295,11 @@ fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
     let path = root.join("workspaces.json");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     let iced = saved(&root);
-    let tab = iced.workspaces[0].tabs[0].clone();
+    let mut tab = iced.workspaces[0].tabs[0].clone();
     let iced_config = serde_json::to_value(&tab.agent_config).unwrap();
     assert!(iced_config.get("future").is_none());
+    // A real change, so the owner writes (an unchanged edit keeps the old bytes).
+    tab.dir = root.join("changed").display().to_string();
     LiveTab::new(
         ServiceContext::production(&root, "unknown-test").unwrap(),
         &workspace,
