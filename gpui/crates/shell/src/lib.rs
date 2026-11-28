@@ -161,6 +161,11 @@ pub struct Shell {
     config_dir: std::path::PathBuf,
     local: bool,
     selected_files: HashMap<WorkspaceId, FileOpen>,
+    editor: String,
+    #[cfg(not(test))]
+    editor_executor: std::sync::Arc<tokio::runtime::Runtime>,
+    #[cfg(test)]
+    editor_requests: Vec<content::actions::OpenEditor>,
     chat_find: HashSet<gpui::EntityId>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -464,6 +469,16 @@ impl Shell {
             config_dir: config_dir.to_path_buf(),
             local,
             selected_files: HashMap::new(),
+            editor: settings.editor.clone(),
+            #[cfg(not(test))]
+            editor_executor: std::sync::Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()?,
+            ),
+            #[cfg(test)]
+            editor_requests: Vec::new(),
             chat_find: HashSet::new(),
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -3623,7 +3638,7 @@ impl Shell {
         &mut self,
         workspace: WorkspaceId,
         action: &pane::git_view::GitAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use pane::git_view::GitAction as A;
@@ -3639,7 +3654,11 @@ impl Shell {
                 }
                 self.sync_git_visibility(true, cx);
             }
-            A::EditFile(_) => self.editor_preview_notice(cx),
+            A::EditFile(path) => self.open_editor(
+                content::actions::OpenEditor::terminal(path.clone()),
+                window,
+                cx,
+            ),
             A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
                 self.owner.update(cx, |owner, cx| {
                     owner.error = Some("Worktree actions are not available in preview".into());
@@ -4148,8 +4167,20 @@ impl Shell {
                 cx,
                 |this, a: &FileSelectByIndex, w, cx| this.select_file(&a.selection, w, cx),
             ))
-            .on_action(Self::background(cx, |this, _: &EditFile, _, cx| {
-                this.editor_preview_notice(cx);
+            .on_action(Self::background(
+                cx,
+                |this, action: &content::actions::OpenEditor, window, cx| {
+                    this.open_editor(action.clone(), window, cx);
+                },
+            ))
+            .on_action(Self::background(
+                cx,
+                |this, action: &gitterm_gpui_chat::OpenCheckout, window, cx| {
+                    this.open_chat_checkout(action.path.as_deref(), window, cx);
+                },
+            ))
+            .on_action(Self::background(cx, |this, _: &EditFile, window, cx| {
+                this.edit_selected_file(window, cx);
             }))
             .on_action(Self::background(cx, |this, _: &AgentFindOpen, w, cx| {
                 let focused = this.focused_chat(w, cx);
@@ -4820,6 +4851,9 @@ impl Render for Shell {
         self.sync_review_selection(cx);
         self.ensure_rosters(window, cx);
         for (id, sidebar) in &self.work_sidebars {
+            sidebar.update(cx, |sidebar, _| {
+                sidebar.editor_name = gitterm_core::editor::display_name(&self.editor)
+            });
             if !self.run_sidebar_subscriptions.contains_key(id) {
                 let subscription = cx.subscribe_in(
                     sidebar,
@@ -4827,6 +4861,13 @@ impl Render for Shell {
                     |shell, _, outcome: &work_sidebar::WorkSidebarOutcome, window, cx| {
                         if let work_sidebar::WorkSidebarOutcome::OpenTask { task } = outcome {
                             shell.activate_task(task, window, cx);
+                        }
+                        if let work_sidebar::WorkSidebarOutcome::OpenEditor { dir } = outcome {
+                            shell.open_editor(
+                                content::actions::OpenEditor::configured(dir.clone(), None),
+                                window,
+                                cx,
+                            );
                         }
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
@@ -5840,8 +5881,8 @@ impl Shell {
                                     view.update(cx, |pane, cx| pane.show_notice(message, cx));
                                 }
                             }
-                            Some(chat::Navigation::File(path, review)) => {
-                                shell.open_chat_file(view, path, review, window, cx)
+                            Some(chat::Navigation::File(path, review, line)) => {
+                                shell.open_chat_file(view, path, (review, line), window, cx)
                             }
                             None => {}
                         }

@@ -141,7 +141,6 @@ impl WorkSidebarOutcome {
             Self::UndoAutoRepo { .. } => "Undo auto-added repos",
             Self::EditRunCommand { .. } => "Save run command",
             Self::DismissAutoRepos { .. } => "Dismiss auto-added repos",
-            Self::OpenEditor { .. } => "Open in editor",
             Self::MakeWorkspace { .. } => "Make workspace",
             // RunRepoCommand and OpenTask are carried out by the shell (as in
             // Iced), so a "not available" banner here would contradict them.
@@ -237,6 +236,7 @@ impl Row {
 }
 
 pub struct WorkSidebar {
+    pub(crate) editor_name: String,
     workspace: WorkspaceFacts,
     /// Shared reducer; blocking reads run through the read-only data adapter.
     state: Rc<RefCell<State>>,
@@ -319,6 +319,7 @@ impl WorkSidebar {
     }
     pub fn new(workspace: WorkspaceFacts, state: Rc<RefCell<State>>) -> Self {
         Self {
+            editor_name: "VS Code".into(),
             workspace,
             state,
             open: HashSet::new(),
@@ -1839,6 +1840,14 @@ impl WorkSidebar {
             _ => &control.label,
         }
         .to_string();
+        let tooltip = if matches!(
+            control.action,
+            Action::Emit(WorkSidebarOutcome::OpenEditor { .. })
+        ) {
+            format!("Open in {}", self.editor_name)
+        } else {
+            tooltip
+        };
         let preview_label = control.label.clone();
         Button::new(id.clone())
             .debug_selector(move || id.clone())
