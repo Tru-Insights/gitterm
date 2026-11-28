@@ -53,7 +53,6 @@ const TASK_PR_BATCH_MAX_ITEMS: usize = 1;
 const PR_IMMEDIATE_DEBOUNCE: Duration = Duration::from_secs(10);
 /// A PR no workspace lists is forgotten this long after its last read.
 const PR_FORGET_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
-const TASK_PR_MAX_AGE: chrono::Duration = chrono::Duration::days(14);
 /// Prefix of every line of a prompt that tells the coordinator news.
 const TELL_PREFIX: &str = "GitTerm PR watch";
 
@@ -151,92 +150,9 @@ pub enum PrEvent {
     DoneToggle(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TaskBranch {
-    repo: String,
-    branch: String,
-}
-
+pub use gitterm_core::work::pr_discovery::TaskBranch;
+use gitterm_core::work::pr_discovery::{task_branch, task_branches, TaskPrOrigin};
 pub type TaskBranchResult = (TaskBranch, Result<Vec<pr_watch::BranchPr>, String>);
-
-#[derive(Debug, Clone)]
-struct TaskPrOrigin {
-    chat: String,
-    started_at: chrono::DateTime<chrono::Utc>,
-    before: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Only recent task delegations can contribute branch PRs. The parent is
-/// resolved to its current root when collecting the list, not when gh runs.
-fn task_branches(
-    store: &TaskStore,
-    now: chrono::DateTime<chrono::Utc>,
-    uid_to_chat: &HashMap<String, String>,
-) -> Vec<(TaskPrOrigin, TaskBranch)> {
-    store
-        .delegations()
-        .iter()
-        .filter_map(|delegation| task_branch(store, delegation, now, uid_to_chat))
-        .collect()
-}
-
-fn task_branch(
-    store: &TaskStore,
-    delegation: &gitterm::tasks::Delegation,
-    now: chrono::DateTime<chrono::Utc>,
-    uid_to_chat: &HashMap<String, String>,
-) -> Option<(TaskPrOrigin, TaskBranch)> {
-    let created = chrono::DateTime::parse_from_rfc3339(&delegation.created_at)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    if created < now - TASK_PR_MAX_AGE || created > now {
-        return None;
-    }
-    let gitterm::tasks::DelegationChild::TaskSession { task_id, .. } = &delegation.child else {
-        return None;
-    };
-    let parent = delegation
-        .parent
-        .chat_session_id
-        .as_ref()
-        .or_else(|| uid_to_chat.get(&delegation.parent.session_uid))?;
-    let task = store.get(task_id)?;
-    let slug = gitterm::gh_identity::parse_repository_slug(task.repository.remote_url.as_deref()?)?;
-    // PR identities and the watch currently support github.com only.
-    if !slug.host.eq_ignore_ascii_case("github.com")
-        || !merge_plan::valid_repo(&slug.full_name())
-        || task.branch.is_empty()
-    {
-        return None;
-    }
-    // Reusing a task starts a new ownership window, even if the next parent
-    // is no longer open. Later PRs must not leak back into the earlier chat.
-    let before = store
-        .delegations()
-        .iter()
-        .filter(|next| {
-            matches!(
-                &next.child,
-                gitterm::tasks::DelegationChild::TaskSession { task_id: next_id, .. }
-                    if next_id == task_id
-            )
-        })
-        .filter_map(|next| chrono::DateTime::parse_from_rfc3339(&next.created_at).ok())
-        .map(|at| at.with_timezone(&chrono::Utc))
-        .filter(|at| *at > created && *at <= now)
-        .min();
-    Some((
-        TaskPrOrigin {
-            chat: parent.clone(),
-            started_at: created,
-            before,
-        },
-        TaskBranch {
-            repo: slug.full_name(),
-            branch: task.branch.clone(),
-        },
-    ))
-}
 
 async fn lookup_task_branches<F, Fut>(
     branches: Vec<TaskBranch>,
