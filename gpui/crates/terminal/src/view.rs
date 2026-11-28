@@ -1007,10 +1007,20 @@ impl TerminalView {
     }
 
     pub fn update_config(&mut self, config: TerminalConfig, cx: &mut Context<Self>) {
-        self.renderer.font_family = config.font_family.clone();
-        self.renderer.font_size = config.font_size;
-        self.renderer.line_height_multiplier = config.line_height_multiplier;
-        self.renderer.palette = config.colors.clone();
+        if self.config.colors != config.colors {
+            // Refresh the entire presentation on a theme change, including
+            // scrollback. Keep the backend: rerunning a PTY can repeat commands.
+            self.renderer = TerminalRenderer::new(
+                config.font_family.clone(),
+                config.font_size,
+                config.line_height_multiplier,
+                config.colors.clone(),
+            );
+        } else {
+            self.renderer.font_family = config.font_family.clone();
+            self.renderer.font_size = config.font_size;
+            self.renderer.line_height_multiplier = config.line_height_multiplier;
+        }
 
         self.backend.set_history_limit(config.scrollback);
         self.config = config;

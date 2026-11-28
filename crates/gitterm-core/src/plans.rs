@@ -174,6 +174,15 @@ fn collect_markdown_entries(root: &Path, dir: &Path, entries: &mut Vec<PlanEntry
     }
 }
 
+/// The same read-only inventory used by the HTTP routes and embedded desktop viewer.
+#[cfg(feature = "runtime")]
+pub fn list_documents(dir: &Path) -> PlansList {
+    let mut entries = Vec::new();
+    collect_markdown_entries(dir, dir, &mut entries);
+    entries.sort_by_key(|a| a.title.to_lowercase());
+    PlansList { plans: entries }
+}
+
 #[cfg(feature = "runtime")]
 pub fn routes(state: DocumentRoots) -> BoxedFilter<(warp::reply::Response,)> {
     let with_state = warp::any().map(move || state.clone());
@@ -250,10 +259,7 @@ async fn handle_list(
     let Some(dir) = source_dir(&state, source) else {
         return Ok(warp::reply::json(&PlansList { plans: Vec::new() }).into_response());
     };
-    let mut entries = Vec::new();
-    collect_markdown_entries(&dir, &dir, &mut entries);
-    entries.sort_by_key(|a| a.title.to_lowercase());
-    Ok(warp::reply::json(&PlansList { plans: entries }).into_response())
+    Ok(warp::reply::json(&list_documents(&dir)).into_response())
 }
 
 #[cfg(feature = "runtime")]

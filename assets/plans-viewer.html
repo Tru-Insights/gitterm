@@ -172,8 +172,12 @@
 <script>/*__BAR_HINT__*/</script>
 <script type="module">
   // --- Theme: read ?theme= from URL, apply to <html>, swap hljs stylesheet. ---
-  const params = new URLSearchParams(location.search);
-  const source = location.pathname.startsWith("/docs")
+  // A retained desktop host supplies the same read-only route data without HTTP.
+  // The browser/HTTP viewer continues to resolve each request through its routes.
+  const embeddedData = document.getElementById("gitterm-plans-data");
+  const embedded = embeddedData ? JSON.parse(embeddedData.textContent) : null;
+  const params = new URLSearchParams(embedded?.query ?? location.search);
+  const source = (embedded?.route ?? location.pathname).startsWith("/docs")
     ? { base: "/docs", label: "Docs", dir: "docs/" }
     : { base: "/plans", label: "Plans", dir: ".plans/" };
   document.title = `${source.label} · GitTerm`;
@@ -242,6 +246,7 @@
 
   async function fetchPlans() {
     try {
+      if (embedded) return embedded.plans;
       const res = await fetch(source.base);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -390,9 +395,16 @@
     let md = sourceText;
     if (!md) {
       try {
-        const res = await fetch(`${source.base}/raw?path=${encodeURIComponent(name)}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        md = await res.text();
+        if (embedded) {
+          if (name !== embedded.name || embedded.error) {
+            throw new Error(embedded.error || "document not found");
+          }
+          md = embedded.markdown;
+        } else {
+          const res = await fetch(`${source.base}/raw?path=${encodeURIComponent(name)}`);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          md = await res.text();
+        }
       } catch (err) {
         content.innerHTML = `
           <h1>Could not load ${escapeHtml(name)}</h1>

@@ -2,6 +2,31 @@
 //! shared decision.
 use super::*;
 
+#[test]
+fn page_new_windows_and_iframes_match_iced_http_only_policy() {
+    for url in [
+        "http://example.com/frame",
+        "https://github.com/example/repo/pull/1",
+    ] {
+        assert_eq!(
+            page_new_window_decision(url),
+            PageNavigationDecision::External
+        );
+    }
+    for url in [
+        "not a URL",
+        "file:///tmp/fixture",
+        "about:blank",
+        "javascript:alert(1)",
+        "mailto:person@example.com",
+    ] {
+        assert_eq!(
+            page_new_window_decision(url),
+            PageNavigationDecision::Cancel
+        );
+    }
+}
+
 fn page_context() -> PageNavigationContext {
     PageNavigationContext {
         url: "https://github.com/sample-owner-a/sample-repo/pull/1".to_string(),

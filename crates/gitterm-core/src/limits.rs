@@ -223,6 +223,24 @@ pub struct SaveJob {
 
 #[cfg(feature = "runtime")]
 impl SaveJob {
+    /// GPUI's single desktop owner; enqueue before awaiting on an executor.
+    pub fn submit_to(
+        self,
+        store: &crate::desktop_store::DesktopStore,
+    ) -> Result<crate::desktop_store::Receipt<()>, String> {
+        let expected = PlanLimitsFile::path_in(store.root());
+        let parent = self
+            .path
+            .parent()
+            .ok_or("plan limits path has no parent")?
+            .canonicalize()
+            .map_err(|error| format!("resolve plan limits directory: {error}"))?;
+        if self.path.file_name() != expected.file_name() || parent != store.root() {
+            return Err("plan limits store root does not match the Live host".into());
+        }
+        Ok(store.save_plan_limits(self.file))
+    }
+
     pub async fn run(self) -> PlanLimitsEvent {
         let result = tokio::task::spawn_blocking(move || self.file.save(&self.path))
             .await

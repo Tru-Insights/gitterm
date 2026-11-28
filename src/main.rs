@@ -7835,9 +7835,7 @@ const SPINE_WIDTH: f32 = 36.0;
 /// two must move together or the webview overlaps/undershoots the strip.
 const SESSION_STRIP_HEIGHT: f32 = 36.0;
 
-const SLIDE_DURATION_MS: f32 = 400.0;
-const SWIPE_DEBOUNCE_MS: u64 = 150;
-const EDGE_PEEK_ZONE: f32 = 30.0;
+use gitterm_core::workspace::slide::{SLIDE_DURATION_MS, SWIPE_DEBOUNCE_MS};
 
 fn workspace_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-slide")
@@ -8436,8 +8434,10 @@ type PhonePanel = phone_panel::PhonePanel<iced::widget::image::Handle>;
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
 /// the code (modules) that scanners need.
-const PHONE_QR_SCALE: usize = 6;
-const PHONE_QR_QUIET: usize = 4;
+#[cfg(test)]
+const PHONE_QR_SCALE: usize = phone_panel::PHONE_QR_SCALE;
+#[cfg(test)]
+const PHONE_QR_QUIET: usize = phone_panel::PHONE_QR_QUIET;
 
 /// Run one phone panel call against the remote's agent; the answer comes
 /// back as the event the panel applies.
@@ -8472,29 +8472,9 @@ async fn run_phone_call(call: PhoneCall<RemoteAgentClientConfig>) -> Event {
 
 /// The pairing URL as a QR image (black on white, quiet zone included).
 fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
-    let code = qrcode::QrCode::new(url.as_bytes())
-        .map_err(|err| format!("could not draw the pairing QR code: {err}"))?;
-    let modules = code.width();
-    let side = (modules + 2 * PHONE_QR_QUIET) * PHONE_QR_SCALE;
-    let mut pixels = vec![255u8; side * side * 4];
-    for (index, color) in code.to_colors().iter().enumerate() {
-        if *color != qrcode::Color::Dark {
-            continue;
-        }
-        let (mx, my) = (index % modules, index / modules);
-        for dy in 0..PHONE_QR_SCALE {
-            let y = (my + PHONE_QR_QUIET) * PHONE_QR_SCALE + dy;
-            for dx in 0..PHONE_QR_SCALE {
-                let x = (mx + PHONE_QR_QUIET) * PHONE_QR_SCALE + dx;
-                let at = (y * side + x) * 4;
-                pixels[at..at + 3].fill(0);
-            }
-        }
-    }
+    let qr = phone_panel::pairing_qr(url)?;
     Ok(iced::widget::image::Handle::from_rgba(
-        side as u32,
-        side as u32,
-        pixels,
+        qr.side, qr.side, qr.pixels,
     ))
 }
 
@@ -17961,16 +17941,10 @@ impl App {
             );
             return Task::none();
         };
-        let name = root
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("remote")
-            .to_string();
+        let name = gitterm_core::remote::folders::workspace_name(&remote_name, &root);
         let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
         let mut workspace = Workspace::new(
-            format!("{remote_name}:{name}"),
+            name,
             PathBuf::from(&root),
             WorkspaceColor::next_available(&used_colors),
         );
@@ -18024,30 +17998,20 @@ impl App {
     /// "same machine" alone isn't enough to reuse the active workspace.
     fn open_remote_folder_tab(&mut self, remote_id: &str, dir: String) -> Task<Event> {
         let folder = PathBuf::from(&dir);
-        let holds = |ws: &Workspace| match &ws.location {
-            WorkspaceLocation::RemoteAgent {
-                remote_id: rid,
-                root,
-                ..
-            } => rid == remote_id && folder.starts_with(root),
-            _ => false,
-        };
-        let existing = self
-            .active_workspace()
-            .filter(|ws| holds(ws))
-            .map(|_| self.active_workspace_index())
-            .or_else(|| {
-                // Deepest root first, as for chats.
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ws)| holds(ws))
-                    .max_by_key(|(_, ws)| {
-                        remote_agent_root(&ws.location)
-                            .map_or(0, |root| Path::new(root).components().count())
-                    })
-                    .map(|(idx, _)| idx)
-            });
+        let locations: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|ws| workspace_location_config_from_location(&ws.location))
+            .collect();
+        let existing = gitterm_core::remote::folders::folder_workspace(
+            locations
+                .iter()
+                .enumerate()
+                .map(|(i, location)| (i, location.as_ref())),
+            self.active_workspace_index(),
+            remote_id,
+            &folder,
+        );
         let mut tasks = Vec::new();
         match existing {
             Some(ws_idx) => {
@@ -20731,7 +20695,7 @@ impl App {
         // before startup I/O and the first window/menu tasks can receive quit.
         #[cfg(target_os = "macos")]
         native_quit::install();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = gitterm_core::workspace_config::initial_directory();
         let config::LoadedSettings {
             config,
             refused: settings_refused,
@@ -21230,11 +21194,8 @@ impl App {
         // If no workspaces were loaded, create one from the current directory
         if app.workspaces.is_empty() {
             let dir = cwd;
-            let name = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Home".to_string());
-            let mut workspace = Workspace::new(name, dir.clone(), WorkspaceColor::Lavender);
+            let initial = gitterm_core::workspace_config::initial_workspace(&dir);
+            let mut workspace = Workspace::new(initial.name, dir.clone(), initial.color.into());
             app.add_tab_to_workspace(&mut workspace, dir);
             app.open_workspace(workspace);
         }
@@ -27017,32 +26978,23 @@ impl App {
                 // Step 3-only: spawn a pi-backed agent tab in the active workspace
                 // and submit a hardcoded prompt so we can verify the subprocess
                 // pipeline end-to-end. Removed before Step 4 lands.
-                let model = std::env::var("PI_MODEL")
-                    .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
-                let session_path =
-                    format!("/tmp/gitterm-v6-agent-debug-{}.jsonl", std::process::id());
-                let config = tab::AgentBackendConfig::Pi {
-                    model,
-                    session_path: Some(session_path),
-                    thinking: Some(true),
+                let Some(ws) = self.active_workspace() else {
+                    return Task::none();
                 };
-                let (repo_path, current_dir) = match self.active_workspace() {
-                    Some(ws) => {
-                        let cd = ws
-                            .active_tab()
-                            .map(|t| t.current_dir.clone())
-                            .unwrap_or_else(|| ws.dir.clone());
-                        (ws.dir.clone(), Some(cd))
-                    }
-                    None => return Task::none(),
-                };
+                let repo_path = ws.dir.clone();
+                let launch = gitterm_core::harness::pi::runtime::debug_launch(
+                    &repo_path,
+                    ws.active_tab().map(|tab| tab.current_dir.as_path()),
+                    std::env::var("PI_MODEL"),
+                    std::process::id(),
+                );
 
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
                 if let Some(ws) = self.active_workspace_mut() {
                     let mut tab = TabState::new(id, repo_path.clone());
-                    tab.kind = TabKind::Agent(AgentSession::new(config));
-                    tab.set_local_dir(current_dir.unwrap_or(repo_path));
+                    tab.kind = TabKind::Agent(AgentSession::new(launch.config));
+                    tab.set_local_dir(launch.cwd);
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
                 }
@@ -29568,13 +29520,12 @@ impl App {
                         .iter()
                         .position(|&idx| idx == self.active_workspace_index())
                         .unwrap_or(0);
-                    let has_left = position > 0;
-                    let has_right = position + 1 < order.len();
-
-                    let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
-                    let near_right = has_right
-                        && content_x > content_width - EDGE_PEEK_ZONE
-                        && content_x <= content_width;
+                    let (near_left, near_right) = gitterm_core::workspace::slide::edge_peek(
+                        content_x,
+                        content_width,
+                        position,
+                        order.len(),
+                    );
 
                     if near_left != self.edge_peek_left || near_right != self.edge_peek_right {
                         self.edge_peek_left = near_left;
@@ -31550,7 +31501,7 @@ impl App {
                 if let Some(start_time) = self.slide_start_time {
                     let elapsed = start_time.elapsed().as_millis() as f32;
                     let t = (elapsed / SLIDE_DURATION_MS).min(1.0);
-                    let eased = 1.0 - (1.0 - t).powi(3);
+                    let eased = gitterm_core::workspace::slide::eased(elapsed);
                     self.slide_offset = self.slide_start_offset
                         + (self.slide_target - self.slide_start_offset) * eased;
 
@@ -31605,7 +31556,11 @@ impl App {
                         // Update active workspace based on current scroll
                         // position, in the slide's order (TRU-175).
                         let order = self.slide_order();
-                        let position = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let position = gitterm_core::workspace::slide::nearest(
+                            offset,
+                            viewport_width,
+                            order.len(),
+                        );
                         let nearest = order
                             .get(position.min(order.len().saturating_sub(1)))
                             .copied()

@@ -1,5 +1,5 @@
 //! WebKit host: local Viewer documents in a nonpersistent store, or a remote
-//! Page in GPUI's own login store. No Wry or IPC.
+//! Page in GPUI's own login store. The only local message asks to close a viewer.
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -20,7 +20,8 @@ use objc2_foundation::{
 };
 use objc2_web_kit::{
     WKNavigation, WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate,
-    WKSnapshotConfiguration, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
+    WKScriptMessage, WKScriptMessageHandler, WKSnapshotConfiguration, WKUserContentController,
+    WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -52,6 +53,7 @@ pub type NavigationResult = (LoadTicket, Result<(), String>);
 #[derive(Default)]
 struct NavigationState {
     injection: Cell<bool>,
+    close_requested: Cell<bool>,
     /// A remote Page: navigation follows its `PagePolicy`, not the local policy.
     page: Option<Rc<RefCell<PagePolicy>>>,
     /// The Page URL just requested; its own first navigation always loads.
@@ -80,6 +82,19 @@ define_class!(
     struct LocalNavigation;
 
     unsafe impl NSObjectProtocol for LocalNavigation {}
+    unsafe impl WKScriptMessageHandler for LocalNavigation {
+        #[unsafe(method(userContentController:didReceiveScriptMessage:))]
+        fn received(&self, _: &WKUserContentController, message: &WKScriptMessage) {
+            // A child frame cannot dismiss the dedicated viewer.
+            if unsafe { message.frameInfo().isMainFrame() }
+                && unsafe { message.body() }
+                    .downcast_ref::<NSString>()
+                    .is_some_and(|body| body.to_string() == "close")
+            {
+                self.ivars().close_requested.set(true);
+            }
+        }
+    }
     unsafe impl WKNavigationDelegate for LocalNavigation {
         #[unsafe(method(webView:decidePolicyForNavigationAction:decisionHandler:))]
         unsafe fn decide(
@@ -230,7 +245,7 @@ pub enum PageRequest {
 
 /// A Page's link policy: Iced's wry handlers around the shared
 /// `page_navigation_decision`. Popups open in the browser; main-frame
-/// navigations follow the decision; embedded frames load in place.
+/// navigations follow the decision; embedded frames open externally, as in wry.
 #[derive(Debug)]
 pub struct PagePolicy {
     pub context: PageNavigationContext,
@@ -247,15 +262,16 @@ impl PagePolicy {
 
     /// Whether WebKit may load `url`; queues the other effects for the window.
     pub fn decide(&mut self, url: Option<&str>, new_window: bool, main_frame: bool) -> bool {
-        let Some(url) = url.filter(|url| gitterm_core::page_store::browser_url(url).is_ok()) else {
+        let Some(url) = url else {
             return false;
         };
-        if new_window {
-            self.requests.push(PageRequest::External(url.to_owned()));
+        if new_window || !main_frame {
+            if gitterm_core::page_navigation::page_new_window_decision(url)
+                == PageNavigationDecision::External
+            {
+                self.requests.push(PageRequest::External(url.to_owned()));
+            }
             return false;
-        }
-        if !main_frame {
-            return true;
         }
         match page_navigation_decision(url, &self.context) {
             PageNavigationDecision::Allow => {
@@ -346,6 +362,7 @@ impl LocalWebKitHost {
         // thread. Retain it until this host detaches in Drop.
         let parent = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }
             .ok_or("Missing native parent view")?;
+        let local = page.is_none();
         let navigation: Retained<LocalNavigation> = unsafe {
             let allocated = LocalNavigation::alloc(mtm).set_ivars(NavigationState {
                 page,
@@ -354,10 +371,18 @@ impl LocalWebKitHost {
             msg_send![super(allocated), init]
         };
         // SAFETY: configuration and all native view operations stay on the main
-        // thread. No user scripts/message handlers are added; only a Page persists data.
+        // thread. Local content can only request close; only a Page persists data.
         let view = unsafe {
             let configuration = WKWebViewConfiguration::new(mtm);
             configuration.setWebsiteDataStore(&store);
+            if local {
+                configuration
+                    .userContentController()
+                    .addScriptMessageHandler_name(
+                        ProtocolObject::from_ref(&*navigation),
+                        &NSString::from_str("gittermViewer"),
+                    );
+            }
             let view = WKWebView::initWithFrame_configuration(
                 WKWebView::alloc(mtm),
                 NSRect::ZERO,
@@ -374,6 +399,10 @@ impl LocalWebKitHost {
             navigation,
             results: Rc::default(),
         })
+    }
+
+    pub fn take_close_requested(&mut self) -> bool {
+        self.navigation.ivars().close_requested.replace(false)
     }
 
     pub fn drain_external(&mut self) -> Vec<String> {
@@ -399,6 +428,7 @@ impl SurfaceHost for LocalWebKitHost {
         self.hide();
         self.navigation.ivars().pending.borrow_mut().take();
         self.navigation.ivars().external.borrow_mut().clear();
+        self.navigation.ivars().close_requested.set(false);
         // SAFETY: main-thread WebKit instance, owned string, no filesystem base
         // URL or read-access grant. The store never changes across replacements.
         let navigation = unsafe {
@@ -461,6 +491,7 @@ impl SurfaceHost for LocalWebKitHost {
         self.hide();
         self.navigation.ivars().pending.borrow_mut().take();
         self.navigation.ivars().external.borrow_mut().clear();
+        self.navigation.ivars().close_requested.set(false);
         unsafe {
             self.view.stopLoading();
             self.navigation.ivars().injection.set(true);
@@ -524,7 +555,49 @@ impl Drop for LocalWebKitHost {
         unsafe {
             self.view.stopLoading();
             self.view.setNavigationDelegate(None);
+            self.view
+                .configuration()
+                .userContentController()
+                .removeScriptMessageHandlerForName(&NSString::from_str("gittermViewer"));
         }
         self.view.removeFromSuperview();
+    }
+}
+
+#[cfg(test)]
+mod page_policy_tests {
+    use super::*;
+
+    #[test]
+    fn page_iframes_and_new_windows_open_externally_like_iced_wry() {
+        let origin = "https://github.com/example/repo/pull/1";
+        let mut policy = PagePolicy::new(PageNavigationContext {
+            url: origin.into(),
+            store: PageStore::Default,
+            github_accounts: Default::default(),
+            linear_workspaces: Default::default(),
+        });
+        for (popup, main) in [(false, false), (true, false), (true, true)] {
+            for url in [
+                origin,
+                "http://example.com/frame",
+                "https://example.com/frame",
+            ] {
+                assert!(!policy.decide(Some(url), popup, main));
+                assert_eq!(policy.drain(), vec![PageRequest::External(url.into())]);
+                assert_eq!(policy.context.url, origin);
+            }
+            for url in [
+                None,
+                Some("about:blank"),
+                Some("file:///tmp/fixture"),
+                Some("javascript:alert(1)"),
+            ] {
+                assert!(!policy.decide(url, popup, main));
+                assert!(policy.drain().is_empty());
+            }
+        }
+        assert!(policy.decide(Some(origin), false, true));
+        assert_eq!(policy.drain(), vec![PageRequest::Navigated(origin.into())]);
     }
 }

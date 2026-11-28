@@ -45,6 +45,7 @@ mod layout;
 mod lifetime;
 mod live;
 mod startup_failure;
+mod view_preferences;
 pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
@@ -57,6 +58,7 @@ mod pane;
 mod park;
 pub mod park_sheet;
 pub mod phone;
+mod plans_viewer;
 mod pr_confirm;
 mod pr_live;
 pub mod preview;
@@ -87,6 +89,7 @@ pub mod usage;
 pub mod work_sidebar;
 pub mod workspace_bar;
 pub mod workspace_config;
+mod workspace_navigation;
 pub mod workspace_settings_sheet;
 pub mod workspace_sheet;
 pub mod workspace_status;
@@ -99,9 +102,8 @@ use data::{Session, SessionId, ShellData, Workspace, WorkspaceId};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb,
-    size,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use gpui_component::{
     Root, StyledExt,
@@ -147,7 +149,10 @@ pub struct Shell {
     bottom: Entity<bottom_panel::BottomPanel>,
     run_tabs: HashMap<String, bottom_panel::RunTab>,
     run_url_poll: Option<gpui::Task<()>>,
+    terminal_mirror: Option<gpui::Task<()>>,
     plans_open: bool,
+    plans_content: Entity<content::window::ContentWindow>,
+    plans_request: Option<plans_viewer::Request>,
     plans_return_focus: Option<FocusHandle>,
     usage_open: bool,
     usage_return_focus: Option<FocusHandle>,
@@ -275,7 +280,6 @@ impl Shell {
                 notifications.enabled = settings.notifications.needs_you;
             }
         });
-        let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
                 settings,
@@ -286,6 +290,7 @@ impl Shell {
         let usage_page = cx.new(|_| usage::UsagePage::from_input(usage_input.clone()));
         gitterm_gpui_review::init(cx);
         let content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
+        let plans_content = cx.new(|cx| content::window::ContentWindow::new(window, cx));
         let catalog = data.workspaces(cx);
         let saved_parked = if local {
             owner.read(cx).saved_parked()
@@ -362,13 +367,23 @@ impl Shell {
             }
             cx.notify();
         })];
+        subscriptions.push(
+            cx.observe_in(&plans_content, window, |this, content, window, cx| {
+                let close = content.update(cx, |content, _| {
+                    std::mem::take(&mut content.close_requested)
+                });
+                if close && this.plans_open {
+                    this.toggle_plans(window, cx);
+                }
+                cx.notify();
+            }),
+        );
         for state in &mut workspaces {
             if !state.store.path.exists() {
                 state.store.regions.bottom_height = bottom.read(cx).input.height;
                 state.store.regions.bottom_visible = settings.console_expanded;
             }
             load_workspace_layout(state, window, cx)?;
-            state.store.regions.resize_sidebar(sidebar_width);
             if !bottom_pane_ids(state, cx).is_empty() {
                 state.store.regions.bottom_opened = true;
             }
@@ -394,6 +409,12 @@ impl Shell {
                 }
             }
         }
+        let sidebar_width = Self::restore_view_preferences(
+            &mut workspaces,
+            settings,
+            bottom.read(cx).input.height,
+            cx,
+        );
         subscriptions
             .push(cx.on_app_quit(|shell: &mut Self, cx| shell.save_remote_tabs_on_quit(cx)));
         subscriptions.push(cx.observe(&owner, |this, _, cx| {
@@ -467,7 +488,10 @@ impl Shell {
             bottom,
             run_tabs: HashMap::new(),
             run_url_poll: None,
+            terminal_mirror: None,
             plans_open: false,
+            plans_content,
+            plans_request: None,
             plans_return_focus: None,
             usage_open: false,
             usage_return_focus: None,
@@ -597,6 +621,7 @@ impl Shell {
         {
             theme::set_chat_width(width, cx);
         }
+        shell.sync_log_mirroring(cx);
         Ok(shell)
     }
     fn sync_content_selection(&self, cx: &mut Context<Self>) {
@@ -2602,7 +2627,18 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: self.browser.bar(colors),
+            // Preview keeps v6's idle button; its click reports the Iced label.
+            browser: if chat::policy::is_live(cx) {
+                self.browser.bar(colors)
+            } else {
+                workspace_bar::Browser {
+                    color: colors.muted,
+                    driving: false,
+                    hint: "Browser idle".into(),
+                    action: Some(workspace_bar::BrowserAction::Open),
+                    has_evidence: false,
+                }
+            },
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
@@ -3034,6 +3070,7 @@ impl Shell {
             change(&mut state.store.regions);
             save_layout(state, cx);
         }
+        self.save_global_geometry(cx);
         self.sync_git_visibility(true, cx);
         cx.notify();
     }
@@ -3226,101 +3263,24 @@ impl Shell {
             )
     }
     fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
-        if self.selected_task.is_some()
-            && let Some(panel) = &self.task_panel
-            && state
-                .active_session
-                .and_then(|id| self.session_task(id, cx))
-                .is_none()
-        {
-            return div()
-                .id("task-overview-host")
-                .flex_1()
-                .h_full()
-                .child(task_panel::overview_view(panel, self.task_inputs(cx), cx));
-        }
-        #[cfg(test)]
-        if self.dock_fixture {
-            return div()
-                .id("dock-fixture")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(state.dock.clone());
-        }
-        if state.active_session.is_none() {
-            if let Some(home) = self.remote_session_home(cx) {
-                return home;
-            }
-            return div()
-                .id("session-content")
-                .debug_selector(|| "session-content".into())
-                .flex_1()
-                .min_w_0()
-                .h_full();
-        }
-        let selected = self
-            .content
-            .read(cx)
-            .selected
-            .as_ref()
-            .and_then(|id| state.panes.get(id));
-        let bottom = bottom_pane_ids(state, cx);
-        let active = state.active_session.map(session_pane_id);
-        let pane = selected
-            .or_else(|| {
-                active
-                    .as_ref()
-                    .filter(|id| pane_id_visible(state, id, cx) && !bottom.contains(id))
-                    .and_then(|id| state.panes.get(id))
-            })
-            .or_else(|| {
-                state
-                    .panes
-                    .iter()
-                    .find(|(id, _)| {
-                        !id.ends_with("-git")
-                            && !id.ends_with("-files")
-                            && pane_id_visible(state, id, cx)
-                            && !bottom.contains(id)
-                    })
-                    .map(|(_, pane)| pane)
-            });
         div()
-            .id("session-content")
-            .debug_selector(|| "session-content".into())
+            .id("workspace-slide-host")
             .flex_1()
             .min_w_0()
             .h_full()
-            .overflow_hidden()
-            .when(
-                pane.is_some_and(|pane| {
-                    matches!(
-                        pane.read(cx).content,
-                        pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
-                    )
-                }),
-                |pane| pane.font_family(".SystemUIFont"),
-            )
-            .when(
-                pane.is_some_and(|p| matches!(p.read(cx).content, pane::PaneContent::Terminal(_))),
-                |host| {
-                    host.capture_any_mouse_down(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
-                    })
-                    .capture_any_mouse_up(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
-                    })
-                },
-            )
-            .children(pane.cloned())
+            .child(workspace_navigation::WorkspaceSlide {
+                shell: cx.weak_entity(),
+                home: self
+                    .active(cx)
+                    .active_session
+                    .is_none()
+                    .then(|| self.remote_session_home(cx))
+                    .flatten(),
+            })
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_global_geometry(f32::from(window.viewport_size().height), cx);
+        self.refresh_view_appearance(cx);
         self.run_tabs.retain(|id, _| {
             self.workspaces
                 .iter()
@@ -3536,7 +3496,7 @@ impl Shell {
                 },
                 cx,
             ),
-            O::ToggleMirroring => self.preview_unavailable("Terminal log mirroring", cx),
+            O::ToggleMirroring => self.toggle_log_mirroring(cx),
             O::AddTerminal { repo } => {
                 let cwd = match repo {
                     None => None,
@@ -4250,9 +4210,30 @@ impl Shell {
     }
     fn menu_root(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use app_menus::*;
+        let mut menu_context = self
+            .menu_context(window, cx)
+            .replace(" IcedTerminalSearch", "");
+        if self
+            .active_main_terminal(cx)
+            .is_some_and(|view| view.read(cx).is_find_open())
+        {
+            menu_context.push_str(" IcedTerminalSearch");
+        }
         div()
+            .capture_any_mouse_up(cx.listener(|this, event: &gpui::MouseUpEvent, _, cx| {
+                if event.button == gpui::MouseButton::Left {
+                    this.finish_preference_resize(cx);
+                }
+            }))
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // The existing finish handler may already have cleared resize.
+                    this.save_global_geometry(cx);
+                }),
+            )
             .track_focus(&self.focus)
-            .key_context(self.menu_context(window, cx).as_str())
+            .key_context(menu_context.as_str())
             .capture_key_down(cx.listener(Self::guard_app_shortcut))
             // Iced's key handler closes a modal on Escape before any page-local
             // Escape (the composer's slash menu, an input, find or review).
@@ -4306,9 +4287,7 @@ impl Shell {
             ))
             .on_action(Self::background(
                 cx,
-                |this, _: &DebugSpawnAgentTab, _, cx| {
-                    this.preview_unavailable("Debug agent tab", cx)
-                },
+                |this, _: &DebugSpawnAgentTab, window, cx| this.debug_agent_tab(window, cx),
             ))
             .on_action(Self::background(
                 cx,
@@ -4420,13 +4399,13 @@ impl Shell {
                     this.run_repo(repo, w, cx);
                 }
             }))
-            .on_action(Self::background(cx, |this, _: &ToggleTheme, _, cx| {
-                this.chrome_unavailable("Toggle Light/Dark Theme", cx);
+            .on_action(Self::background(cx, |this, _: &ToggleTheme, w, cx| {
+                this.toggle_view_theme(w, cx);
             }))
             .on_action(Self::background(
                 cx,
                 |this, _: &ToggleTerminalLogMirroring, _, cx| {
-                    this.chrome_unavailable("Toggle Terminal Log Mirroring", cx);
+                    this.toggle_log_mirroring(cx);
                 },
             ))
             .on_action(Self::background(
@@ -4445,7 +4424,7 @@ impl Shell {
                 }
             }))
             .on_action(Self::background(cx, |this, _: &ToggleSearch, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+                if let Some(view) = this.active_main_terminal(cx) {
                     if view.read(cx).is_find_open() {
                         view.update(cx, |v, cx| v.close_find(w, cx));
                     } else {
@@ -4454,13 +4433,23 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .on_action(Self::background(cx, |this, _: &SearchNext, w, cx| {
-                if let Some(view) = this.focused_terminal(w, cx) {
+            .on_action(Self::background(cx, |this, _: &SearchNext, _, cx| {
+                if let Some(view) = this.active_main_terminal(cx) {
                     view.update(cx, |v, cx| {
                         v.navigate_find(false, cx);
                     });
                 }
             }))
+            .on_action(Self::background(
+                cx,
+                |this, _: &view_preferences::SearchPrev, _, cx| {
+                    if let Some(view) = this.active_main_terminal(cx) {
+                        view.update(cx, |v, cx| {
+                            v.navigate_find(true, cx);
+                        });
+                    }
+                },
+            ))
             .on_action(Self::background(cx, |this, _: &TaskSwitcherOpen, w, cx| {
                 this.open_task_switcher(w, cx)
             }))
@@ -4737,8 +4726,22 @@ impl Shell {
             I::ChartTokens(tokens) => self.usage_input.chart_tokens = tokens,
             I::ToggleHeadless => self.usage_input.show_headless = !self.usage_input.show_headless,
             I::PinChanged(pin) => {
-                if self.usage_input.plan_limits.pin != pin {
+                if !crate::chat::policy::is_live(cx) {
                     self.preview_unavailable("Routing pin", cx);
+                } else if let Some(host) = cx
+                    .try_global::<task_host::GpuiTaskHost>()
+                    .map(|host| host.0.clone())
+                {
+                    if let Some(file) =
+                        host.update(cx, |host, cx| host.routing_pin_changed(pin, cx))
+                    {
+                        self.usage_input.plan_limits = file;
+                    }
+                } else {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some("Routing pin: Live routing host unavailable".into());
+                        cx.notify();
+                    });
                 }
             }
         }
@@ -4753,9 +4756,13 @@ impl Shell {
     }
     fn set_chat_width(&mut self, width: gitterm_core::settings::ChatWidth, cx: &mut Context<Self>) {
         theme::set_chat_width(width, cx);
+        self.save_view_preferences(move |settings| settings.chat_width = width, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_width = Some(width);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_width = Some(width);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4769,87 +4776,19 @@ impl Shell {
         }
         cx.notify();
     }
-    fn toggle_plans(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.plans_open {
-            self.plans_open = false;
-            if let Some(focus) = self.plans_return_focus.take() {
-                focus.focus(window, cx);
-            }
-        } else if self.active_workspace(cx).is_some() {
-            self.plans_return_focus = window.focused(cx);
-            self.plans_open = true;
-            self.focus.focus(window, cx);
-        }
-        cx.notify();
-    }
-    fn plans_viewer(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let p = Palette::current(cx);
-        let workspace = self.active(cx).workspace.id;
-        let state = self.work_state.borrow();
-        let documents = state.documents(workspace.0);
-        let mut list = div()
-            .id("plans-documents")
-            .debug_selector(|| "plans-documents".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_2();
-        if let Some(result) = documents.and_then(|docs| docs.result.as_ref()) {
-            if result.documents.is_empty() {
-                list = list.child("No documents found.");
-            }
-            for (index, document) in result.documents.iter().enumerate() {
-                let path = document.newest().path.clone();
-                list = list.child(
-                    Button::new(("plan", index))
-                        .debug_selector(move || format!("plan-{index}"))
-                        .label(format!("{} · {}", document.title, document.rel))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.toggle_plans(window, cx);
-                            this.owner.update(cx, |owner, cx| {
-                                owner.open_file(workspace, path.clone(), cx)
-                            });
-                        })),
-                );
-            }
-            if result.truncated {
-                list = list.child("Some documents may be missing: scan limit reached.");
-            }
-        } else {
-            list = list.child("Loading documents…");
-        }
-        if let Some(error) = documents.and_then(|docs| docs.error.as_ref()) {
-            list = list.child(div().text_color(rgb(p.red)).child(error.clone()));
-        }
-        div()
-            .id("plans-viewer")
-            .debug_selector(|| "plans-viewer".into())
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p_4()
-            .gap_3()
-            .bg(rgb(p.base))
-            .child(
-                div().flex().justify_between().child("Documents").child(
-                    Button::new("close-plans")
-                        .label("Close")
-                        .on_click(cx.listener(|this, _, w, cx| this.toggle_plans(w, cx))),
-                ),
-            )
-            .child(list)
-    }
     fn resize_chat_font(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = (theme::chat_appearance(cx).font_size + delta).clamp(11., 22.);
+        if size == theme::chat_appearance(cx).font_size {
+            return;
+        }
         theme::set_chat_font_size(size, cx);
+        self.save_view_preferences(move |settings| settings.chat_font_size = size, cx);
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.chat_font_size = Some(size);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.chat_font_size = Some(size);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 pane.update(cx, |pane, cx| {
                     if let pane::PaneContent::Chat(view) = &pane.content {
@@ -4870,11 +4809,25 @@ impl Shell {
         } else {
             &mut fonts.terminal
         };
-        *value = (*value + delta).clamp(10., 24.);
+        let next = (*value + delta).clamp(10., 24.);
+        if next == *value {
+            return;
+        }
+        *value = next;
         theme::set_font_sizes(fonts, cx);
+        self.save_view_preferences(
+            move |settings| {
+                settings.ui_font_size = fonts.ui;
+                settings.terminal_font_size = fonts.terminal;
+            },
+            cx,
+        );
+        let live = Self::live_preferences(cx);
         for state in &mut self.workspaces {
-            state.store.regions.fonts = Some(fonts);
-            save_layout(state, cx);
+            if !live {
+                state.store.regions.fonts = Some(fonts);
+                save_layout(state, cx);
+            }
             for pane in state.panes.values() {
                 if let pane::PaneContent::Terminal(view) = &pane.read(cx).content {
                     theme::sync_terminal_typography(&view.clone(), cx);
@@ -5199,6 +5152,7 @@ impl Render for Shell {
             }
         }
         self.sync_content_selection(cx);
+        self.sync_plans_viewer(window, cx);
         if let Some(switcher) = &self.task_switcher {
             let inputs = self.switcher_inputs(cx);
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
@@ -5237,6 +5191,11 @@ impl Render for Shell {
                                 window,
                                 cx,
                             );
+                        }
+                        if let work_sidebar::WorkSidebarOutcome::OpenDocument { workspace, path } =
+                            outcome
+                        {
+                            shell.open_work_document(WorkspaceId(*workspace), path, window, cx);
                         }
                         shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
@@ -5386,6 +5345,8 @@ impl Render for Shell {
                                     .h_full()
                                     .child(self.usage_page.clone())
                                     .into_any_element()
+                            } else if self.plans_open {
+                                self.plans_viewer(cx).into_any_element()
                             } else {
                                 self.find_content(cx).into_any_element()
                             }),
@@ -5435,7 +5396,6 @@ impl Render for Shell {
                     .as_ref()
                     .and_then(|panel| task_panel::modal_view(panel, self.task_inputs(cx), cx)),
             )
-            .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
             .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
@@ -5529,14 +5489,30 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     let app_shutdown = shutdown.clone();
     let config = preview.roots.layout();
     let mut store = workspace_config::WorkspaceStore::guarded(preview.writer());
-    let (model, startup_save) = if let Some(snapshot) = live_snapshot {
-        let file = match snapshot.workspaces.loaded {
+    let (mut model, startup_save) = if let Some(snapshot) = live_snapshot {
+        let mut file = match snapshot.workspaces.loaded {
             gitterm_core::desktop_store::LoadState::Valid(file) => file,
             gitterm_core::desktop_store::LoadState::Missing => Default::default(),
             gitterm_core::desktop_store::LoadState::Refused(error) => {
                 anyhow::bail!("Live workspaces refused: {error}")
             }
         };
+        if !file.workspaces.iter().any(|workspace| workspace.active) {
+            let initial = gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            );
+            // Live owns V6 persistence. Preview's fallback below is memory only.
+            file = live_desktop
+                .as_ref()
+                .expect("Live desktop owner")
+                .try_edit_workspaces(move |file| {
+                    file.workspaces.push(initial);
+                    file.active_workspace = 0;
+                    Ok(())
+                })
+                .wait()
+                .map_err(anyhow::Error::msg)?;
+        }
         store.load()?;
         store.parked.clear();
         let catalog = workspace_config::IcedCatalog::from_document(host_lock.root(), file);
@@ -5553,6 +5529,21 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         let model = workspace_config::load_iced_workspaces(&mut store);
         (model, None)
     };
+    let empty_preview_start = !sample && model.workspaces.is_empty();
+    if empty_preview_start {
+        let catalog = store.iced.as_mut().expect("loaded Iced catalog");
+        if catalog.source.as_os_str().is_empty() {
+            catalog.source = workspace_config::iced_config_dir();
+        }
+        catalog
+            .workspaces
+            .push(gitterm_core::workspace_config::initial_workspace(
+                &gitterm_core::workspace_config::initial_directory(),
+            ));
+        catalog.order = vec![0];
+        catalog.active = 0;
+        model = WorkspaceStatus::from_iced(catalog);
+    }
     let (title_workspace, title_tab) = model
         .active()
         .and_then(|active| {
@@ -5664,10 +5655,13 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                             owner.update(cx, |owner, cx| owner.watch_save(save, cx));
                         }
                         let data = Rc::new(data::LocalData(owner.clone()));
-                        let shell = Shell::with_owner_settings(
+                        let mut shell = Shell::with_owner_settings(
                             data, owner, &config, true, &settings, window, cx,
                         )
                         .expect("create local shell");
+                        if empty_preview_start {
+                            terminal_setup::start_initial_terminal(&mut shell, window, cx);
+                        }
                         shell.sync_git_visibility(false, cx);
                         shell
                     }

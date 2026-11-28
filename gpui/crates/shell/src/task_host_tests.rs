@@ -3119,7 +3119,7 @@ mod live_writes {
                 .for_gpui_live(),
         );
         let owner = cx
-            .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+            .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
             .unwrap();
         // Exercise the same issuance path used by the shell's chat descriptor.
         assert_eq!(
@@ -3740,7 +3740,7 @@ fn live_pr_mcp_set_get_preserves_full_response_and_uses_live_root(cx: &mut TestA
     );
     let (config, sender) = fixture.config();
     let owner = cx
-        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
         .unwrap();
     let set = dispatch_as(
         cx,

@@ -79,5 +79,31 @@ pub(crate) fn launch(
         })
 }
 
+/// Preview's synthetic cwd tab is a new shell, rather than a read-only view
+/// of a terminal imported from Iced. Retain its single pane and session id.
+pub(crate) fn start_initial_terminal(
+    shell: &mut crate::Shell,
+    window: &mut gpui::Window,
+    cx: &mut Context<crate::Shell>,
+) {
+    let state = shell.active(cx);
+    let session = state.active_session.expect("initial cwd session");
+    let pane = state.panes[&crate::session_pane_id(session)].clone();
+    let workspace = state.workspace.id;
+    let cwd = shell.data.terminal_cwd(workspace, cx).expect("initial cwd");
+    let data = shell.data.clone();
+    pane.update(cx, |pane, cx| {
+        *pane = crate::pane::Pane::new(
+            pane.id.clone(),
+            pane.title.clone(),
+            crate::pane::PaneKind::CenterTerminal(cwd, None),
+            workspace,
+            data,
+            window,
+            cx,
+        );
+    });
+}
+
 #[cfg(test)]
 mod tests;

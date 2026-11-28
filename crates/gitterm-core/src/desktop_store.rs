@@ -6,7 +6,9 @@
 use crate::settings::DesktopSettings;
 use crate::state_lock::StateLock;
 use crate::workspace_config::WorkspacesFile;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
+#[cfg(test)]
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -127,6 +129,14 @@ impl DesktopStore {
                 let _ = sender.send(result);
             })));
         Receipt(receiver)
+    }
+
+    /// Shared routing owner writes through the same serialized V6 store.
+    pub fn save_plan_limits(&self, file: crate::plan_limits::PlanLimitsFile) -> Receipt<()> {
+        self.submit(move |_, root| {
+            let path = crate::plan_limits::PlanLimitsFile::path_in(root);
+            write_plan_limits(&path, &file)
+        })
     }
 
     pub fn snapshot(&self) -> Receipt<Snapshot> {
@@ -326,7 +336,7 @@ impl DesktopStore {
                     settings.task_worktree_root.0 = None;
                 }
             }
-            save(&mut state.settings, &root.join("settings.json"))
+            save_settings(&mut state.settings, &root.join("settings.json"))
         })
     }
 
@@ -337,7 +347,7 @@ impl DesktopStore {
     }
 
     pub fn save_settings(&self) -> Receipt<()> {
-        self.submit(|state, root| save(&mut state.settings, &root.join("settings.json")))
+        self.submit(|state, root| save_settings(&mut state.settings, &root.join("settings.json")))
     }
 
     pub fn drain(&self) -> Receipt<()> {
@@ -345,7 +355,7 @@ impl DesktopStore {
             // Try both files even if one writer is blocked.
             let workspaces =
                 save_workspace_document(&mut state.workspaces, &root.join("workspaces.json"));
-            let settings = save(&mut state.settings, &root.join("settings.json"));
+            let settings = save_settings(&mut state.settings, &root.join("settings.json"));
             let errors: Vec<_> = [workspaces, settings]
                 .into_iter()
                 .filter_map(Result::err)
@@ -356,6 +366,85 @@ impl DesktopStore {
                 Err(errors.join("; "))
             }
         })
+    }
+}
+
+/// Retain newer fields while using Iced's exact known-field serialization.
+fn write_plan_limits(path: &Path, file: &crate::plan_limits::PlanLimitsFile) -> Result<(), String> {
+    let mut original: serde_json::Value = match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    // Validate before mutating; never turn a malformed file into defaults.
+    let previous: crate::plan_limits::PlanLimitsFile = serde_json::from_value(original.clone())
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let known = serde_json::to_value(previous).map_err(|e| e.to_string())?;
+    let next = serde_json::to_value(file).map_err(|e| e.to_string())?;
+    let object = original
+        .as_object_mut()
+        .ok_or("plan-limits must be an object")?;
+    for key in [
+        "claude",
+        "codex",
+        "pin",
+        "policy",
+        "history",
+        "usage_badge",
+        "pending_notices",
+    ] {
+        let old = object.remove(key);
+        if let Some(value) = next.get(key) {
+            let mut value = value.clone();
+            if let (Some(old), Some(known)) = (old.as_ref(), known.get(key)) {
+                keep_unknown_fields(old, known, &mut value);
+            }
+            object.insert(key.into(), value);
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&original).map_err(|e| e.to_string())?;
+    crate::atomic_file::write_atomically(path, &bytes)
+}
+
+fn keep_unknown_fields(
+    raw: &serde_json::Value,
+    known: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    use serde_json::Value;
+    match (raw, known, next) {
+        (Value::Object(raw), Value::Object(known), Value::Object(next)) => {
+            for (key, value) in raw {
+                if let Some(previous) = known.get(key) {
+                    if let Some(next) = next.get_mut(key) {
+                        keep_unknown_fields(value, previous, next);
+                    }
+                } else {
+                    next.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        (Value::Array(raw), Value::Array(known), Value::Array(next)) => {
+            for next in next {
+                let previous = known.iter().position(|previous| {
+                    previous == next
+                        || (["provider", "label", "observed_at"]
+                            .iter()
+                            .any(|key| previous.get(key).is_some())
+                            && ["provider", "label", "resets_at", "observed_at"]
+                                .iter()
+                                .all(|key| previous.get(key) == next.get(key)))
+                });
+                if let Some(index) = previous {
+                    if let Some(raw) = raw.get(index) {
+                        keep_unknown_fields(raw, &known[index], next);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -574,7 +663,24 @@ fn save_workspace_document(
     result
 }
 
+fn save_settings(state: &mut FileState<DesktopSettings>, path: &Path) -> Result<(), String> {
+    save_with(state, path, crate::settings::save_desktop_to)
+}
+
+#[cfg(test)]
 fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), String> {
+    save_with(state, path, |path, document| {
+        let bytes = serde_json::to_vec_pretty(document)
+            .map_err(|e| format!("encode {}: {e}", path.display()))?;
+        crate::atomic_file::write_atomically(path, &bytes)
+    })
+}
+
+fn save_with<T>(
+    state: &mut FileState<T>,
+    path: &Path,
+    write: impl FnOnce(&Path, &T) -> Result<(), String>,
+) -> Result<(), String> {
     if let LoadState::Refused(error) = &state.loaded {
         return Err(error.clone());
     }
@@ -587,9 +693,7 @@ fn save<T: Serialize>(state: &mut FileState<T>, path: &Path) -> Result<(), Strin
         let LoadState::Valid(document) = &state.loaded else {
             return Err(format!("no document loaded for {}", path.display()));
         };
-        let bytes = serde_json::to_vec_pretty(document)
-            .map_err(|e| format!("encode {}: {e}", path.display()))?;
-        crate::atomic_file::write_atomically(path, &bytes)
+        write(path, document)
     })();
     match result {
         Ok(()) => {
@@ -994,5 +1098,80 @@ mod workspace_settings_tests {
             .wait()
             .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{malformed");
+    }
+}
+
+#[cfg(test)]
+mod routing_parity_tests {
+    use super::*;
+    use crate::{
+        limits::{PlanLimitsEvent, PlanLimitsState},
+        plan_limits::{PlanLimitsFile, Provider, RoutingPin},
+    };
+
+    #[test]
+    fn parity_routing_save_preserves_unknown_history_by_window_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let path = PlanLimitsFile::path_in(store.root());
+        let original = serde_json::json!({"history":[
+            {"provider":"codex","label":"old","resets_at":100,"samples":[],"future":"old"},
+            {"provider":"codex","label":"kept","resets_at":200,"samples":[],"future":"kept"}
+        ]});
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let next: PlanLimitsFile = serde_json::from_value(serde_json::json!({"history":[
+            {"provider":"codex","label":"kept","resets_at":200,"samples":[]},
+            {"provider":"codex","label":"new","resets_at":300,"samples":[]}
+        ]}))
+        .unwrap();
+        store.save_plan_limits(next).wait().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["history"][0]["future"], "kept");
+        assert!(saved["history"][1].get("future").is_none());
+    }
+
+    #[test]
+    fn parity_live_usage_pin_and_clear_save_iced_policy_json() {
+        let root = tempfile::tempdir().unwrap();
+        let path = PlanLimitsFile::path_in(root.path());
+        let mut original = serde_json::to_value(PlanLimitsFile::default()).unwrap();
+        original["future"] = serde_json::json!({"keep":17});
+        original["usage_badge"]["future_nested"] = serde_json::json!([17]);
+        std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let mut iced = PlanLimitsState::default();
+        for pin in [
+            Some(RoutingPin {
+                provider: Provider::Codex,
+                until: 2000,
+            }),
+            None,
+        ] {
+            let now = 1000;
+            iced.complete_event(PlanLimitsEvent::PinChanged(pin.clone()), &path, now);
+            let mut live = PlanLimitsState::load(store.root());
+            live.complete_event(PlanLimitsEvent::PinChanged(pin), &path, now);
+            live.begin_save(path.clone())
+                .unwrap()
+                .submit_to(&store)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(live.file(), iced.file());
+            let mut expected = serde_json::to_value(iced.file()).unwrap();
+            expected["future"] = original["future"].clone();
+            expected["usage_badge"]["future_nested"] =
+                original["usage_badge"]["future_nested"].clone();
+            let disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk, expected);
+        }
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(store
+            .save_plan_limits(PlanLimitsFile::default())
+            .wait()
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"broken");
     }
 }

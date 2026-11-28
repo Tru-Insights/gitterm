@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 #[cfg(feature = "runtime")]
 pub mod connect;
+pub mod folders;
 #[cfg(feature = "runtime")]
 pub mod launch;
 pub mod phone_panel;
