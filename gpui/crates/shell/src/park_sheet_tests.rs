@@ -384,6 +384,7 @@ fn outcomes(view: &Entity<ParkSheet>, cx: &mut VisualTestContext) -> Rc<RefCell<
 
 #[gpui::test]
 fn native_note_is_selected_editable_and_enter_emits_once(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let initial = chat("mine", Some("Prefilled note"), 1, None);
     let model = WorkspaceSheet::open(
         &state(),
@@ -413,6 +414,7 @@ fn native_note_is_selected_editable_and_enter_emits_once(cx: &mut TestAppContext
 
 #[gpui::test]
 fn native_close_enter_does_nothing_and_escape_cancels(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx) = setup(sheet(false), cx);
     let events = outcomes(&view, cx);
     cx.simulate_keystrokes("enter");
@@ -425,6 +427,7 @@ fn native_close_enter_does_nothing_and_escape_cancels(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn native_park_escape_cancels_from_note_focus(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx) = setup(sheet(true), cx);
     let events = outcomes(&view, cx);
     cx.simulate_keystrokes("escape");
@@ -434,6 +437,7 @@ fn native_park_escape_cancels_from_note_focus(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn native_parked_list_done_can_repeat_until_close(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (root, cx) = cx.add_window_view(|window, cx| {
         let sheet = cx.new(|cx| ParkSheet::parked(vec![row()], window, cx));
@@ -468,6 +472,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn native_close_button_emits_captured_target(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let model = sheet(false);
     let target = model.target.clone();
     let (view, cx) = setup(model, cx);
@@ -478,6 +483,7 @@ fn native_close_button_emits_captured_target(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn native_folder_park_button_emits_stopped_empty_note(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx) = setup(sheet(false), cx);
     let events = outcomes(&view, cx);
     click("Park", cx);
@@ -492,6 +498,7 @@ fn native_folder_park_button_emits_stopped_empty_note(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn native_keep_running_and_park_button_emit_edited_values(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx) = setup(sheet(true), cx);
     let events = outcomes(&view, cx);
     cx.simulate_input("Come back here");
@@ -508,6 +515,7 @@ fn native_keep_running_and_park_button_emit_edited_values(cx: &mut TestAppContex
 
 #[gpui::test]
 fn native_parked_row_buttons_emit_stable_key(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (root, cx) = cx.add_window_view(|window, cx| {
         let sheet = cx.new(|cx| ParkSheet::parked(vec![row()], window, cx));
@@ -526,6 +534,7 @@ fn native_parked_row_buttons_emit_stable_key(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn native_enter_parks_when_keep_running_has_focus(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx) = setup(sheet(true), cx);
     let events = outcomes(&view, cx);
     click("keep-running", cx);

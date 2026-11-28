@@ -82,6 +82,7 @@ pub(super) fn fixture(
 
 #[gpui::test]
 fn find_mount_select_close_filters_and_tab_owners(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let before = std::fs::read(root.path().join("iced/workspaces.json")).unwrap();
     click(cx, "Find");
@@ -174,6 +175,7 @@ fn find_mount_select_close_filters_and_tab_owners(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn find_open_resume_select_existing_history_and_refuse_new_process(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let before = std::fs::read(root.path().join("iced/workspaces.json")).unwrap();
     click(cx, "Find");
@@ -233,6 +235,7 @@ fn find_open_resume_select_existing_history_and_refuse_new_process(cx: &mut Test
 
 #[gpui::test]
 fn file_open_event_close_button_and_escape_return_to_same_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let (owner, workspace, session, pane) = cx.read(|cx| {
         let shell = shell.read(cx);
@@ -272,6 +275,7 @@ fn file_open_event_close_button_and_escape_return_to_same_session(cx: &mut TestA
 
 #[gpui::test]
 fn find_open_rows_refresh_and_keep_needs_you_before_working_before_idle(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     click(cx, "Find");
     let sessions = cx.read(|cx| shell.read(cx).active(cx).sessions.clone());

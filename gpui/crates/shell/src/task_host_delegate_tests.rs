@@ -86,6 +86,7 @@ fn assert_worker_started(
 
 #[gpui::test]
 fn delegate_task_prepares_and_starts_worker_in_fixture(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     // Codex from the calling tab's repository.
     let codex = launches
@@ -117,6 +118,7 @@ fn delegate_task_prepares_and_starts_worker_in_fixture(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn fixture_add_dir_outside_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let git = &launches.runs.git;
     // Outside the fixture, named directly or through a link inside it.
@@ -135,6 +137,7 @@ fn fixture_add_dir_outside_refused(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn delegate_path_swapped_after_prep_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let base = launches.runs.fixture.iced.parent().unwrap().to_path_buf();
     let elsewhere = base.join("elsewhere");
@@ -166,6 +169,7 @@ fn delegate_path_swapped_after_prep_refused(cx: &mut TestAppContext) {
 /// never started or attached; this host's own worker is.
 #[gpui::test]
 fn imported_delegation_never_started(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start_with(
         |runs0| {
             let mut imported = worker_delegation("imported-worker", "imported", "unused");
@@ -209,6 +213,7 @@ fn imported_delegation_never_started(cx: &mut TestAppContext) {
 /// stores and starts nothing.
 #[gpui::test]
 fn preview_delegate_task_answers_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let git = GitFixture::new(&fixture);
@@ -234,6 +239,7 @@ fn preview_delegate_task_answers_notice(cx: &mut TestAppContext) {
 /// While its worker delegation is open the checkout takes no more work.
 #[gpui::test]
 fn delegate_into_task_checkout_reuses_the_task(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -271,6 +277,7 @@ fn delegate_into_task_checkout_reuses_the_task(cx: &mut TestAppContext) {
 /// counts as working and its checkout can be delegated into again.
 #[gpui::test]
 fn blocked_worker_checkout_can_be_delegated_again(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -312,6 +319,7 @@ fn blocked_worker_checkout_can_be_delegated_again(cx: &mut TestAppContext) {
 /// written.
 #[gpui::test]
 fn delegate_into_unowned_worktree_adopts_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let git = &launches.runs.git;
     assert_eq!(
@@ -361,6 +369,7 @@ fn delegate_into_unowned_worktree_adopts_it(cx: &mut TestAppContext) {
 /// checkout check then refuses it, as Iced's does.
 #[gpui::test]
 fn delegate_repo_folds_as_iced_main_checkout(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let git = &launches.runs.git;
     let bare = git.root.join("bare.git");

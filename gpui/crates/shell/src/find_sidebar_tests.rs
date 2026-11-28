@@ -446,6 +446,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn native_query_filters_row_and_open_marker_emit_typed_outcomes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, mut facts) = fixture();
     facts.open_sessions.push(OpenSession {
@@ -502,6 +503,7 @@ fn native_query_filters_row_and_open_marker_emit_typed_outcomes(cx: &mut TestApp
 
 #[gpui::test]
 fn native_preview_buttons_emit_resume_and_close_and_raw_toggle_is_local(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (mut state, facts) = fixture();
     let select = FindOutcome::Select {
@@ -570,6 +572,7 @@ fn open_lines_match_iced_title_and_place_limits() {
 
 #[gpui::test]
 fn measured_rows_are_left_aligned_and_never_overlap(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, mut facts) = fixture();
     facts.open_sessions = [
@@ -793,6 +796,7 @@ fn overview_facts_follow_iced_machine_repo_branch_harness_order() {
 
 #[gpui::test]
 fn n13_overview_groups_idle_fold_and_live_navigation(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, mut facts) = fixture();
     for (id, marker) in [("first", "●"), ("second", "▶"), ("same", "✦")] {
@@ -888,6 +892,7 @@ fn n13_overview_groups_idle_fold_and_live_navigation(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn n13b_summary_folds_match_iced_limits_and_files_emit_local_open(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (mut state, facts) = fixture();
     preview_state(
@@ -957,6 +962,7 @@ fn n13b_summary_folds_match_iced_limits_and_files_emit_local_open(cx: &mut TestA
 
 #[gpui::test]
 fn n12_and_n13d_workspace_and_waiting_actions_are_notice_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (mut state, mut facts) = fixture();
     facts.workspaces = vec![
@@ -1032,6 +1038,7 @@ fn n12_and_n13d_workspace_and_waiting_actions_are_notice_only(cx: &mut TestAppCo
 
 #[gpui::test]
 fn n14_relevant_guard_and_n14a_widen_clicks_preserve_filters(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (mut state, mut facts) = fixture();
     state.reduce(Intent::SetFilter(Filter {
@@ -1113,6 +1120,7 @@ fn draw_host(cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn n16_escape_dismisses_file_before_preview_then_returns_to_overview(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = crate::h7_tests::fixture(cx);
     cx.update(|window, cx| {
         window.dispatch_action(Box::new(crate::app_menus::ChatsOverviewOpen), cx)
@@ -1223,6 +1231,7 @@ fn settled_tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 #[gpui::test]
 fn pw_notices_do_not_write_or_create_a_process_or_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = crate::h7_tests::fixture(cx);
     cx.update(|window, cx| {
         window.dispatch_action(Box::new(crate::app_menus::ChatsOverviewOpen), cx)
@@ -1323,6 +1332,7 @@ fn n14_confidence_choice_and_source_guard_match_iced() {
 fn n14_toggle_restores_recency_and_confident_order_keeps_adjacent_repo_groups(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, mut facts) = fixture();
     facts.relevance_available = true;
@@ -1388,6 +1398,7 @@ fn n14_toggle_restores_recency_and_confident_order_keeps_adjacent_repo_groups(
 
 #[gpui::test]
 fn n13_non_targets_are_disabled_and_remote_changed_files_are_text(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, mut facts) = fixture();
     facts
@@ -1467,6 +1478,7 @@ fn n14_fake_transport_uses_iced_contract_and_confidence_fallback() {
 
 #[gpui::test]
 fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (state, facts) = fixture();
     let (root, cx) = cx.add_window_view(|window, cx| {
@@ -1520,6 +1532,7 @@ fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppCont
 
 #[gpui::test]
 fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
     let id = format!(
         "unopened-{}",

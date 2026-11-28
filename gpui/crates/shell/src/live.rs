@@ -497,6 +497,7 @@ mod tests {
     use super::*;
     #[gpui::test]
     fn quit_during_backup_prompts_and_cancel_keeps_running(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let progress = Arc::new(ActivationProgress::default());
         cx.update(|cx| {

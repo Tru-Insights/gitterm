@@ -217,6 +217,7 @@ fn fixture(
 
 #[gpui::test]
 fn cmd_t_escape_activate_overview_and_context_back_are_separate(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, true);
     let focus = cx.update(|window, cx| window.focused(cx).unwrap());
     key(cx, "cmd-t");
@@ -286,6 +287,7 @@ fn cmd_t_escape_activate_overview_and_context_back_are_separate(cx: &mut TestApp
 
 #[gpui::test]
 fn new_work_button_follows_chat_recency(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, false);
     // ⌥⇧T is Iced's folder picker now (TRU-274), so only the button opens the sheet.
     for _ in 0..2 {
@@ -320,6 +322,7 @@ fn new_work_button_follows_chat_recency(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, false);
     let path = fixture.source.join("tasks.json");
     let mut document: TaskStoreDocument =
@@ -377,6 +380,7 @@ fn roster_periodic_read_finds_new_workers_and_preserves_local_dismissal(cx: &mut
 
 #[gpui::test]
 fn roster_is_fed_from_worker_fixture_and_row_click_stays_in_place(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, true);
     assert!(cx.debug_bounds("roster-dlg:worker").is_some());
     cx.read(|cx| {
@@ -449,6 +453,7 @@ fn roster_is_fed_from_worker_fixture_and_row_click_stays_in_place(cx: &mut TestA
 
 #[gpui::test]
 fn attention_cycles_open_sessions_in_iced_order(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, true);
     for expected in ["child-one", "child-two", "other-child", "child-one"] {
         cx.update(|window, cx| window.dispatch_action(Box::new(app_menus::AttentionJumpNext), cx));
@@ -469,6 +474,7 @@ fn attention_cycles_open_sessions_in_iced_order(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn attention_without_session_attention_cycles_tasks_in_store_order(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, false);
     for expected in ["closed-first", "closed-second", "closed-first"] {
         cx.update(|window, cx| window.dispatch_action(Box::new(app_menus::AttentionJumpNext), cx));
@@ -481,6 +487,7 @@ fn attention_without_session_attention_cycles_tasks_in_store_order(cx: &mut Test
 
 #[gpui::test]
 fn collapsed_work_sidebar_still_loads_switcher_and_roster_facts(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (fixture, shell, cx) = fixture(cx, true);
     cx.update(|_, cx| {
         shell.update(cx, |s, cx| {

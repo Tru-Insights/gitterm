@@ -285,6 +285,7 @@ fn dechunk(mut body: &str) -> String {
 /// its dispatch; its profile is the preview root's.
 #[gpui::test]
 fn host_browser_serves_reads_and_refuses_launch(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         preview::service::preview_notice,
         task_commands::mcp_protocol::{BROWSER_MCP_TOKEN_ENV, BROWSER_MCP_URL_ENV},
@@ -332,6 +333,7 @@ fn host_browser_serves_reads_and_refuses_launch(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn gpui_host_lists_seeded_tasks(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(
@@ -383,6 +385,7 @@ fn gpui_host_lists_seeded_tasks(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let app = cx.new_app();
@@ -422,6 +425,7 @@ fn gpui_host_shutdown_resolves_pending_replies(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn shell_lifetime_holds_host_lock_beyond_quit_and_reaper(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let lifetime = crate::lifetime::Lifetime::acquire(&fixture.roots).unwrap();
@@ -441,6 +445,7 @@ fn shell_lifetime_holds_host_lock_beyond_quit_and_reaper(cx: &mut TestAppContext
 
 #[gpui::test]
 fn preview_runs_beside_desktop_lifetime_lock(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(vec![task("desktop", TaskLifecycle::Ready)], vec![]);
@@ -454,6 +459,7 @@ fn preview_runs_beside_desktop_lifetime_lock(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn second_process_host_on_same_root_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(vec![task("first", TaskLifecycle::Ready)], vec![]);
@@ -547,6 +553,7 @@ fn recorded(dir: &Path) -> Vec<(PathBuf, Vec<u8>, SystemTime, u32)> {
 #[cfg(unix)]
 #[gpui::test]
 fn gpui_host_never_opens_v6_root(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::os::unix::fs::PermissionsExt;
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
@@ -619,6 +626,7 @@ fn assert_inert(owner: &Entity<TaskHostOwner>, cx: &mut TestAppContext, ids: &[&
 
 #[gpui::test]
 fn imported_running_and_queued_records_inert_after_seed_and_reseed(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let tasks = || {
@@ -674,6 +682,7 @@ fn imported_running_and_queued_records_inert_after_seed_and_reseed(cx: &mut Test
 
 #[gpui::test]
 fn reseed_refused_while_work_in_flight(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(vec![task("first", TaskLifecycle::Ready)], vec![]);
@@ -707,6 +716,7 @@ fn reseed_refused_while_work_in_flight(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn failed_reseed_keeps_last_snapshot_and_raises_a_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(vec![task("first", TaskLifecycle::Ready)], vec![]);
@@ -812,6 +822,7 @@ fn req<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
 #[cfg(unix)]
 #[gpui::test]
 fn every_write_tool_answers_preview_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         preview::service::preview_notice,
         task_commands::SessionLaunch,
@@ -950,6 +961,7 @@ fn every_write_tool_answers_preview_notice(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn reads_work_in_preview(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::task_mcp::TaskControlOperation as Op;
     use serde_json::json;
     cx.background_executor.allow_parking();
@@ -1006,6 +1018,10 @@ fn reads_work_in_preview(cx: &mut TestAppContext) {
     );
 
     // plan_limits: Iced's policy report on Iced's (here empty) file.
+    let before_limits = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let limits = dispatch(cx, &sender, Op::PlanLimits).unwrap();
     let file = gitterm_core::plan_limits::PlanLimitsFile::load(
         &gitterm_core::plan_limits::PlanLimitsFile::path_in(&fixture.iced),
@@ -1014,9 +1030,14 @@ fn reads_work_in_preview(cx: &mut TestAppContext) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    // An empty policy starts routing at the request's current Unix second.
+    // Validate that timestamp, then evaluate the expected shape at the same
+    // instant so crossing a second boundary cannot change the comparison.
+    let since = limits["routing"]["since"].as_i64().unwrap();
+    assert!((before_limits..=now).contains(&since), "{limits}");
     assert_eq!(
         limits,
-        serde_json::to_value(gitterm_core::plan_limits::evaluate_policy(&file, now).report)
+        serde_json::to_value(gitterm_core::plan_limits::evaluate_policy(&file, since).report)
             .unwrap()
     );
 
@@ -1076,6 +1097,7 @@ fn reads_work_in_preview(cx: &mut TestAppContext) {
 /// work runs it is Iced's value for the same files.
 #[gpui::test]
 fn reads_do_not_touch_disk_on_the_ui_thread(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{task_host::HostEffect, task_mcp::TaskControlOperation as Op};
     use std::task::Poll;
     cx.background_executor.allow_parking();
@@ -1116,6 +1138,7 @@ fn reads_do_not_touch_disk_on_the_ui_thread(cx: &mut TestAppContext) {
 /// the answer is the synchronous functions' on the same files.
 #[gpui::test]
 fn plan_limits_and_preset_reads_leave_the_ui_thread(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::task_mcp::TaskControlOperation as Op;
     use std::task::Poll;
     cx.background_executor.allow_parking();
@@ -1165,6 +1188,7 @@ fn plan_limits_and_preset_reads_leave_the_ui_thread(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn html_render_requires_open_gpui_chat(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::task_mcp::TaskControlOperation as Op;
     use serde_json::json;
     cx.background_executor.allow_parking();
@@ -1200,6 +1224,7 @@ fn html_render_requires_open_gpui_chat(cx: &mut TestAppContext) {
 /// store), in Iced's full response shape.
 #[gpui::test]
 fn merge_plan_scoped_to_root_chat(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         chat_facts,
         chats::ChatBackend,
@@ -1542,6 +1567,7 @@ fn create_in(repo: &Path) -> TaskControlOperation {
 #[cfg(unix)]
 #[gpui::test]
 fn fixture_create_prepares_worktree_in_fixture_repo(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let git_fixture = GitFixture::new(&fixture);
@@ -1584,6 +1610,7 @@ fn fixture_create_prepares_worktree_in_fixture_repo(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn handoff_done_only_from_hosted_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{task_mcp::TaskControlOperation as Op, tasks::DelegationStatus};
     use serde_json::json;
     cx.background_executor.allow_parking();
@@ -1673,6 +1700,7 @@ fn handoff_done_only_from_hosted_session(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn non_fixture_target_denied(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::task_mcp::{TaskControlOperation as Op, TaskSessionEventRequest};
     use serde_json::json;
     cx.background_executor.allow_parking();
@@ -1737,6 +1765,7 @@ fn non_fixture_target_denied(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn plain_preview_still_refuses_all_writes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         preview::service::preview_notice,
         task_host::HostEffect,
@@ -1842,6 +1871,7 @@ fn plain_preview_still_refuses_all_writes(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn merge_plan_set_writes_preview_state_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::{
         merge_plan::{self, MergePlan},
         task_mcp::TaskControlOperation as Op,
@@ -1904,6 +1934,7 @@ fn merge_plan_set_writes_preview_state_only(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn path_swapped_after_prep_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let git_fixture = GitFixture::new(&fixture);
@@ -2174,6 +2205,7 @@ fn settle(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn delegate_runs_fake_codex_with_scoped_env(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     let iced_before = tree(&runs.fixture.iced);
     let reply = runs.consult_in(&runs.git.repo, cx).unwrap();
@@ -2258,6 +2290,7 @@ fn delegate_runs_fake_codex_with_scoped_env(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn queued_start_rechecks_policy_trust_and_batch_capacity(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::plan_limits::{LimitWindow, PlanLimits, PlanLimitsFile, Provider};
     let runs = Runs::start(1, cx);
     runs.codex.hold(1);
@@ -2318,6 +2351,7 @@ fn queued_start_rechecks_policy_trust_and_batch_capacity(cx: &mut TestAppContext
 #[cfg(unix)]
 #[gpui::test]
 fn fixture_checkout_with_outside_repo_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     // A worktree of the outside repo placed inside the fixture: its Git
     // admin dir lies outside.
@@ -2353,6 +2387,7 @@ fn fixture_checkout_with_outside_repo_refused(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn run_path_swapped_after_check_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     let elsewhere = runs.fixture.iced.parent().unwrap().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
@@ -2378,6 +2413,7 @@ fn run_path_swapped_after_check_refused(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn mixed_allowed_and_denied_headless_queue(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(1, cx);
     // A second checkout in the fixture, a worktree of the listed repo.
     let other = runs.git.root.join("other");
@@ -2413,6 +2449,7 @@ fn mixed_allowed_and_denied_headless_queue(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn imported_requested_run_inert_in_fixture_mode(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     // Iced's record looks like a run of this very chat in this fixture.
     let runs = Runs::start_with(
         2,
@@ -2492,6 +2529,7 @@ fn settled_status(runs: &Runs, id: &str, cx: &mut TestAppContext) -> String {
 #[cfg(unix)]
 #[gpui::test]
 fn fsmonitor_hook_never_runs_in_run_preflight(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     let marker = runs.fixture.iced.parent().unwrap().join("fsmonitor-ran");
     // The checkout's own hook would put the outside repo in its place
@@ -2520,6 +2558,7 @@ fn fsmonitor_hook_never_runs_in_run_preflight(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn checkout_swapped_during_preflight_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     // A `git` ahead of the real one swaps the checkout during the runner's
     // `git status`, as any hook it runs could.
@@ -2567,6 +2606,7 @@ fn checkout_swapped_during_preflight_refused(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn work_tree_moved_out_by_preflight_config_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::os::unix::fs::PermissionsExt;
     let runs = Runs::start(2, cx);
     // A `git` ahead of the real one stands in for a config-driven program
@@ -2625,6 +2665,7 @@ fn work_tree_moved_out_by_preflight_config_refused(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn shutdown_during_pending_check_persists_nothing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     runs.shut_down_at("checked", cx);
     let reply = runs.consult_in(&runs.git.repo, cx);
@@ -2638,6 +2679,7 @@ fn shutdown_during_pending_check_persists_nothing(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn shutdown_during_queued_start_check_persists_nothing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(1, cx);
     runs.codex.hold(1);
     let first = runs.consult(cx);
@@ -2667,6 +2709,7 @@ fn shutdown_during_queued_start_check_persists_nothing(cx: &mut TestAppContext) 
 #[cfg(unix)]
 #[gpui::test]
 fn shutdown_with_buffered_progress_persists_nothing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     runs.shut_down_at("progress", cx);
     let id = runs.consult(cx);
@@ -2684,6 +2727,7 @@ fn shutdown_with_buffered_progress_persists_nothing(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn shutdown_kills_codex_descendants(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     runs.codex.spawn_descendant(1);
     runs.codex.hold(1);
@@ -2713,6 +2757,7 @@ fn shutdown_kills_codex_descendants(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn clean_filter_can_redirect_git_dir(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::os::unix::fs::PermissionsExt;
     let runs = Runs::start(2, cx);
     let repo = &runs.git.repo;
@@ -2763,6 +2808,7 @@ fn clean_filter_can_redirect_git_dir(cx: &mut TestAppContext) {
 #[cfg(unix)]
 #[gpui::test]
 fn slow_preflight_blocks_shutdown(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::os::unix::fs::PermissionsExt;
     let runs = Runs::start(2, cx);
     // A `git` ahead of the real one that sleeps in the runner's `git status`.
@@ -2839,6 +2885,7 @@ fn open_session_labels(
 /// title until its first status poll.
 #[gpui::test]
 fn open_sessions_label_is_the_repo_folder_name(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use serde_json::json;
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
@@ -2877,6 +2924,7 @@ fn open_sessions_label_is_the_repo_folder_name(cx: &mut TestAppContext) {
 /// returns reads it afresh, as a new Iced tab would.
 #[gpui::test]
 fn open_sessions_label_is_read_again_after_the_folder_is_left(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use serde_json::json;
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
@@ -3097,6 +3145,7 @@ mod live_writes {
 
     #[gpui::test]
     fn closed_chat_refuses_create(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("closed_chat_refuses_create") {
             return;
         }
@@ -3126,6 +3175,7 @@ mod live_writes {
 
     #[gpui::test]
     fn exited_chat_refuses_handoff(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("exited_chat_refuses_handoff") {
             return;
         }
@@ -3161,6 +3211,7 @@ mod live_writes {
 
     #[gpui::test]
     fn closing_one_chat_preserves_other_caller(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("closing_one_chat_preserves_other_caller") {
             return;
         }
@@ -3192,6 +3243,7 @@ mod live_writes {
 
     #[gpui::test]
     fn chat_reset_and_workspace_stop_revoke_callers(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("chat_reset_and_workspace_stop_revoke_callers") {
             return;
         }
@@ -3251,6 +3303,7 @@ mod live_writes {
 
     #[gpui::test]
     fn create_handoff_restart(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("create_handoff_restart") {
             return;
         }
@@ -3312,6 +3365,7 @@ mod live_writes {
 
     #[gpui::test]
     fn core_reads_live_file_and_custom_worktree_root(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("core_reads_live_file_and_custom_worktree_root") {
             return;
         }
@@ -3340,6 +3394,7 @@ mod live_writes {
 
     #[gpui::test]
     fn batch_uses_shared_create_with_ordered_partial_results(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("batch_uses_shared_create_with_ordered_partial_results") {
             return;
         }
@@ -3389,6 +3444,7 @@ mod live_writes {
 
     #[gpui::test]
     fn forged_and_previous_host_callers_refused(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         if child("forged_and_previous_host_callers_refused") {
             return;
         }
@@ -3427,6 +3483,7 @@ mod live_writes {
 
     #[gpui::test]
     fn failed_save_preserves_file_and_memory(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use std::os::unix::fs::PermissionsExt;
         if child("failed_save_preserves_file_and_memory") {
             return;
@@ -3476,6 +3533,7 @@ mod live_writes {
 
     #[gpui::test]
     fn only_task_writes_open(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_core::preview::service::{RunnerEffect, preview_notice};
         if child("only_task_writes_open") {
             return;

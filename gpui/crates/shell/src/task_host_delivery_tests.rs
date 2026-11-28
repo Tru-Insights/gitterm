@@ -160,6 +160,7 @@ fn submits(effects: &[DeliveryEffect]) -> usize {
 /// submit nothing more; the one submission is recorded once.
 #[gpui::test]
 fn delivery_pending_flush_does_not_resubmit(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     let parent = delivery.open(None, cx);
     delivery.own_result("d1", &parent, cx);
@@ -204,6 +205,7 @@ fn delivery_pending_flush_does_not_resubmit(cx: &mut TestAppContext) {
 /// both leave the result undelivered; the next tick retries it.
 #[gpui::test]
 fn delivery_rejection_and_receipt_failure_preserve_retry(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     let parent = delivery.open(None, cx);
     let tab = delivery.tab(&parent, cx);
@@ -239,6 +241,7 @@ fn delivery_rejection_and_receipt_failure_preserve_retry(cx: &mut TestAppContext
 /// neither marks nor unmarks the result, and submits nothing.
 #[gpui::test]
 fn late_completion_after_timeout_does_not_resubmit(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     let parent = delivery.open(None, cx);
     let tab = delivery.tab(&parent, cx);
@@ -321,6 +324,7 @@ fn prompts(checkout: &Path) -> Vec<String> {
 /// With the fixture's `delegations.auto_tell` off it stays on the card.
 #[gpui::test]
 fn fixture_result_delivered_once_to_the_requesting_chat(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     let settings = delivery.fixture.iced.join("settings.json");
     std::fs::write(&settings, r#"{"delegations": {"auto_tell": false}}"#).unwrap();
@@ -404,6 +408,7 @@ fn fixture_result_delivered_once_to_the_requesting_chat(cx: &mut TestAppContext)
 /// fixture gate; the host's own result in the same chat is.
 #[gpui::test]
 fn imported_delegation_never_delivered(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![imported("seeded")], cx);
     // The pane reopens the requesting conversation, so core resolves it.
     let parent = delivery.open(Some("parent-history"), cx);
@@ -466,6 +471,7 @@ fn imported(id: &str) -> Delegation {
 /// and core's gate denies automatic delivery for the open chat.
 #[gpui::test]
 fn preview_never_auto_delivers(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(false, vec![imported("d1")], cx);
     let parent = delivery.open(Some("parent-history"), cx);
     let tab = delivery.tab(&parent, cx);
@@ -508,6 +514,7 @@ fn preview_never_auto_delivers(cx: &mut TestAppContext) {
 /// clock never advances, so the tick never fires.
 #[gpui::test]
 fn turn_end_flushes_delivery_without_waiting_for_the_tick(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     std::fs::write(
         delivery.fixture.iced.join("settings.json"),
@@ -586,6 +593,7 @@ fn turn_end_flushes_delivery_without_waiting_for_the_tick(cx: &mut TestAppContex
 /// counts it logged against, and keeps them while nothing changes.
 #[gpui::test]
 fn tick_counts_results_waiting_for_a_closed_chat(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     std::fs::write(
         delivery.fixture.iced.join("settings.json"),
@@ -612,6 +620,7 @@ fn tick_counts_results_waiting_for_a_closed_chat(cx: &mut TestAppContext) {
 /// the pane takes core's held delegations, and the card flag follows them.
 #[gpui::test]
 fn roster_card_shows_a_held_result(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let delivery = Delivery::start(true, vec![], cx);
     std::fs::write(
         delivery.fixture.iced.join("settings.json"),

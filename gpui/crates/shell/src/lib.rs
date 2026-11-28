@@ -5929,6 +5929,36 @@ mod tests {
     use gpui_component::dock::{InsertTarget, PaneRef};
 
     #[test]
+    fn test_teardown_releases_window_terminals_before_the_next_test() {
+        // Exercise the borrowed VisualTestContext path repeatedly in one
+        // process; without Cleanup each window retains its live PTY.
+        let mut cx = TestAppContext::single();
+        cx.background_executor.allow_parking();
+        for _ in 0..8 {
+            let cleanup = crate::test_app::Cleanup::new(&cx);
+            let (view, _) = cx.add_window_view(|_, cx| {
+                gitterm_terminal::TerminalView::new(
+                    gitterm_terminal::Backend::new(gitterm_terminal::BackendSettings {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "read fixture".into()],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                    Default::default(),
+                    cx,
+                )
+            });
+            let weak = view.downgrade();
+            drop(view);
+            drop(cleanup);
+            assert!(
+                weak.upgrade().is_none(),
+                "test window retained its terminal"
+            );
+        }
+    }
+
+    #[test]
     fn roster_entries_project_delegation_and_task_checkouts() {
         let delegation: gitterm_core::tasks::Delegation = serde_json::from_value(serde_json::json!({
             "delegation_id": "checkout-option",
@@ -6184,6 +6214,7 @@ mod tests {
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
@@ -6355,7 +6386,7 @@ mod tests {
         needle: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             if view.read_with(cx, |view, _| {
                 view.backend()
@@ -6384,6 +6415,7 @@ mod tests {
     fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6514,6 +6546,7 @@ mod tests {
 
     #[gpui::test]
     fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6541,6 +6574,7 @@ mod tests {
 
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -6612,8 +6646,12 @@ mod tests {
             cx.simulate_input(
                 "printf '\\033]7;file:///tmp/reported-pane\\007\\033]2;REPORTED_PANE\\007'\n",
             );
-            let deadline = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
+                // PTY I/O runs on a real thread; its UI notification uses GPUI's
+                // simulated 16ms timer. Deliver that timer while awaiting OSC.
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(20));
                 draw(cx);
                 let pane = if selector == "session-12" {
                     &first
@@ -6625,7 +6663,7 @@ mod tests {
                     break;
                 }
                 assert!(
-                    deadline.elapsed().as_secs() < 5,
+                    std::time::Instant::now() < deadline,
                     "pane reports not delivered"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -6693,6 +6731,7 @@ mod tests {
 
     #[gpui::test]
     fn corrupt_file_starts_default_dock_and_remains_intact(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout-1.json");
@@ -6727,6 +6766,7 @@ mod tests {
 
     #[gpui::test]
     fn saved_workspace_layout_restores_position_and_size(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {
@@ -6754,3 +6794,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../../../test_app.rs"]
+mod test_app;

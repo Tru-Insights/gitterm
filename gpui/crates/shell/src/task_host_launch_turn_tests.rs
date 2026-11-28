@@ -26,6 +26,7 @@ fn turn_ended(
 /// session keeps its outcome.
 #[gpui::test]
 fn turn_ended_counts_launched_terminals(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let reply = launches.launch(&task, Some("Codex"), cx).unwrap();
@@ -53,6 +54,7 @@ fn turn_ended_counts_launched_terminals(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn turn_ended_keeps_a_workers_final_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.runs.owner.update(cx, |owner, _| {
