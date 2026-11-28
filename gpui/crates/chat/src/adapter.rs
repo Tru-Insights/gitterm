@@ -531,6 +531,18 @@ impl ChatAdapter {
         {
             return None;
         }
+        // Link notices are transient, as in Iced: never persist them as conversation.
+        if matches!(
+            &event,
+            AgentEvent::Harness(
+                HarnessEvent::RemoteDisconnected { .. } | HarnessEvent::RemoteReconnected { .. }
+            )
+        ) {
+            return Some(Update {
+                presentation: Some(Presentation::Append(vec![event])),
+                ..Update::default()
+            });
+        }
         // A receiver can relay our channel-accepted prompt back under the same ID.
         // Use the sole conversation's prompt lookup before any duplicate effects.
         if let AgentEvent::Harness(HarnessEvent::UserMessageEcho { id: Some(id), .. }) = &event
@@ -679,6 +691,14 @@ impl ChatAdapter {
             presentation: Some(Presentation::Append(before)),
             event: None,
             receipts: vec![],
+        }
+    }
+    /// A remote gap replaces the timeline; subsequent live events follow history.
+    pub fn reset_history(&mut self) -> Update {
+        self.state.reduce(Intent::ResetHistory);
+        Update {
+            presentation: Some(Presentation::Replay),
+            ..Update::default()
         }
     }
     pub fn begin_history(

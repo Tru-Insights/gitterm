@@ -3534,7 +3534,7 @@ mod live_writes {
     #[gpui::test]
     fn only_task_writes_open(cx: &mut TestAppContext) {
         let _test_app = crate::test_app::Cleanup::new(cx);
-        use gitterm_core::preview::service::{RunnerEffect, preview_notice};
+        use gitterm_core::preview::service::RunnerEffect;
         if child("only_task_writes_open") {
             return;
         }
@@ -3550,7 +3550,9 @@ mod live_writes {
                 &sender,
                 TaskControlOperation::MergePlanSet(req(json!({"entries": []})))
             ),
-            Err(preview_notice("merge_plan_set"))
+            // Go-live 13 opens merge plans in Live: the write reaches its
+            // handler, which refuses a caller with no GitTerm tab on this Mac.
+            Err("merge_plan_set: no GitTerm tab on this Mac has session caller; merge plans are for this Mac's chats".into())
         );
         owner.read_with(cx, |owner, _| {
             for effect in [RunnerEffect::RestoreSession, RunnerEffect::NotifyIngress] {
@@ -3600,4 +3602,85 @@ mod live_writes {
     include!("task_host_live_delivery_tests.rs");
     include!("task_host_live_terminal_tests.rs");
     include!("remote_terminal_tests.rs");
+}
+
+#[gpui::test]
+fn live_pr_mcp_set_get_preserves_full_response_and_uses_live_root(cx: &mut TestAppContext) {
+    use gitterm_core::{
+        merge_plan::{self, PrKey, PrRef, PrState},
+        preview::service::ServiceContext,
+        prs::{PullCore, WatchFile, WatchedPr},
+        task_mcp::TaskControlOperation as Op,
+    };
+    use serde_json::json;
+    cx.background_executor.allow_parking();
+    let fixture = Fixture::new();
+    fixture.write_iced(vec![], vec![]);
+    std::fs::create_dir(fixture.roots.root()).unwrap();
+    let chats = Chats::new(&fixture, cx);
+    let caller = chats.open(&fixture, Some("root"), cx);
+    let mut watched = WatchedPr::new(PrKey::new("owner/repo", 53));
+    watched.snapshot.core = Some(PullCore {
+        title: "Example change".into(),
+        state: Some(PrState::Open),
+        head_sha: "head-one".into(),
+        ..Default::default()
+    });
+    let watch = WatchFile {
+        prs: [(watched.key.id(), watched)].into(),
+    };
+    watch.save(&WatchFile::path_in(&fixture.iced)).unwrap();
+    let live = crate::pr_live::LivePrs::with_client(
+        &fixture.iced,
+        Default::default(),
+        Arc::new(|| Err("no GitHub calls in this test".into())),
+    );
+    live.note_live_prs(
+        "root",
+        &[PrRef {
+            repo: "owner/repo".into(),
+            number: 54,
+            url: "https://github.com/owner/repo/pull/54".into(),
+        }],
+    )
+    .unwrap();
+    cx.update(|cx| cx.set_global(live));
+    let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+    let services = Arc::new(
+        ServiceContext::production(&fixture.iced, "example")
+            .unwrap()
+            .for_gpui_live(),
+    );
+    let (config, sender) = fixture.config();
+    let owner = cx
+        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .unwrap();
+    let set = dispatch_as(
+        cx,
+        &sender,
+        Op::MergePlanSet(req(
+            json!({"entries":[{"repo":"owner/repo","number":53,"step":1,"method":"squash"}]}),
+        )),
+        Some(&caller),
+    )
+    .unwrap();
+    assert_eq!(set["kept_holds"], json!([]));
+    assert_eq!(set["next"], "owner/repo#53");
+    assert_eq!(
+        set["entries"][0]["live"],
+        gitterm_core::prs::pr_live_value(watch.prs.get("owner/repo#53"))
+    );
+    assert_eq!(set["unplanned_prs"][0]["number"], 54);
+    assert_eq!(
+        merge_plan::load_plans(&merge_plan::plans_dir(&fixture.iced))["root"]
+            .entries
+            .len(),
+        1
+    );
+    assert!(!merge_plan::plans_dir(fixture.roots.root()).exists());
+    let get = dispatch_as(cx, &sender, Op::MergePlanGet, Some(&caller)).unwrap();
+    let mut expected = set;
+    expected.as_object_mut().unwrap().remove("kept_holds");
+    assert_eq!(get, expected);
+    owner.update(cx, |owner, _| owner.shutdown());
 }
