@@ -2488,8 +2488,7 @@ where
 /// tabs left (at least one): a later tab shifts down one; the removed
 /// tab's place goes to the tab after it, else the last.
 fn active_tab_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
-    let active = if active > removed { active - 1 } else { active };
-    active.min(remaining.saturating_sub(1))
+    gitterm_core::workspace_config::active_tab_after_removal(active, removed, remaining)
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {

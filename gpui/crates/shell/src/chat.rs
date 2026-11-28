@@ -869,6 +869,31 @@ impl ChatPane {
         &self.held
     }
 
+    /// Read-only source for Find's shared Iced projections.
+    pub(crate) fn find_source(&self) -> (&gitterm_core::chat::state::State, &[Record]) {
+        (self.controller.adapter.state(), &self.saved.records)
+    }
+    pub(crate) fn move_workspace(
+        &mut self,
+        previous: &gitterm_core::workspace_config::WorkspaceConfig,
+        next: &gitterm_core::workspace_config::WorkspaceConfig,
+        id: crate::WorkspaceId,
+    ) {
+        self.rebind_live_workspace(previous, next);
+        if let Some(runtime) = &self.controller.runtime {
+            let context = gitterm_core::guidelines::config_document_places(next)
+                .as_ref()
+                .map(gitterm_core::guidelines::documents_note);
+            if let Err(error) = runtime
+                .send(gitterm_core::chat::types::HarnessCommand::SetWorkspaceContext(context))
+            {
+                eprintln!("[workspace] cannot update moved chat's workspace context: {error}");
+            }
+        }
+        if let Some(launch) = &mut self.deferred_live {
+            launch.workspace = Some(id);
+        }
+    }
     pub(crate) fn cwd(&self) -> &std::path::Path {
         &self.saved.cwd
     }

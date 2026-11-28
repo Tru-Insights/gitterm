@@ -429,6 +429,40 @@ impl LivePrs {
         self.wake.notify_one();
         result
     }
+    pub fn local_control(
+        &self,
+        store: &gitterm_core::desktop_store::DesktopStore,
+        control: gitterm_core::work::pr_actions::LocalControl,
+    ) -> Result<(), String> {
+        let _serial = self.serial.lock().map_err(|_| "PR watch lock poisoned")?;
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err("PR watch is shutting down".into());
+        }
+        let mut snapshot = self.snapshot.lock().unwrap();
+        // Flush any earlier failed poll save before changing a local field.
+        if snapshot.watch_dirty {
+            snapshot.save_watch(&prs::WatchFile::path_in(&self.root))?;
+        }
+        if store.root() != self.root {
+            return Err("PR persistence root changed".into());
+        }
+        store
+            .pr_control(control, chat_facts::runtime::now_stamp())
+            .wait()?;
+        snapshot.reload_watch(&prs::WatchFile::path_in(&self.root))?;
+        snapshot.plans = merge_plan::load_plans(&merge_plan::plans_dir(&self.root));
+        let watch = snapshot.watch.clone();
+        for groups in snapshot.groups.values_mut() {
+            for group in groups {
+                for pr in &mut group.prs {
+                    if let Some(saved) = watch.prs.get(&pr.key.id()) {
+                        *pr = saved.clone();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     pub fn request_refresh(&self) {
         self.refresh_requested.store(true, Ordering::SeqCst);
         self.wake.notify_one();

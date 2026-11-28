@@ -1198,53 +1198,7 @@ pub(crate) fn save_live_workspace(
     result
 }
 
-fn new_work_config(
-    name: &str,
-    dir: &Path,
-    color: gitterm_core::settings::WorkspaceColor,
-    start: gitterm_core::work::catalog::WorkStart,
-) -> gitterm_core::workspace_config::WorkspaceConfig {
-    use gitterm_core::workspace_config::WorkspaceConfig;
-    let dir = dir.to_string_lossy().into_owned();
-    let added: Vec<String> = start
-        .repos
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    WorkspaceConfig {
-        extra: Default::default(),
-        collapsed_issue_groups: gitterm_core::issues::IssueGroup::default_collapsed(),
-        name: name.into(),
-        abbrev: name.chars().take(2).collect::<String>().to_uppercase(),
-        dir: dir.clone(),
-        color,
-        location: Some(
-            gitterm_core::remote::config::WorkspaceLocationConfig::Local { root: dir.clone() },
-        ),
-        remote_session: None,
-        active_tab: Some(0),
-        tabs: vec![],
-        run_command: None,
-        bottom_terminals: vec![],
-        env: Default::default(),
-        active: true,
-        chats: vec![],
-        parked: None,
-        done_at: None,
-        guidelines_off: false,
-        claude_in_chrome: false,
-        decisions_repo: start
-            .decisions_repo
-            .map(|p| p.to_string_lossy().into_owned()),
-        repos: std::iter::once(dir.clone())
-            .chain(added.iter().filter(|r| **r != dir).cloned())
-            .collect(),
-        home: Some(dir),
-        env_overrides: Default::default(),
-        repos_added: added,
-        repos_removed: vec![],
-    }
-}
+use gitterm_core::workspace_config::new_work_config;
 
 #[cfg(test)]
 mod live_workspace_tests {

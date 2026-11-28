@@ -1431,7 +1431,7 @@ impl crate::Shell {
     }
 
     /// One mounting path for restored tabs and saved conversations opened by either rail.
-    fn mount_live_chat(
+    pub(crate) fn mount_live_chat(
         &mut self,
         workspace: crate::WorkspaceId,
         tab: gitterm_core::workspace_config::WorkspaceTabConfig,

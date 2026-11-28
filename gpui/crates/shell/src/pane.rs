@@ -62,7 +62,7 @@ pub struct Pane {
     pub(crate) terminal_cwd: Option<std::path::PathBuf>,
     /// Iced's restored tracked cwd, until the local shell reports a new cwd.
     pub(crate) terminal_saved_dir: Option<std::path::PathBuf>,
-    workspace: WorkspaceId,
+    pub(crate) workspace: WorkspaceId,
     data: Rc<dyn ShellData>,
     focus: FocusHandle,
     files: Option<Entity<crate::files_view::FilesView>>,
