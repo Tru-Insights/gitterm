@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 
 [dependencies]
-gitterm-core = { path = "../../../crates/gitterm-core" }
+gitterm-core = { path = "../../../crates/gitterm-core", features = ["runtime"] }
 alacritty_terminal = "=0.25.1"
 gpui-kit = { version = "=0.11.0", default-features = false, features = ["component"] }
 parking_lot = "0.12"

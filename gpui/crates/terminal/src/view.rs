@@ -583,6 +583,46 @@ impl TerminalView {
         self
     }
 
+    /// Attach an embedding pane without replacing the launch owner's callbacks.
+    pub fn add_title_callback(
+        &mut self,
+        callback: impl Fn(&mut Window, &mut Context<Self>, &str) + 'static,
+    ) {
+        let previous = self.title_callback.take();
+        self.title_callback = Some(Box::new(move |window, cx, title| {
+            if let Some(previous) = &previous {
+                previous(window, cx, title);
+            }
+            callback(window, cx, title);
+        }));
+    }
+
+    pub fn add_exit_callback(
+        &mut self,
+        callback: impl Fn(&mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let previous = self.exit_callback.take();
+        self.exit_callback = Some(Box::new(move |window, cx| {
+            if let Some(previous) = &previous {
+                previous(window, cx);
+            }
+            callback(window, cx);
+        }));
+    }
+
+    pub fn add_cwd_callback(
+        &mut self,
+        callback: impl Fn(&mut Window, &mut Context<Self>, &std::path::Path) + 'static,
+    ) {
+        let previous = self.cwd_callback.take();
+        self.cwd_callback = Some(Box::new(move |window, cx, cwd| {
+            if let Some(previous) = &previous {
+                previous(window, cx, cwd);
+            }
+            callback(window, cx, cwd);
+        }));
+    }
+
     pub fn with_title_callback(
         mut self,
         callback: impl Fn(&mut Window, &mut Context<TerminalView>, &str) + 'static,

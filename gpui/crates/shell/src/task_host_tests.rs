@@ -3598,4 +3598,6 @@ mod live_writes {
     }
     include!("task_host_live_worker_tests.rs");
     include!("task_host_live_delivery_tests.rs");
+    include!("task_host_live_terminal_tests.rs");
+    include!("remote_terminal_tests.rs");
 }

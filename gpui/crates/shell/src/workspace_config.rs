@@ -818,6 +818,9 @@ mod preview_terminal_restore_test {
             startup_command: None,
             task_id: None,
             task_session_id: None,
+            session_uid: None,
+            chat_session_id: None,
+            bottom: false,
         }]);
         let state = gpui_component::dock::DockAreaState {
             version: Some(1),
@@ -970,15 +973,9 @@ pub(crate) fn save_live_workspace(
             if let Some(key) = target && file.workspaces.iter().filter(|w| key.matches(w)).count() > 1 {
                 return Err(format!("Several saved workspaces are named {} in {}; this workspace cannot be changed in Live.", key.name, key.dir));
             }
-            if let Some(workspace) = target.and_then(|key| file.workspaces.iter().find(|w| key.matches(w))) {
-                if workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) {
-                    return Err("Remote workspaces cannot be changed in Live yet.".into());
-                }
-                // shortcut: task restore still requires task_host_runs::fixture_of;
-                // use that host's restore path once it accepts Live callers.
-                if matches!(action, LiveWorkspaceAction::Resume { .. }) && workspace.tabs.iter().any(|t| t.task_id.is_some() && t.startup_command.is_some()) {
-                    return Err("This task terminal cannot be resumed in Live yet.".into());
-                }
+            if let Some(workspace) = target.and_then(|key| file.workspaces.iter().find(|w| key.matches(w)))
+                && (workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. }))) {
+                return Err("Remote workspaces cannot be changed in Live yet.".into());
             }
             let mut workspace = match action {
                 LiveWorkspaceAction::Create { name, start, .. } => {
@@ -1618,6 +1615,9 @@ mod review_regressions {
             startup_command: None,
             task_id: None,
             task_session_id: None,
+            session_uid: None,
+            chat_session_id: None,
+            bottom: false,
         }]);
         layout.save(&Default::default()).unwrap();
         for name in ["Renamed", "Renamed again"] {

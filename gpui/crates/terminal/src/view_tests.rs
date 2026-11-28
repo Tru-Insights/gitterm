@@ -1180,3 +1180,46 @@ fn terminal_scrollback_limit_survives_deferred_pty_start(cx: &mut TestAppContext
         assert_eq!(view.backend.term.lock_unfair().grid().history_size(), 13);
     });
 }
+
+#[::gpui::test]
+fn golive10_adopted_callbacks_preserve_launch_owner(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+    cx.background_executor.allow_parking();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let backend = python(
+        "import os\nos.write(1,b'\\x1b]7;file:///tmp/placeholder\\x07\\x1b]2;PLACEHOLDER\\x07')"
+            .into(),
+    );
+    let seen = events.clone();
+    let handle = cx.add_window(|_, cx| {
+        let (cwd, title, exit) = (seen.clone(), seen.clone(), seen.clone());
+        let mut view = TerminalView::new(backend, TerminalConfig::default(), cx)
+            .with_cwd_callback(move |_, _, _| cwd.borrow_mut().push("owner cwd"))
+            .with_title_callback(move |_, _, _| title.borrow_mut().push("owner title"))
+            .with_exit_callback(move |_, _| exit.borrow_mut().push("owner exit"));
+        let (cwd, title, exit) = (seen.clone(), seen.clone(), seen.clone());
+        view.add_cwd_callback(move |_, _, _| cwd.borrow_mut().push("pane cwd"));
+        view.add_title_callback(move |_, _, _| title.borrow_mut().push("pane title"));
+        view.add_exit_callback(move |_, _| exit.borrow_mut().push("pane exit"));
+        view
+    });
+    wait(|| {
+        handle
+            .update(cx, |view, window, cx| view.process_events(window, cx))
+            .unwrap();
+        ["pane cwd", "pane title", "pane exit"]
+            .iter()
+            .all(|event| events.borrow().contains(event))
+    });
+    let events = events.borrow();
+    for pair in [
+        ["owner cwd", "pane cwd"],
+        ["owner title", "pane title"],
+        ["owner exit", "pane exit"],
+    ] {
+        assert!(
+            events.windows(2).any(|events| events == pair),
+            "{pair:?}: {events:?}"
+        );
+    }
+}

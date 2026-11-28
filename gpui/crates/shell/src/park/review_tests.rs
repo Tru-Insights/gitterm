@@ -102,6 +102,12 @@ fn review_f1_filtered_resume_reconciles_roster_and_reparks_the_right_identity(
                 pane.session.as_ref().unwrap().session_uid,
                 "terminal-caller"
             );
+            assert!(pane.exited);
+            assert!(matches!(
+                &pane.content,
+                crate::pane::PaneContent::Error(error)
+                    if error == "Restore terminal: Live terminal host is unavailable"
+            ));
             assert_eq!(
                 shell.live_workspace_tabs(state.runtime_uid, cx)[0].extra["future_tab"],
                 "keep"
