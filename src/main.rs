@@ -7835,9 +7835,7 @@ const SPINE_WIDTH: f32 = 36.0;
 /// two must move together or the webview overlaps/undershoots the strip.
 const SESSION_STRIP_HEIGHT: f32 = 36.0;
 
-const SLIDE_DURATION_MS: f32 = 400.0;
-const SWIPE_DEBOUNCE_MS: u64 = 150;
-const EDGE_PEEK_ZONE: f32 = 30.0;
+use gitterm_core::workspace::slide::{SLIDE_DURATION_MS, SWIPE_DEBOUNCE_MS};
 
 fn workspace_scrollable_id() -> iced::widget::Id {
     iced::widget::Id::new("ws-slide")
@@ -27016,32 +27014,23 @@ impl App {
                 // Step 3-only: spawn a pi-backed agent tab in the active workspace
                 // and submit a hardcoded prompt so we can verify the subprocess
                 // pipeline end-to-end. Removed before Step 4 lands.
-                let model = std::env::var("PI_MODEL")
-                    .unwrap_or_else(|_| "openai-codex/gpt-5.4".to_string());
-                let session_path =
-                    format!("/tmp/gitterm-v6-agent-debug-{}.jsonl", std::process::id());
-                let config = tab::AgentBackendConfig::Pi {
-                    model,
-                    session_path: Some(session_path),
-                    thinking: Some(true),
+                let Some(ws) = self.active_workspace() else {
+                    return Task::none();
                 };
-                let (repo_path, current_dir) = match self.active_workspace() {
-                    Some(ws) => {
-                        let cd = ws
-                            .active_tab()
-                            .map(|t| t.current_dir.clone())
-                            .unwrap_or_else(|| ws.dir.clone());
-                        (ws.dir.clone(), Some(cd))
-                    }
-                    None => return Task::none(),
-                };
+                let repo_path = ws.dir.clone();
+                let launch = gitterm_core::harness::pi::runtime::debug_launch(
+                    &repo_path,
+                    ws.active_tab().map(|tab| tab.current_dir.as_path()),
+                    std::env::var("PI_MODEL"),
+                    std::process::id(),
+                );
 
                 let id = self.next_tab_id;
                 self.next_tab_id += 1;
                 if let Some(ws) = self.active_workspace_mut() {
                     let mut tab = TabState::new(id, repo_path.clone());
-                    tab.kind = TabKind::Agent(AgentSession::new(config));
-                    tab.set_local_dir(current_dir.unwrap_or(repo_path));
+                    tab.kind = TabKind::Agent(AgentSession::new(launch.config));
+                    tab.set_local_dir(launch.cwd);
                     ws.tabs.push(tab);
                     ws.active_tab = ws.tabs.len() - 1;
                 }
@@ -29567,13 +29556,12 @@ impl App {
                         .iter()
                         .position(|&idx| idx == self.active_workspace_index())
                         .unwrap_or(0);
-                    let has_left = position > 0;
-                    let has_right = position + 1 < order.len();
-
-                    let near_left = has_left && (0.0..EDGE_PEEK_ZONE).contains(&content_x);
-                    let near_right = has_right
-                        && content_x > content_width - EDGE_PEEK_ZONE
-                        && content_x <= content_width;
+                    let (near_left, near_right) = gitterm_core::workspace::slide::edge_peek(
+                        content_x,
+                        content_width,
+                        position,
+                        order.len(),
+                    );
 
                     if near_left != self.edge_peek_left || near_right != self.edge_peek_right {
                         self.edge_peek_left = near_left;
@@ -31549,7 +31537,7 @@ impl App {
                 if let Some(start_time) = self.slide_start_time {
                     let elapsed = start_time.elapsed().as_millis() as f32;
                     let t = (elapsed / SLIDE_DURATION_MS).min(1.0);
-                    let eased = 1.0 - (1.0 - t).powi(3);
+                    let eased = gitterm_core::workspace::slide::eased(elapsed);
                     self.slide_offset = self.slide_start_offset
                         + (self.slide_target - self.slide_start_offset) * eased;
 
@@ -31604,7 +31592,11 @@ impl App {
                         // Update active workspace based on current scroll
                         // position, in the slide's order (TRU-175).
                         let order = self.slide_order();
-                        let position = ((offset + viewport_width * 0.5) / viewport_width) as usize;
+                        let position = gitterm_core::workspace::slide::nearest(
+                            offset,
+                            viewport_width,
+                            order.len(),
+                        );
                         let nearest = order
                             .get(position.min(order.len().saturating_sub(1)))
                             .copied()

@@ -87,6 +87,7 @@ pub mod usage;
 pub mod work_sidebar;
 pub mod workspace_bar;
 pub mod workspace_config;
+mod workspace_navigation;
 pub mod workspace_settings_sheet;
 pub mod workspace_sheet;
 pub mod workspace_status;
@@ -2906,99 +2907,20 @@ impl Shell {
             )
     }
     fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
-        if self.selected_task.is_some()
-            && let Some(panel) = &self.task_panel
-            && state
-                .active_session
-                .and_then(|id| self.session_task(id, cx))
-                .is_none()
-        {
-            return div()
-                .id("task-overview-host")
-                .flex_1()
-                .h_full()
-                .child(task_panel::overview_view(panel, self.task_inputs(cx), cx));
-        }
-        #[cfg(test)]
-        if self.dock_fixture {
-            return div()
-                .id("dock-fixture")
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(state.dock.clone());
-        }
-        if state.active_session.is_none() {
-            if let Some(home) = self.remote_session_home(cx) {
-                return home;
-            }
-            return div()
-                .id("session-content")
-                .debug_selector(|| "session-content".into())
-                .flex_1()
-                .min_w_0()
-                .h_full();
-        }
-        let selected = self
-            .content
-            .read(cx)
-            .selected
-            .as_ref()
-            .and_then(|id| state.panes.get(id));
-        let bottom = bottom_pane_ids(state, cx);
-        let active = state.active_session.map(session_pane_id);
-        let pane = selected
-            .or_else(|| {
-                active
-                    .as_ref()
-                    .filter(|id| pane_id_visible(state, id, cx) && !bottom.contains(id))
-                    .and_then(|id| state.panes.get(id))
-            })
-            .or_else(|| {
-                state
-                    .panes
-                    .iter()
-                    .find(|(id, _)| {
-                        !id.ends_with("-git")
-                            && !id.ends_with("-files")
-                            && pane_id_visible(state, id, cx)
-                            && !bottom.contains(id)
-                    })
-                    .map(|(_, pane)| pane)
-            });
         div()
-            .id("session-content")
-            .debug_selector(|| "session-content".into())
+            .id("workspace-slide-host")
             .flex_1()
             .min_w_0()
             .h_full()
-            .overflow_hidden()
-            .when(
-                pane.is_some_and(|pane| {
-                    matches!(
-                        pane.read(cx).content,
-                        pane::PaneContent::Chat(_) | pane::PaneContent::PreviewChat(_)
-                    )
-                }),
-                |pane| pane.font_family(".SystemUIFont"),
-            )
-            .when(
-                pane.is_some_and(|p| matches!(p.read(cx).content, pane::PaneContent::Terminal(_))),
-                |host| {
-                    host.capture_any_mouse_down(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
-                    })
-                    .capture_any_mouse_up(|event, _, cx| {
-                        if event.button == gpui::MouseButton::Right {
-                            cx.stop_propagation();
-                        }
-                    })
-                },
-            )
-            .children(pane.cloned())
+            .child(workspace_navigation::WorkspaceSlide {
+                shell: cx.weak_entity(),
+                home: self
+                    .active(cx)
+                    .active_session
+                    .is_none()
+                    .then(|| self.remote_session_home(cx))
+                    .flatten(),
+            })
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_tabs.retain(|id, _| {
@@ -3986,9 +3908,7 @@ impl Shell {
             ))
             .on_action(Self::background(
                 cx,
-                |this, _: &DebugSpawnAgentTab, _, cx| {
-                    this.preview_unavailable("Debug agent tab", cx)
-                },
+                |this, _: &DebugSpawnAgentTab, window, cx| this.debug_agent_tab(window, cx),
             ))
             .on_action(Self::background(
                 cx,

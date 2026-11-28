@@ -13,7 +13,6 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -25,7 +24,6 @@ use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::HarnessSession;
 #[cfg(test)]
 use gitterm::harness::{HarnessEvent, UserPrompt};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -55,7 +53,6 @@ pub(crate) use gitterm_core::chat::types::{
 
 pub use gitterm_core::chat::state::AgentEvent;
 pub(crate) use gitterm_core::chat::state::{Effect as ChatEffect, Intent as ChatIntent};
-use gitterm_core::harness::pi::parse_line;
 
 /// The Agent call whose subagent `ev` starts, if it is a subagent start.
 pub(crate) fn subagent_started(ev: &AgentEvent) -> Option<&str> {
@@ -253,13 +250,7 @@ pub(crate) use gitterm_core::chat::checkout::{
 /// Inputs the UI can send into the agent subprocess. New variants will be added
 /// as features land (e.g. `ApprovePermission { id, allowed }` once Claude's
 /// permission flow ships).
-#[derive(Debug)]
-pub(crate) enum AgentInput {
-    /// User submitted a prompt. The subprocess manager spawns one subprocess
-    /// per prompt (matching the spike's per-turn pattern); multi-turn
-    /// continuity is preserved via `--session` (pi) or `--resume` (Claude).
-    Prompt(String),
-}
+pub(crate) use gitterm_core::harness::pi::runtime::AgentInput;
 
 /// Handle to the background tokio task that owns the agent subprocess.
 /// Lives on `AgentSession.task_handle` for the lifetime of the tab.
@@ -350,11 +341,14 @@ pub(crate) fn spawn_agent_task(
                 )),
             )
             .with_close_token(close_token);
-            rt.block_on(agent_loop(
+            rt.block_on(gitterm_core::harness::pi::runtime::agent_loop(
                 snapshots,
-                config,
-                repo_path,
-                guidelines_file,
+                gitterm_core::harness::pi::runtime::Launch {
+                    config,
+                    cwd: repo_path,
+                    guidelines_file,
+                    program: "pi".into(),
+                },
                 input_rx,
                 event_tx,
                 stop_slot,
@@ -380,159 +374,31 @@ pub(crate) fn spawn_agent_task(
     }
 }
 
-/// Per-turn loop: wait for a prompt, spawn the subprocess, stream events, repeat.
-async fn agent_loop(
-    mut snapshots: gitterm::turn_snapshots::Recorder,
-    config: AgentBackendConfig,
-    repo_path: PathBuf,
-    guidelines_file: Option<PathBuf>,
-    mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
-    stop_slot: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-) {
-    while let Some(input) = input_rx.recv().await {
-        match input {
-            AgentInput::Prompt(prompt) => {
-                let (stop_tx, stop_rx) = oneshot::channel::<()>();
-                if let Ok(mut g) = stop_slot.lock() {
-                    *g = Some(stop_tx);
-                }
-
-                snapshots.begin().await;
-                let result = run_turn(
-                    &config,
-                    &repo_path,
-                    guidelines_file.as_deref(),
-                    &prompt,
-                    &event_tx,
-                    stop_rx,
-                )
-                .await;
-                snapshots.end().await;
-
-                if let Ok(mut g) = stop_slot.lock() {
-                    g.take();
-                }
-
-                if let Err(err) = result {
-                    let _ = event_tx.send(AgentEvent::Other(serde_json::json!({
-                        "type": "error",
-                        "message": err,
-                    })));
-                }
-            }
-        }
-    }
-    snapshots.end().await;
-    // input channel closed: tab being dropped — exit
-}
-
 /// Spawn one subprocess turn and stream its stdout as `AgentEvent::Other(line)`
 /// for each JSON line. Step 3 keeps parsing minimal — Step 4 will refine each
 /// line into the typed variants (`AssistantText`, `ToolCallStart`, etc.).
+#[cfg(test)]
 async fn run_turn(
     config: &AgentBackendConfig,
     repo_path: &PathBuf,
     guidelines_file: Option<&Path>,
     prompt: &str,
     event_tx: &mpsc::UnboundedSender<AgentEvent>,
-    mut stop_rx: oneshot::Receiver<()>,
+    stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
-    let mut cmd = build_command(config, prompt, guidelines_file)?;
+    let cmd = build_command(config, prompt, guidelines_file)?;
     #[cfg(test)]
-    {
-        cmd = native_chat_tests::override_command(cmd);
-    }
-    cmd.current_dir(repo_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn agent subprocess: {}", e))?;
-    let stdout = child.stdout.take().ok_or("child stdout missing")?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    let mut stopped = false;
-    loop {
-        tokio::select! {
-            maybe_line = lines.next_line() => {
-                match maybe_line {
-                    Ok(Some(line)) => {
-                        let Some(value) = parse_line(line) else {
-                            continue;
-                        };
-                        if event_tx.send(AgentEvent::Other(value)).is_err() {
-                            // Receiver dropped — tab is gone, abort.
-                            let _ = child.start_kill();
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        return Err(format!("stdout read error: {}", e));
-                    }
-                }
-            }
-            _ = &mut stop_rx => {
-                stopped = true;
-                let _ = child.start_kill();
-                break;
-            }
-        }
-    }
-
-    let _ = child.wait().await;
-    // Sentinel event so the UI knows the turn ended. Refined into a typed
-    // variant in Step 4 (likely a state-transition event rather than a raw blob).
-    let _ = event_tx.send(AgentEvent::Other(serde_json::json!({
-        "type": if stopped { "stopped" } else { "done" },
-    })));
-    Ok(())
+    let cmd = native_chat_tests::override_command(cmd);
+    gitterm_core::harness::pi::runtime::execute_turn(cmd, repo_path, event_tx, stop_rx).await
 }
 
+#[cfg(test)]
 fn build_command(
     config: &AgentBackendConfig,
     prompt: &str,
     guidelines_file: Option<&Path>,
 ) -> Result<Command, String> {
-    match config {
-        AgentBackendConfig::Pi {
-            model,
-            session_path,
-            thinking,
-        } => {
-            let mut cmd = Command::new("pi");
-            cmd.arg("--print")
-                .arg("--mode")
-                .arg("json")
-                .arg("--model")
-                .arg(model);
-            if let Some(path) = session_path {
-                cmd.arg("--session").arg(path);
-            }
-            if let Some(t) = thinking.as_ref() {
-                if *t {
-                    cmd.arg("--thinking").arg("medium");
-                }
-            }
-            // pi reads an existing file given as the value.
-            if let Some(path) = guidelines_file {
-                cmd.arg("--append-system-prompt").arg(path);
-            }
-            cmd.arg(prompt);
-            Ok(cmd)
-        }
-        // Claude tabs run one long-lived process through
-        // `gitterm::harness::claude::ClaudeSession` (TRU-140).
-        AgentBackendConfig::Claude { .. } => {
-            Err("Claude tabs use the native harness session, not per-turn processes".to_string())
-        }
-        AgentBackendConfig::Acp { .. } => {
-            Err("ACP tabs use the native harness session, not per-turn processes".to_string())
-        }
-    }
+    gitterm_core::harness::pi::runtime::build_command(config, prompt, guidelines_file)
 }
 
 #[cfg(all(test, unix))]
