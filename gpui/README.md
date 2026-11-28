@@ -131,8 +131,7 @@ toolchains. `rust-toolchain.toml` also selects stable for rustup proxies.
 From the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/cargo.sh build --manifest-path gpui/Cargo.toml --release --locked -j 4
-CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/bundle-gpui.sh
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 19 scripts/bundle-gpui.sh
 scripts/cargo.sh fmt --manifest-path gpui/Cargo.toml -- --check
 CARGO_TARGET_DIR=/private/tmp/gt-target-tru280 nice -n 10 scripts/cargo.sh clippy --manifest-path gpui/Cargo.toml --locked -j 4 -- -D warnings
 scripts/check-gpui-deps.sh
@@ -146,6 +145,57 @@ with identifier `com.cree8.gitterm.gpui`. It does not replace GitTerm V6.
 The pinned stack is gpui-component/gpui-kit 0.11.0 and gpui-pre 0.3.14.
 Cargo tree may print repeated `(*)` references; compare distinct package versions,
 as the dependency check does.
+
+### Versioned package, install and rollback
+
+Build, verify, and install from the repository root (macOS):
+
+```sh
+CARGO_BUILD_JOBS=4 nice -n 19 scripts/bundle-gpui.sh
+scripts/verify-gpui-bundle.sh 'gpui/target/GitTerm GPUI.app'
+scripts/install-gpui.sh 'gpui/target/GitTerm GPUI.app'
+```
+
+If `CARGO_TARGET_DIR` is set, pass its `GitTerm GPUI.app` to the last two
+commands. The bundler keeps `--features stt`, uses four Cargo jobs at nice 19,
+and verifies the finished ad-hoc signature, arm64 executable, icon, microphone
+description and (when available) whisper symbols. A stripped/unavailable symbol
+table is reported as unchecked STT; signature and other checks still apply.
+
+`CFBundleShortVersionString` comes from the app package in `gpui/Cargo.toml`
+(`0.1.0`). `CFBundleVersion` is `<short git SHA>[-dirty]+YYYYMMDDTHHMMSSZ`,
+with the timestamp in UTC; `-dirty` includes tracked changes and untracked
+files. The shell's native standard About panel uses these same Info.plist keys,
+so the displayed version identifies the installed bundle without a separate
+compiled version string. The packaging test covers clean and dirty stamps.
+
+The installer refuses if any `gitterm-gpui` executable or GitTerm GPUI bundle
+executable is running; quit it yourself before installation or rollback. It
+copies with `ditto` into a staging directory and verifies before moving the
+current bundle. It installs to `~/Applications/GitTerm GPUI.app`, prints old
+and new build versions, and keeps the last three archived bundles named
+`GitTerm GPUI.prev-<version>.app`. Duplicate versions gain a UTC/PID suffix.
+Only those GPUI backups are pruned. Final signature failure restores the old
+app. Concurrent script installs are locked; after an interrupted/crashed script,
+inspect `.gitterm-gpui-install.lock` and any staging/backup before removing the
+stale lock. Do not launch GPUI while installation is in progress.
+
+```sh
+scripts/install-gpui.sh --rollback
+```
+
+Rollback restores the most recently archived backup (archive time, not build
+time), verifies it, and archives the displaced app so it can be restored too.
+Rollback also accepts the original signed `0.0.0` bundle archived during the
+first versioned installation; it checks the GPUI identity and signature without
+applying the new-package verifier's placeholder-version rejection.
+An absolute `GITTERM_GPUI_INSTALL_DIR` overrides the destination for either
+operation; for example, use a directory under `mktemp -d` for trials.
+`nice -n 19 bash tests/gpui-bundle-scripts.sh` exercises installation, a second
+installation, retention, rollback, running refusal, failure recovery, package
+validation and version stamping entirely in temporary directories with fake
+apps/platform checks, plus a tiny ad-hoc-signed arm64 fixture for the real
+macOS verification tools. No app is launched and no GPUI release is compiled.
 
 ## Stage 2 shell (TRU-280 / TRU-283)
 

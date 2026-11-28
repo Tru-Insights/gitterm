@@ -16,6 +16,7 @@ fn dispatch(action: impl Action, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn open_folder_shortcut_opens_the_folder_picker_not_the_workspace_sheet(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h6_tests::sample(cx);
     let sessions = cx.read(|cx| shell.read(cx).active(cx).sessions.len());
     // A12c / M09: Iced's ⌥⇧T is `Event::OpenFolder`, the in-app folder picker.
@@ -32,6 +33,7 @@ fn open_folder_shortcut_opens_the_folder_picker_not_the_workspace_sheet(cx: &mut
 
 #[gpui::test]
 fn empty_content_open_folder_button_opens_the_same_folder_flow(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -71,6 +73,7 @@ fn empty_content_open_folder_button_opens_the_same_folder_flow(cx: &mut TestAppC
 
 #[gpui::test]
 fn clear_terminal_targets_the_active_main_tab_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h6_tests::sample(cx);
     // A chat is active: Iced's active tab has no terminal to write to.
     dispatch(TabSelect { index: 0 }, cx);
@@ -93,6 +96,7 @@ fn clear_terminal_targets_the_active_main_tab_only(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn usage_refresh_reads_fresh_codex_limits_without_writing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h6_tests::sample(cx);
     let day = root.path().join(".codex/sessions/2026/11/21");
     std::fs::create_dir_all(&day).unwrap();

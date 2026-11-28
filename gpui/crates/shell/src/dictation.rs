@@ -298,6 +298,7 @@ mod enabled {
         }
         #[gpui::test]
         fn switched_or_closed_chat_cannot_redirect_a_transcript(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             install(&shell, Some(Ok("spoken".into())), cx);
             let (origin, job) = start_stop(&shell, cx);
@@ -354,6 +355,7 @@ mod enabled {
         }
         #[gpui::test]
         fn switch_while_recording_keeps_the_starting_composer(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             install(&shell, Some(Ok("spoken".into())), cx);
             let origin = shell.update(cx, |shell, cx| {
@@ -379,6 +381,7 @@ mod enabled {
         }
         #[gpui::test]
         fn second_toggle_during_transcription_keeps_the_original_job(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             let starts = install(&shell, Some(Ok("spoken".into())), cx);
             let (origin, job) = start_stop(&shell, cx);
@@ -396,6 +399,7 @@ mod enabled {
         }
         #[gpui::test]
         fn silent_empty_and_failed_results_return_to_idle(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             install(&shell, None, cx); // core filtered silent/short audio
             shell.update(cx, |shell, cx| {
@@ -438,6 +442,7 @@ mod enabled {
         }
         #[gpui::test]
         fn shortcut_indicator_and_half_second_pulse_match_iced(cx: &mut TestAppContext) {
+            let _test_app = crate::test_app::Cleanup::new(cx);
             let (_root, shell, cx) = h6_tests::sample(cx);
             install(&shell, None, cx);
             let mic = |shell: &Entity<Shell>, cx: &VisualTestContext| {

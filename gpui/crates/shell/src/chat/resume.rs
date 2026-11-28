@@ -608,6 +608,7 @@ mod tests {
     fn async_history_is_shown_once_claims_before_send_and_requires_explicit_fresh(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let (dir, preview) = super::super::tests::fixture();
         let services = ServiceContext::production(&dir.path().join("live"), "resume-test").unwrap();
@@ -788,6 +789,7 @@ mod tests {
     fn missing_saved_cwd_offers_fresh_in_the_workspace_without_launching(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let (dir, preview) = super::super::tests::fixture();
         let services =

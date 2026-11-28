@@ -372,6 +372,7 @@ fn uncorrelated_ports_refuse_send_stop_permission_question_and_stale_stamps() {
 fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let (dir, preview) = fixture();
@@ -452,6 +453,7 @@ fn pane_owns_one_receiver_projects_adapter_and_saves_only_accepted_events(
 
 #[gpui::test]
 fn resume_failure_keeps_one_read_only_message_and_fresh_chat_action(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let (dir, preview) = fixture();
@@ -733,6 +735,7 @@ fn sign_in_command_quotes_provider_and_executable_paths_without_shell_expansion(
 fn quit_route_drains_a_closed_slow_child_before_platform_termination(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixListener;
 
@@ -887,6 +890,7 @@ Path('reaped-marker').write_text('finished')
 
 #[gpui::test]
 fn preview_pane_focus_forwards_to_the_native_chat(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui::Focusable as _;
     cx.update(gpui_component::init);
     let (dir, preview) = fixture();
@@ -1197,6 +1201,7 @@ fn preview_refuses_forged_bound_remember_before_any_writer() {
 
 #[gpui::test]
 fn shell_hookup_reports_chat_identity_and_actual_working_state(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (dir, preview) = fixture();
     let saved = SavedChat {
@@ -1241,6 +1246,7 @@ fn shell_hookup_reports_chat_identity_and_actual_working_state(cx: &mut gpui::Te
 
 #[gpui::test]
 fn received_turn_end_preserves_rate_limit_observation(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (dir, preview) = fixture();
     let saved = SavedChat {
@@ -1641,6 +1647,7 @@ fn hosted_launch(cx: &mut gpui::TestAppContext) -> HostedLaunch {
 
 #[gpui::test]
 fn chat_argv_has_configs_not_token(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_browser::browser_mcp::BROWSER_TOOL_ACCESS;
     use gitterm_core::preview::service::BrowserAccess;
     let launch = hosted_launch(cx);
@@ -1679,6 +1686,7 @@ fn chat_argv_has_configs_not_token(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn chat_env_has_token_and_caller_url(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launch = hosted_launch(cx);
     assert_eq!(
         launch.env["GITTERM_V6_TASK_MCP_TOKEN"],
@@ -1725,6 +1733,7 @@ fn chat_env_has_token_and_caller_url(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn chat_caller_is_target_uid(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launch = hosted_launch(cx);
     let configs: Vec<serde_json::Value> = launch
         .args
@@ -1750,6 +1759,7 @@ fn chat_caller_is_target_uid(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn chat_without_host_launches_without_mcp(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let (dir, preview) = fixture();
     let caller = Controller::new().target.session_uid;

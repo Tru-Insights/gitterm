@@ -1089,7 +1089,12 @@ impl Shell {
             return;
         }
         if !self.live_chat_enabled(cx) {
-            self.preview_unavailable("Remote terminal", cx);
+            let label = match kind {
+                launch::SessionKind::Shell => "Shell",
+                launch::SessionKind::Codex => "Codex",
+                launch::SessionKind::Claude => "Claude",
+            };
+            self.chrome_unavailable(label, cx);
             return;
         }
         let Some(config) = self.active_remote_session(cx) else {
@@ -1629,6 +1634,7 @@ mod connect_tests {
 
     #[gpui::test]
     fn closed_form_delivers_save_success_and_failure_to_the_shell(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (f, cx) = fixture(cx);
         let source = f.iced();
         cx.update(|window, cx| {
@@ -1703,6 +1709,7 @@ mod connect_tests {
     fn live_form_save_reloads_remotes_and_closes_only_after_matching_handshake(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (f, cx) = fixture(cx);
         let source = f.iced();
         cx.update(|window, cx| {

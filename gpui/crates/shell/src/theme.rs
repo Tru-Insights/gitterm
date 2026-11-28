@@ -256,6 +256,7 @@ mod tests {
 
     #[gpui::test]
     fn terminal_view_uses_shared_font_settings(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let view = cx.new(|cx| {
             gitterm_terminal::TerminalView::new_deferred(
@@ -284,6 +285,7 @@ mod tests {
 
     #[gpui::test]
     fn startup_settings_fixture_applies_light_and_missing_uses_defaults(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(
             fixture.path().join("settings.json"),
@@ -371,6 +373,7 @@ mod tests {
 
     #[gpui::test]
     fn global_theme_matches_iced_and_applies_settings(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         cx.update(|cx| {
             for mode in ["dark", "light", "unknown", "Light"] {
