@@ -188,12 +188,12 @@ impl App {
     /// changed.
     pub(super) fn poll_plan_limits(&mut self) -> Task<Event> {
         self.evaluate_plan_limits();
-        let due = self.plan_limits.codex_read_due(Instant::now());
-        let read = if due {
-            self.read_codex_limits()
-        } else {
-            Task::none()
-        };
+        let read = self
+            .plan_limits
+            .begin_scheduled_codex_read(Instant::now())
+            .map_or_else(Task::none, |job| {
+                shutdown_task("read_codex_limits", job.run(), Event::PlanLimits)
+            });
         Task::batch([
             read,
             self.save_plan_limits(),
@@ -206,7 +206,7 @@ impl App {
         if self.plan_limits.codex_read_in_flight() {
             return Task::none();
         }
-        let sessions = gitterm::usage::UsageSources::local().map(|sources| sources.codex_sessions);
+        let sessions = gitterm_core::limits::local_codex_sessions();
         let Some(job) = self.plan_limits.begin_codex_read(sessions, Instant::now()) else {
             return Task::none();
         };
@@ -223,29 +223,12 @@ impl App {
     }
 
     pub(super) fn update_plan_limits(&mut self, event: PlanLimitsEvent) -> Task<Event> {
-        match event {
-            PlanLimitsEvent::CodexRead(limits) => {
-                if self.plan_limits.finish_codex_read(limits) {
-                    self.evaluate_plan_limits();
-                    return self.save_plan_limits();
-                }
-            }
-            PlanLimitsEvent::Saved(result) => {
-                let path = PlanLimitsFile::path_in(&config::global_config_dir());
-                if !self.plan_limits.finish_save(result, &path) {
-                    return Task::none();
-                }
-                return self.save_plan_limits();
-            }
-            PlanLimitsEvent::PinChanged(pin) => {
-                if !self.plan_limits.set_pin(pin.clone()) {
-                    return Task::none();
-                }
-                self.evaluate_plan_limits();
-                return self.save_plan_limits();
-            }
+        let path = PlanLimitsFile::path_in(&config::global_config_dir());
+        if self.plan_limits.complete_event(event, &path, now_unix()) {
+            self.save_plan_limits()
+        } else {
+            Task::none()
         }
-        Task::none()
     }
 
     /// A level's colour; `normal` below the warning threshold.

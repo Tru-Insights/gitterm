@@ -378,7 +378,7 @@ pub(crate) struct ChatPane {
 }
 /// The provider finished a turn (Iced's `HarnessEvent::TurnCompleted`).
 #[derive(Clone, Debug)]
-pub(crate) struct TurnEnded;
+pub(crate) struct TurnEnded(pub Option<gitterm_core::chat::types::RateLimitReading>);
 impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
@@ -956,6 +956,12 @@ impl ChatPane {
             &event,
             RuntimeEvent::Harness(HarnessEvent::ProcessExited { .. })
         );
+        let rate_limit = match &event {
+            RuntimeEvent::Harness(HarnessEvent::TurnCompleted { rate_limit, .. }) => {
+                rate_limit.clone()
+            }
+            _ => None,
+        };
         let turn_ended = matches!(
             &event,
             RuntimeEvent::Harness(HarnessEvent::TurnCompleted { .. })
@@ -1011,7 +1017,7 @@ impl ChatPane {
         }
         if turn_ended {
             self.refresh_checkout_head(cx);
-            cx.emit(TurnEnded);
+            cx.emit(TurnEnded(rate_limit));
         }
         if exited {
             self.shutdown_runtime(cx);
@@ -1199,6 +1205,7 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     Persist(
         Box<resume::LiveTab>,
+        gitterm_core::desktop_store::DesktopStore,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
@@ -1221,8 +1228,8 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, reply) => {
-                            let result = tab.persist().map_err(|error| {
+                        ShutdownCommand::Persist(tab, store, reply) => {
+                            let result = tab.persist(&store).map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {

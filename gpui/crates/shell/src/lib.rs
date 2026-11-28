@@ -770,6 +770,27 @@ impl Shell {
         let id = self
             .owner
             .update(cx, |owner, cx| owner.add_folder(folder, cx))?;
+        self.mount_workspace(id, window, cx)?;
+        self.reopen_workspace(id, window, cx);
+        self.sync_git_visibility(false, cx);
+        self.focus.focus(window, cx);
+        cx.notify();
+        Ok(())
+    }
+    pub(crate) fn mount_workspace(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if cx
+            .try_global::<workspace_config::LiveWorkspaces>()
+            .is_some()
+            && self.owner.read(cx).stopped_workspaces.contains(&id)
+            && self.workspaces.iter().any(|w| w.workspace.id == id)
+        {
+            self.reconcile_stopped_workspace(id, window, cx);
+        }
         if !self.workspaces.iter().any(|w| w.workspace.id == id) {
             let workspace = self
                 .data
@@ -814,7 +835,6 @@ impl Shell {
             }
             self.workspaces.push(state);
         }
-        self.reopen_workspace(id, window, cx);
         self.sync_git_visibility(false, cx);
         self.focus.focus(window, cx);
         cx.notify();
@@ -917,6 +937,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         if !self
             .workspaces
             .iter()
@@ -990,6 +1013,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         if !self.local {
             return;
         }
@@ -1087,6 +1113,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
         if !self.local || !self.workspaces.iter().any(|state| state.on_bar()) {
             return;
         }
@@ -1845,7 +1874,8 @@ impl Shell {
             .collect()
     }
     fn chrome_workspaces(&self, cx: &App) -> Vec<workspace_bar::Workspace> {
-        self.workspaces
+        let mut workspaces: Vec<_> = self
+            .workspaces
             .iter()
             .map(|state| {
                 let saved = self.owner.read(cx).iced_workspace(state.workspace.id);
@@ -1924,8 +1954,14 @@ impl Shell {
                         .unwrap_or(gitterm_core::settings::WorkspaceColor::Lavender),
                     placement: gitterm_core::workspace::BarChip {
                         group,
-                        work: saved
-                            .is_some_and(|w| gitterm_core::work::catalog::is_work(&w.chats, false)),
+                        work: saved.is_some_and(|w| {
+                            gitterm_core::work::catalog::is_work(
+                                &w.chats,
+                                self.owner.read(cx).iced_catalog().is_some_and(|c| {
+                                    c.claims.contains(&(state.workspace.id.0 as usize - 1))
+                                }),
+                            )
+                        }),
                         parked: !state.on_bar(),
                     },
                     attention: attention
@@ -1944,7 +1980,17 @@ impl Shell {
                     pr_news: None,
                 }
             })
-            .collect()
+            .collect();
+        if let Some(catalog) = self.owner.read(cx).iced_catalog() {
+            let order = catalog.ordered_indices();
+            workspaces.sort_by_key(|w| {
+                order
+                    .iter()
+                    .position(|&i| i as u64 + 1 == w.id.0)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        workspaces
     }
     fn repos_on_bar(&self, cx: &App) -> bool {
         self.owner
@@ -2030,7 +2076,14 @@ impl Shell {
                 facts.parked,
                 &self.owner.read(cx).saved_parked(),
                 hidden,
-                self.workspaces.iter().filter(|w| !w.on_bar()).count(),
+                if cx
+                    .try_global::<workspace_config::LiveWorkspaces>()
+                    .is_some()
+                {
+                    0
+                } else {
+                    self.workspaces.iter().filter(|w| !w.on_bar()).count()
+                },
             ),
             terminal_expanded: active.is_some_and(|w| w.store.regions.has_bottom(false)),
             terminal_running: active.is_some_and(|state| {
@@ -4817,13 +4870,12 @@ fn install_app_menus(cx: &mut App) {
 }
 
 pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
-    let mut live_desktop = None;
-    let (settings, roots, lifetime, live_snapshot, live_services) = match mode {
+    let (settings, roots, lifetime, live_snapshot, live_services, live_desktop) = match mode {
         launch::LaunchMode::Preview => {
             let settings = workspace_config::load_iced_settings();
             let roots = preview::roots_from_environment(sample)?;
             let lifetime = lifetime::Lifetime::acquire(&roots)?;
-            (settings, roots, lifetime, None, None)
+            (settings, roots, lifetime, None, None, None)
         }
         launch::LaunchMode::Live => {
             ensure!(
@@ -4831,7 +4883,6 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                 "Live uses the V6 workspace catalog; --sample and --workspace are Preview inputs"
             );
             let (lifetime, desktop, snapshot, services) = live::prepare()?.publish()?;
-            live_desktop = Some(desktop.clone());
             let settings = match &snapshot.settings.loaded {
                 gitterm_core::desktop_store::LoadState::Valid(settings) => {
                     serde_json::from_value(serde_json::to_value(settings)?)?
@@ -4843,12 +4894,20 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                     anyhow::bail!("Live settings refused: {error}")
                 }
             };
+            let live_desktop = desktop.clone();
             lifetime.barrier.register("desktop-store", move || {
                 desktop.drain().wait().map_err(anyhow::Error::msg)
             });
             // UI layout remains GPUI-only; the durable V6 owner is DesktopStore.
             let roots = preview::roots_from_environment(false)?;
-            (settings, roots, lifetime, Some(snapshot), Some(services))
+            (
+                settings,
+                roots,
+                lifetime,
+                Some(snapshot),
+                Some(services),
+                Some(live_desktop),
+            )
         }
     };
     let preview = preview::PreviewContext::from_roots(roots)?;
@@ -4871,6 +4930,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
             }
         };
         store.load()?;
+        store.parked.clear();
         let catalog = workspace_config::IcedCatalog::from_document(host_lock.root(), file);
         let model = WorkspaceStatus::from_iced(&catalog);
         store.iced = Some(catalog);
@@ -4908,8 +4968,8 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     );
     let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
-        if let Some(store) = live_desktop {
-            cx.set_global(work_sidebar::LiveRepoStore(store));
+        if let Some(desktop) = live_desktop {
+            cx.set_global(workspace_config::LiveWorkspaces(desktop));
         }
         cx.set_global(barrier);
         cx.set_global(app_shutdown);
@@ -5033,70 +5093,6 @@ fn window_title(app_name: &str, workspace: &str, sidebar_mode: SidebarMode) -> S
     format!("{app_name} - {workspace} - {mode}")
 }
 
-impl Shell {
-    pub(crate) fn open_recent_work_sheet(
-        &mut self,
-        window: &mut gpui::Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        use gitterm_core::work::catalog::{
-            NewWorkSheet, OpenWork, existing_work, new_work_recent_repos,
-        };
-        use gpui::AppContext as _;
-        self.session_picker = None;
-        self.picker_subscription = None;
-        self.park_sheet = None;
-        self.park_subscription = None;
-        self.settings_sheet = None;
-        self.settings_subscription = None;
-        let owner = self.owner.read(cx);
-        let saved = owner
-            .iced_catalog()
-            .map(|c| c.workspaces.as_slice())
-            .unwrap_or_default();
-        let open: Vec<_> = saved
-            .iter()
-            .enumerate()
-            .map(|(i, w)| OpenWork {
-                uid: i as u64 + 1,
-                name: &w.name,
-                dir: &w.dir,
-                chats: &w.chats,
-                claims_new_chats: false,
-                running_park: self.workspaces[i].parked.is_some(),
-            })
-            .collect();
-        let existing = existing_work(&open, &[]);
-        let candidates = self.recent_repo_candidates(cx);
-        let draft = NewWorkSheet {
-            recent: new_work_recent_repos(candidates, |p| p.join(".git").is_dir()),
-            ..Default::default()
-        };
-        let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
-        let sheet = cx.new(|cx| {
-            crate::workspace_sheet::WorkspaceSheet::new(
-                draft,
-                existing,
-                dirs::home_dir(),
-                window,
-                cx,
-            )
-        });
-        self.new_work_subscription = Some(cx.subscribe_in(
-            &sheet,
-            window,
-            move |shell, _, outcome: &crate::workspace_sheet::WorkspaceSheetOutcome, window, cx| {
-                shell.new_work_outcome(outcome, window, cx);
-                if shell.new_work_sheet.is_none() {
-                    previous_focus.focus(window, cx);
-                }
-            },
-        ));
-        self.new_work_sheet = Some(sheet);
-        self.cover_sheet(true, window, cx);
-        cx.notify();
-    }
-}
 impl Shell {
     fn session_tab<'a>(
         &self,

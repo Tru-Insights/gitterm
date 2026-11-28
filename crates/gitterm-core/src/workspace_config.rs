@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename = "WorkspacesFile")]
 pub struct WorkspacesFile<C = WorkspaceColor> {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub workspaces: Vec<WorkspaceConfig<C>>,
     pub active_workspace: usize,
     #[serde(default = "default_remote_sessions")]
@@ -33,6 +36,7 @@ pub struct WorkspacesFile<C = WorkspaceColor> {
 impl<C> Default for WorkspacesFile<C> {
     fn default() -> Self {
         Self {
+            extra: Default::default(),
             workspaces: Vec::new(),
             active_workspace: 0,
             remote_sessions: Vec::new(),
@@ -156,6 +160,9 @@ pub struct RemoteSessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename = "WorkspaceConfig")]
 pub struct WorkspaceConfig<C = WorkspaceColor> {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Collapsed Issues groups (TRU-243), independently saved for each workspace.
     #[serde(default = "crate::issues::IssueGroup::default_collapsed")]
     pub collapsed_issue_groups: Vec<crate::issues::IssueGroup>,
@@ -291,6 +298,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceTabConfig {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_dir: Option<String>,
@@ -831,3 +841,33 @@ pub fn detect_run_command(dir: &Path) -> Option<String> {
 #[cfg(all(test, feature = "runtime"))]
 #[path = "workspace_config/action_tests.rs"]
 mod repo_action_tests;
+
+/// Markdown roots follow the workspace home folder, including named work;
+/// starting repos and the decisions repo never replace this root.
+pub fn document_roots(workspace: &Path) -> (PathBuf, PathBuf) {
+    (workspace.join(".plans"), workspace.join("docs"))
+}
+
+/// Creates Iced's numbered ~/Work/<slug> folder. Nothing is created on cancel.
+pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(base)?;
+    let slug = crate::work::summary::work_folder_slug(name);
+    for n in 1u32.. {
+        let dir = if n == 1 {
+            base.join(&slug)
+        } else {
+            base.join(format!("{slug}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("create {}: {error}", dir.display()),
+                ))
+            }
+        }
+    }
+    unreachable!("u32 suffixes exhausted under {}", base.display())
+}

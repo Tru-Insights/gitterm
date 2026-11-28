@@ -11,10 +11,6 @@ mod theme {
     }
 }
 
-mod tab {
-    pub use gitterm_core::chat::types::AgentBackendConfig;
-}
-
 #[path = "support/iced_named_work.rs"]
 mod iced_named_work;
 
@@ -103,3 +99,49 @@ fn core_workspace_dtos_preserve_iced_serialized_bytes() {
 
 #[path = "support/desktop_store_parity.rs"]
 mod desktop_store_parity;
+
+#[test]
+fn shared_park_helpers_preserve_iced_bytes_and_cross_read_both_hosts() {
+    use gitterm_core::park::{self, Key};
+    let fixture = r#"{"name":"Old Iced work","abbrev":"OI","dir":"/fixture/work","color":"blue","tabs":[{"dir":"/fixture/repo","session_uid":"caller","startup_command":"echo preserved"}],"chats":["chat"],"env":{"KEEP":"value"}}"#;
+    let iced: config::WorkspaceConfig = serde_json::from_str(fixture).unwrap();
+    let key = Key {
+        name: iced.name.clone(),
+        dir: iced.dir.clone(),
+    };
+    let info = config::ParkedInfo {
+        note: "keep this note".into(),
+        parked_at: "2026-11-27T00:00:00Z".into(),
+    };
+    // Frozen pre-extraction operations, performed on the very same map clone
+    // so randomized HashMap iteration cannot mask a byte regression.
+    let mut expected = iced.clone();
+    expected.active = false;
+    expected.parked = Some(info.clone());
+    let actual = park::parked_config(iced, info);
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    let mut configs = vec![actual];
+    assert!(park::finish_parked(&mut configs, &key, "done-stamp".into()));
+    expected.done_at = Some("done-stamp".into());
+    assert_eq!(
+        serde_json::to_vec(&configs[0]).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert!(park::reopen_done(&mut configs, &key));
+    expected.done_at = None;
+    assert_eq!(
+        serde_json::to_vec(&configs[0]).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    let gpui: gitterm_core::workspace_config::WorkspaceConfig =
+        serde_json::from_slice(&serde_json::to_vec(&configs[0]).unwrap()).unwrap();
+    let iced: config::WorkspaceConfig =
+        serde_json::from_slice(&serde_json::to_vec(&gpui).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(iced).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+}

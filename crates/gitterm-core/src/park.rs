@@ -247,6 +247,51 @@ impl State {
     }
 }
 
+/// Both stopped and running parks use Iced's closed-entry wire format.
+pub fn parked_config<C>(
+    mut config: crate::workspace_config::WorkspaceConfig<C>,
+    info: crate::workspace_config::ParkedInfo,
+) -> crate::workspace_config::WorkspaceConfig<C> {
+    config.active = false;
+    config.parked = Some(info);
+    config
+}
+
+pub fn finish_parked<C>(
+    configs: &mut [crate::workspace_config::WorkspaceConfig<C>],
+    key: &Key,
+    stamp: String,
+) -> bool {
+    if let Some(config) = configs.iter_mut().find(|c| c.is_parked() && key.matches(c)) {
+        config.done_at = Some(stamp);
+        true
+    } else {
+        false
+    }
+}
+
+/// Clear Done on the first matching closed entry, making it parked again.
+pub fn reopen_done<C>(
+    configs: &mut [crate::workspace_config::WorkspaceConfig<C>],
+    key: &Key,
+) -> bool {
+    if let Some(config) = configs
+        .iter_mut()
+        .find(|c| !c.active && c.done_at.is_some() && key.matches(c))
+    {
+        config.done_at = None;
+        true
+    } else {
+        false
+    }
+}
+
+impl Key {
+    pub fn matches<C>(&self, config: &crate::workspace_config::WorkspaceConfig<C>) -> bool {
+        self.name == config.name && self.dir == config.dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

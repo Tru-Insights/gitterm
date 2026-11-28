@@ -19,6 +19,13 @@ pub enum TaskSessionLiveState {
     AwaitingInput,
 }
 
+/// Input answers notify-driven idle. A title-driven waiting state remains
+/// owned by the harness title adapter, as in Iced's terminal-write arm.
+pub fn input_resumes_waiting(live: Option<TaskSessionLiveState>, title: Option<&str>) -> bool {
+    live == Some(TaskSessionLiveState::AwaitingInput)
+        && title.is_none_or(|title| !title.starts_with('✳'))
+}
+
 /// Aggregate the live states of every session linked to one task into a
 /// single lifecycle observation. A session awaiting input outranks work in
 /// progress — the human is the blocker; work elsewhere doesn't unblock it.
@@ -78,6 +85,23 @@ mod tests {
 
     fn session(live: Option<TaskSessionLiveState>, is_final: bool) -> LinkedSession {
         LinkedSession { live, is_final }
+    }
+
+    #[test]
+    fn input_resumes_notify_idle_but_preserves_title_owned_waiting() {
+        assert!(input_resumes_waiting(
+            Some(TaskSessionLiveState::AwaitingInput),
+            None
+        ));
+        assert!(input_resumes_waiting(
+            Some(TaskSessionLiveState::AwaitingInput),
+            Some("shell")
+        ));
+        assert!(!input_resumes_waiting(
+            Some(TaskSessionLiveState::AwaitingInput),
+            Some("✳ Claude Code")
+        ));
+        assert!(!input_resumes_waiting(None, None));
     }
 
     #[test]
