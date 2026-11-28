@@ -950,11 +950,20 @@ pub(crate) fn save_live_workspace(
                     );
                     let mut tabs = tabs;
                     // A provider acknowledgement can reach the serialized owner
-                    // after the UI captured its park request. Keep that identity.
+                    // after the UI captured its park request. Keep that metadata
+                    // and fields this desktop cannot render.
                     for tab in &mut tabs {
-                        if tab.chat_session_id.is_none() && tab.session_uid.is_some()
+                        if tab.session_uid.is_some()
                             && let Some(confirmed) = workspace.tabs.iter().find(|saved| saved.session_uid == tab.session_uid) {
-                            tab.chat_session_id = confirmed.chat_session_id.clone();
+                            let mut extra = confirmed.extra.clone();
+                            extra.extend(tab.extra.clone());
+                            tab.extra = extra;
+                            if confirmed.chat_session_id.is_some()
+                                && (tab.chat_session_id.is_none() || tab.chat_session_id == confirmed.chat_session_id) {
+                                tab.chat_session_id = confirmed.chat_session_id.clone();
+                                tab.agent_config = confirmed.agent_config.clone();
+                                tab.repo_dir = confirmed.repo_dir.clone();
+                            }
                         }
                     }
                     workspace.tabs = tabs;
@@ -991,6 +1000,7 @@ pub(crate) fn save_live_workspace(
                     workspace.active_tab = active_tab;
                     if workspace.tabs.is_empty() {
                         workspace.tabs.push(gitterm_core::workspace_config::WorkspaceTabConfig {
+                            extra: Default::default(),
                             dir: workspace.dir.clone(), repo_dir: Some(workspace.dir.clone()), startup_command: None, tab_kind: None, agent_config: None, chat_session_id: None, task_id: None, task_session_id: None, worker_shutdown_refused: false, session_uid: None,
                         });
                         workspace.active_tab = Some(0);
@@ -1104,6 +1114,7 @@ fn new_work_config(
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     WorkspaceConfig {
+        extra: Default::default(),
         collapsed_issue_groups: gitterm_core::issues::IssueGroup::default_collapsed(),
         name: name.into(),
         abbrev: name.chars().take(2).collect::<String>().to_uppercase(),

@@ -1199,6 +1199,7 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     Persist(
         Box<resume::LiveTab>,
+        gitterm_core::desktop_store::DesktopStore,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
@@ -1221,8 +1222,8 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, reply) => {
-                            let result = tab.persist().map_err(|error| {
+                        ShutdownCommand::Persist(tab, store, reply) => {
+                            let result = tab.persist(&store).map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {

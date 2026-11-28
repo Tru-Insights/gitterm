@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename = "WorkspacesFile")]
 pub struct WorkspacesFile<C = WorkspaceColor> {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub workspaces: Vec<WorkspaceConfig<C>>,
     pub active_workspace: usize,
     #[serde(default = "default_remote_sessions")]
@@ -33,6 +36,7 @@ pub struct WorkspacesFile<C = WorkspaceColor> {
 impl<C> Default for WorkspacesFile<C> {
     fn default() -> Self {
         Self {
+            extra: Default::default(),
             workspaces: Vec::new(),
             active_workspace: 0,
             remote_sessions: Vec::new(),
@@ -156,6 +160,9 @@ pub struct RemoteSessionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename = "WorkspaceConfig")]
 pub struct WorkspaceConfig<C = WorkspaceColor> {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Collapsed Issues groups (TRU-243), independently saved for each workspace.
     #[serde(default = "crate::issues::IssueGroup::default_collapsed")]
     pub collapsed_issue_groups: Vec<crate::issues::IssueGroup>,
@@ -291,6 +298,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceTabConfig {
+    /// Fields written by a newer desktop survive full-document Live saves.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_dir: Option<String>,

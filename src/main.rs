@@ -10627,6 +10627,7 @@ impl App {
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
         let home = self.repo(ws.home);
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: ws.collapsed_issue_groups.clone(),
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
@@ -10641,6 +10642,7 @@ impl App {
                 .tabs
                 .iter()
                 .map(|tab| WorkspaceTabConfig {
+                    extra: Default::default(),
                     // Terminal-style tabs persist their tracked local
                     // cwd; source-browsing tabs persist the browser dir
                     // so remote workspaces restore where they left off.
@@ -55841,6 +55843,7 @@ mod tests {
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             name: name.to_string(),
             abbrev: "AC".to_string(),

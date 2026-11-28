@@ -1877,6 +1877,7 @@ impl crate::Shell {
                     )
                 } else {
                     gitterm_core::workspace_config::WorkspaceTabConfig {
+                        extra: Default::default(),
                         dir: cwd.to_string_lossy().into_owned(),
                         repo_dir: Some(saved.dir.clone()),
                         startup_command: None,

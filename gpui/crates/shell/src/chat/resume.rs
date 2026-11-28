@@ -9,6 +9,8 @@ use std::path::Path;
 
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod store_tests;
 
 #[derive(Clone)]
 pub(super) struct LiveTab {
@@ -30,34 +32,41 @@ impl LiveTab {
             tab,
         }
     }
-    /// Read/modify the current document, retaining unknown fields and other tabs.
-    /// The chat shutdown queue serializes these writes and drains them on quit.
-    pub fn persist(&self) -> Result<()> {
-        use std::io::Write;
+    /// Share the workspace lifecycle's serialized owner. The chat shutdown queue
+    /// waits for its receipt, so quit also drains writes not yet submitted here.
+    pub fn persist(&self, store: &gitterm_core::desktop_store::DesktopStore) -> Result<()> {
         anyhow::ensure!(
             !self.services.is_preview(),
             "Cannot persist Live chat in Preview"
         );
-        let root = self.services.state_root();
-        let path = root.join("workspaces.json");
-        let mut document: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path).with_context(|| format!("Read {}", path.display()))?,
-        )
-        .with_context(|| format!("Parse {}", path.display()))?;
-        // Validate the shared contract before changing the raw JSON document.
-        let _: gitterm_core::workspace_config::WorkspacesFile =
-            serde_json::from_value(document.clone())?;
-        let workspace = document["workspaces"]
-            .as_array_mut()
-            .context("Missing workspaces")?
-            .iter_mut()
-            .find(|workspace| {
-                workspace["name"] == self.workspace_name && workspace["dir"] == self.workspace_dir
+        anyhow::ensure!(
+            std::fs::canonicalize(self.services.state_root())? == store.root(),
+            "Live chat persistence owner belongs to another state root"
+        );
+        let live = self.clone();
+        store
+            .transact_workspaces(move |file| {
+                live.update_document(file)
+                    .map_err(|error| format!("{error:#}"))
             })
+            .wait()
+            .map_err(anyhow::Error::msg)
+    }
+    fn update_document(
+        &self,
+        file: &mut gitterm_core::workspace_config::WorkspacesFile,
+    ) -> Result<()> {
+        let mut matches = file.workspaces.iter_mut().filter(|workspace| {
+            workspace.name == self.workspace_name && workspace.dir == self.workspace_dir
+        });
+        let workspace = matches
+            .next()
             .context("Live chat workspace no longer exists")?;
-        let tabs = workspace["tabs"]
-            .as_array_mut()
-            .context("Missing workspace tabs")?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "Several saved workspaces have the same name and folder; this workspace cannot be changed in Live."
+        );
+        let tabs = &mut workspace.tabs;
         let uid = self
             .tab
             .session_uid
@@ -69,43 +78,39 @@ impl LiveTab {
             .as_deref()
             .context("Live chat has no confirmed provider identity")?;
         anyhow::ensure!(
-            !tabs.iter().any(|tab| tab["chat_session_id"] == id
-                && !tab["session_uid"].is_null()
-                && tab["session_uid"] != uid),
+            !tabs
+                .iter()
+                .any(|tab| tab.chat_session_id.as_deref() == Some(id)
+                    && tab.session_uid.is_some()
+                    && tab.session_uid.as_deref() != Some(uid)),
             "Confirmed Claude session already belongs to another tab"
         );
         if let Some(tab) = tabs.iter_mut().find(|tab| {
-            tab["session_uid"] == uid
-                || (tab["chat_session_id"] == id && tab["session_uid"].is_null())
+            tab.session_uid.as_deref() == Some(uid)
+                || (tab.chat_session_id.as_deref() == Some(id) && tab.session_uid.is_none())
         }) {
             // Iced also drops nested agent_config unknowns by re-serializing its typed config.
             // Preserve other fields a newer desktop may have written.
-            let object = tab.as_object_mut().context("Invalid workspace tab")?;
+            let mut value = serde_json::to_value(&*tab)?;
+            let object = value.as_object_mut().context("Invalid workspace tab")?;
             for (key, value) in serde_json::to_value(&self.tab)?
                 .as_object()
                 .context("Invalid live tab")?
             {
                 object.insert(key.clone(), value.clone());
             }
-        } else if !tabs.iter().any(|tab| tab["chat_session_id"] == id) {
-            tabs.push(serde_json::to_value(&self.tab)?);
+            *tab = serde_json::from_value(value)?;
+        } else if !tabs
+            .iter()
+            .any(|tab| tab.chat_session_id.as_deref() == Some(id))
+        {
+            tabs.push(self.tab.clone());
         } else {
             anyhow::bail!("Confirmed Claude session already belongs to another tab");
         }
-        if let Some(chats) = workspace
-            .get_mut("chats")
-            .and_then(serde_json::Value::as_array_mut)
-            && !chats.is_empty()
-            && !chats.iter().any(|chat| chat == id)
-        {
-            chats.push(serde_json::Value::String(id.into()));
+        if !workspace.chats.is_empty() && !workspace.chats.iter().any(|chat| chat == id) {
+            workspace.chats.push(id.into());
         }
-        let bytes = serde_json::to_vec_pretty(&document)?;
-        let mut file = tempfile::NamedTempFile::new_in(root)?;
-        file.write_all(&bytes)?;
-        file.as_file().sync_all()?;
-        file.persist(&path)
-            .with_context(|| format!("Save confirmed chat to {}", path.display()))?;
         Ok(())
     }
 }
@@ -119,6 +124,7 @@ pub(super) fn default_config() -> AgentBackendConfig {
 }
 pub(crate) fn tab(cwd: &Path, uid: String, id: Option<String>) -> WorkspaceTabConfig {
     WorkspaceTabConfig {
+        extra: Default::default(),
         dir: cwd.to_string_lossy().into_owned(),
         repo_dir: Some(cwd.to_string_lossy().into_owned()),
         startup_command: None,
@@ -173,11 +179,20 @@ impl ChatPane {
         tab.tab.repo_dir = Some(self.saved.cwd.to_string_lossy().into_owned());
         tab.tab.agent_config = Some(self.controller.config.clone());
         let tab = tab.clone();
+        let store = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .context("Live workspace persistence owner is unavailable")?
+            .0
+            .clone();
         self.persisted_id = tab.tab.chat_session_id.clone();
         let (reply, saved) = tokio::sync::oneshot::channel();
         self.shutdown
             .sender
-            .send(ShutdownCommand::Persist(Box::new(tab.clone()), reply))
+            .send(ShutdownCommand::Persist(
+                Box::new(tab.clone()),
+                store,
+                reply,
+            ))
             .map_err(|_| anyhow::anyhow!("Live chat persistence queue stopped"))?;
         if let Some(owner) = cx
             .try_global::<crate::work_sidebar::IcedWorkSource>()
@@ -452,6 +467,10 @@ impl ChatPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) fn install_store(root: &Path, cx: &mut gpui::App) {
+        let store = gitterm_core::desktop_store::DesktopStore::open(root).unwrap();
+        cx.set_global(crate::workspace_config::LiveWorkspaces(store));
+    }
     pub(super) fn workspace(dir: &Path) -> WorkspaceConfig {
         serde_json::from_value(serde_json::json!({"name":"Synthetic", "dir":dir, "abbrev":"S", "color":"blue", "tabs":[]})).unwrap()
     }
@@ -476,9 +495,10 @@ mod tests {
             "tabs":[{"dir":workspace.dir,"startup_command":"do not run","future":true}]
         }]});
         std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let store = gitterm_core::desktop_store::DesktopStore::open(dir.path()).unwrap();
         let live = LiveTab::new(services, &workspace, tab.clone());
-        live.persist().unwrap();
-        live.persist().unwrap();
+        live.persist(&store).unwrap();
+        live.persist(&store).unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved["future"], "keep");
@@ -499,10 +519,12 @@ mod tests {
         let mut conflicting = live.clone();
         conflicting.tab.session_uid = Some("other-caller".into());
         let before = std::fs::read(&path).unwrap();
-        assert!(conflicting.persist().is_err());
+        assert!(conflicting.persist(&store).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(store);
         std::fs::write(&path, b"{partial").unwrap();
-        assert!(live.persist().is_err());
+        let refused = gitterm_core::desktop_store::DesktopStore::open(dir.path()).unwrap();
+        assert!(live.persist(&refused).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{partial");
     }
     #[gpui::test]
@@ -597,6 +619,7 @@ mod tests {
             "name":workspace.name,"dir":workspace.dir,"abbrev":"S","color":"blue","tabs":[tab.clone()]
         }]});
         std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        cx.update(|_, cx| install_store(services.state_root(), cx));
         pane.update(cx, |pane, cx| {
             assert!(pane.persisted_id.is_none());
             let id = pane.saved.session_id.clone().unwrap();
