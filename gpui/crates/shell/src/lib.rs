@@ -1109,7 +1109,24 @@ impl Shell {
             });
             return;
         };
-        let mut id = layout::stable_path_hash(&cwd);
+        // A Live action may have just added this tab to the V6 document.
+        // Use its imported identity so the local layout cannot restore it twice.
+        let imported = cx
+            .try_global::<work_sidebar::LiveRepoStore>()
+            .and_then(|_| {
+                let owner = self.owner.read(cx);
+                let saved = owner.iced_workspace(state.workspace.id)?;
+                data::iced_sessions(saved)
+                    .into_iter()
+                    .zip(&saved.tabs)
+                    .find(|(session, tab)| {
+                        !used.contains(&session.id.0)
+                            && gitterm_core::workspace_config::RepoKey::local(Path::new(&tab.dir))
+                                == gitterm_core::workspace_config::RepoKey::local(&cwd)
+                    })
+                    .map(|(session, _)| session.id.0)
+            });
+        let mut id = imported.unwrap_or_else(|| layout::stable_path_hash(&cwd));
         while used.contains(&id) {
             id = id.wrapping_add(1);
         }
@@ -3355,11 +3372,8 @@ impl Shell {
                 window,
                 cx,
             ),
-            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("Worktree actions are not available in preview".into());
-                    cx.notify();
-                });
+            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree { .. } => {
+                self.live_worktree_action(workspace, action, window, cx);
             }
         }
         cx.notify();
@@ -4565,6 +4579,7 @@ impl Render for Shell {
                                 cx,
                             );
                         }
+                        shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
@@ -4802,6 +4817,7 @@ fn install_app_menus(cx: &mut App) {
 }
 
 pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: bool) -> Result<()> {
+    let mut live_desktop = None;
     let (settings, roots, lifetime, live_snapshot, live_services) = match mode {
         launch::LaunchMode::Preview => {
             let settings = workspace_config::load_iced_settings();
@@ -4815,6 +4831,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                 "Live uses the V6 workspace catalog; --sample and --workspace are Preview inputs"
             );
             let (lifetime, desktop, snapshot, services) = live::prepare()?.publish()?;
+            live_desktop = Some(desktop.clone());
             let settings = match &snapshot.settings.loaded {
                 gitterm_core::desktop_store::LoadState::Valid(settings) => {
                     serde_json::from_value(serde_json::to_value(settings)?)?
@@ -4891,6 +4908,9 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     );
     let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
+        if let Some(store) = live_desktop {
+            cx.set_global(work_sidebar::LiveRepoStore(store));
+        }
         cx.set_global(barrier);
         cx.set_global(app_shutdown);
         preview.release_on_quit(cx);

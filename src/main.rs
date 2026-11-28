@@ -3751,80 +3751,7 @@ impl RunOutput {
     }
 }
 
-fn detect_run_command(dir: &PathBuf) -> Option<String> {
-    // Detect package manager (used by multiple checks)
-    let detect_pm = |dir: &PathBuf| -> &str {
-        if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
-            "bun"
-        } else if dir.join("yarn.lock").exists() {
-            "yarn"
-        } else if dir.join("pnpm-lock.yaml").exists() {
-            "pnpm"
-        } else {
-            "npm"
-        }
-    };
-
-    // 1. Tauri app (has src-tauri/ directory with Cargo.toml)
-    if dir.join("src-tauri").join("Cargo.toml").exists() {
-        // Check if package.json has a "tauri" script (frontend-driven setup)
-        if dir.join("package.json").exists() {
-            let pm = detect_pm(dir);
-            if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-                        if scripts.contains_key("tauri") {
-                            return Some(format!("{} run tauri", pm));
-                        }
-                        if scripts.contains_key("tauri:dev") {
-                            return Some(format!("{} run tauri:dev", pm));
-                        }
-                    }
-                }
-            }
-        }
-        // Fallback: run cargo tauri dev from inside src-tauri
-        return Some("cd src-tauri && cargo tauri dev".to_string());
-    }
-
-    // 2. package.json (check before bare Cargo.toml for hybrid projects)
-    if dir.join("package.json").exists() {
-        let pm = detect_pm(dir);
-
-        if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-                    // Priority: tauri dev > dev > start
-                    for script_name in &["tauri dev", "dev", "start"] {
-                        if scripts.contains_key(*script_name) {
-                            if *script_name == "start" && pm == "npm" {
-                                return Some("npm start".to_string());
-                            }
-                            return Some(format!("{} run {}", pm, script_name));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Cargo.toml (plain Rust project)
-    if dir.join("Cargo.toml").exists() {
-        return Some("cargo run".to_string());
-    }
-
-    // 4. docker-compose
-    if dir.join("docker-compose.yml").exists() || dir.join("docker-compose.yaml").exists() {
-        return Some("docker compose up".to_string());
-    }
-
-    // 5. Go project
-    if dir.join("go.mod").exists() && (dir.join("main.go").exists() || dir.join("cmd").is_dir()) {
-        return Some("go run .".to_string());
-    }
-
-    None
-}
+use gitterm_core::workspace_config::detect_run_command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttentionReason {
@@ -15875,9 +15802,15 @@ impl App {
         let Some(dir) = self.repo(id).map(|repo| repo.dir.clone()) else {
             return;
         };
+        let home = self
+            .repo(self.workspaces[idx].home)
+            .map(|repo| repo.dir.clone());
         let ws = &mut self.workspaces[idx];
-        if id == ws.home {
-            eprintln!("[workspace] {:?}: the home repo stays listed", ws.name);
+        if let Err(error) = gitterm_core::workspace_config::check_remove_repo(
+            home.as_deref().unwrap_or(&ws.dir),
+            &dir,
+        ) {
+            eprintln!("[workspace] {:?}: {error}", ws.name);
             return;
         }
         ws.repos.retain(|listed| *listed != id);
@@ -17487,8 +17420,7 @@ impl App {
             return;
         }
         if let Some(ws) = self.workspaces.iter_mut().find(|ws| ws.uid == rename.uid) {
-            if ws.name != name {
-                ws.name = name.to_string();
+            if gitterm_core::workspace_config::rename_workspace(&mut ws.name, name) {
                 self.mark_workspaces_dirty();
                 self.mark_log_server_dirty();
             }
@@ -30033,79 +29965,20 @@ fi
                     .unwrap_or_else(|| "Workspace".to_string());
                 let task_id = format!("task-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
                 let timestamp = chrono::Utc::now().to_rfc3339();
-                let branch = resolution.branch.clone();
-                let title = branch.strip_prefix("task/").unwrap_or(&branch).to_string();
-                // Branches named by the task convention lead with the issue
-                // key ("tru-105-..."); recover it when it looks like one.
-                let issue_key = {
-                    let stem = branch.strip_prefix("task/").unwrap_or(&branch);
-                    let mut segments = stem.splitn(3, '-');
-                    match (segments.next(), segments.next()) {
-                        (Some(team), Some(number)) => {
-                            let candidate = format!("{team}-{number}").to_uppercase();
-                            is_linear_issue_key(&candidate).then_some(candidate)
-                        }
-                        _ => None,
-                    }
-                };
-                let mut record = TaskRecord::new_draft(
-                    NewTaskRecord {
-                        task_id: task_id.clone(),
-                        title,
-                        objective: format!(
-                            "Adopted existing worktree {} on branch {}.",
-                            path.display(),
-                            branch
-                        ),
-                        workspace: TaskWorkspaceIdentity {
-                            name: workspace_name,
-                            location: WorkspaceLocationIdentity::Local {
-                                directory: resolution.repository.top_level.clone(),
-                            },
-                        },
-                        repository: resolution.repository.identity.clone(),
-                        issue: issue_key.map(|key| IssueReference {
-                            provider: IssueProvider::Linear,
-                            key,
-                            url: None,
-                        }),
-                        base: resolution.base.clone(),
-                        branch: branch.clone(),
-                        executor: ExecutorTarget::Local,
-                        harness: None,
-                        stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
-                    },
-                    timestamp.clone(),
-                );
-                record.created_by = Some(TaskCreator {
-                    kind: TaskCreatorKind::Manual,
-                    session_id: None,
-                    harness_label: None,
-                    created_at: timestamp.clone(),
-                });
-                record.lifecycle = TaskLifecycle::Preparing;
-                record.worktree = TaskWorktree {
-                    state: TaskWorktreeState::Preparing,
-                    path: None,
-                };
                 let Some(store) = self.task_host.store_mut().as_mut() else {
                     let op = self.unmanaged_worktree_ops.entry(path).or_default();
                     op.busy = false;
                     op.error = Some("The task store is unavailable".to_string());
                     return Task::none();
                 };
-                let persisted = store.insert(record).and_then(|()| {
-                    store.complete_worktree_preparation(
-                        &task_id,
-                        CompletedWorktreePreparation {
-                            repository: resolution.repository.identity.clone(),
-                            base: resolution.base.clone(),
-                            branch,
-                            path: path.clone(),
-                        },
-                        &timestamp,
-                    )
-                });
+                let persisted = gitterm_core::task_worktree::persist_adopted_worktree(
+                    store,
+                    &resolution,
+                    workspace_name,
+                    &path,
+                    task_id.clone(),
+                    &timestamp,
+                );
                 if let Err(error) = persisted {
                     let op = self.unmanaged_worktree_ops.entry(path).or_default();
                     op.busy = false;
@@ -30119,29 +29992,19 @@ fi
                 self.unmanaged_worktree_ops.remove(&path);
             }
             Event::WorktreeRemove { path, force } => {
-                if let Some(task) = self.worktree_task(&path) {
-                    self.task_ui_error = Some(format!(
-                        "{} belongs to task \"{}\" — delete it from the task instead",
-                        path.display(),
-                        task.title
-                    ));
-                    return Task::none();
-                }
-                let Some(workspace_dir) = self
+                let workspace_dir = self
                     .active_workspace()
-                    .filter(|workspace| {
-                        matches!(workspace.location, WorkspaceLocation::Local { .. })
-                    })
-                    .map(|workspace| workspace.dir.clone())
-                else {
-                    self.task_ui_error =
-                        Some("Removing a worktree needs a local workspace".to_string());
-                    return Task::none();
-                };
-                if paths_equal(&path, &workspace_dir) {
-                    self.task_ui_error = Some("The main checkout cannot be removed".to_string());
+                    .filter(|ws| matches!(ws.location, WorkspaceLocation::Local { .. }))
+                    .map(|ws| ws.dir.clone());
+                if let Err(error) = gitterm_core::task_worktree::check_unmanaged_removal(
+                    workspace_dir.as_deref(),
+                    &path,
+                    self.worktree_task(&path).map(|t| t.title.as_str()),
+                ) {
+                    self.task_ui_error = Some(error);
                     return Task::none();
                 }
+                let workspace_dir = workspace_dir.expect("checked local workspace");
                 let prunable = self
                     .rail_worktrees
                     .iter()
@@ -30200,8 +30063,7 @@ fi
                     }
                 }
                 Err(error) => {
-                    let offer_force = error.contains("use --force")
-                        || error.contains("contains modified or untracked files");
+                    let offer_force = gitterm_core::task_worktree::offer_force(&error);
                     let op = self.unmanaged_worktree_ops.entry(path).or_default();
                     op.busy = false;
                     op.error = Some(error);
@@ -33182,8 +33044,7 @@ fi
             Event::RunCommandSubmit => {
                 if let Some((repo_id, cmd)) = self.editing_run_command.take() {
                     if let Some(repo) = self.repo_mut(repo_id) {
-                        let cmd = cmd.trim();
-                        repo.run_command = (!cmd.is_empty()).then(|| cmd.to_string());
+                        repo.run_command = gitterm_core::workspace_config::run_command(&cmd);
                     }
                     self.mark_workspaces_dirty();
                 }
@@ -54020,7 +53881,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("cargo run".to_string())
         );
     }
@@ -54034,7 +53895,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("npm run dev".to_string())
         );
     }
@@ -54044,7 +53905,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("docker-compose.yml"), "version: '3'").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("docker compose up".to_string())
         );
     }
@@ -54054,16 +53915,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("go.mod"), "module test").unwrap();
         std::fs::write(dir.path().join("main.go"), "package main").unwrap();
-        assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
-            Some("go run .".to_string())
-        );
+        assert_eq!(detect_run_command(dir.path()), Some("go run .".to_string()));
     }
 
     #[test]
     fn detect_run_command_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(detect_run_command(&dir.path().to_path_buf()), None);
+        assert_eq!(detect_run_command(dir.path()), None);
     }
 
     // === Workspace::derive_abbrev ===
@@ -54314,7 +54172,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("npm start".to_string())
         );
     }
@@ -54329,7 +54187,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("bun.lockb"), "").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("bun run dev".to_string())
         );
     }
@@ -54344,7 +54202,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("yarn run dev".to_string())
         );
     }
@@ -54359,7 +54217,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("pnpm run dev".to_string())
         );
     }
@@ -54375,7 +54233,7 @@ mod tests {
         .unwrap();
         // No package.json — falls back to cargo tauri dev
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("cd src-tauri && cargo tauri dev".to_string())
         );
     }
@@ -54395,7 +54253,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("npm run tauri".to_string())
         );
     }
@@ -54406,10 +54264,7 @@ mod tests {
         std::fs::write(dir.path().join("go.mod"), "module test").unwrap();
         std::fs::create_dir(dir.path().join("cmd")).unwrap();
         // cmd/ dir is an alternative to main.go
-        assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
-            Some("go run .".to_string())
-        );
+        assert_eq!(detect_run_command(dir.path()), Some("go run .".to_string()));
     }
 
     #[test]
@@ -54417,7 +54272,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("docker-compose.yaml"), "version: '3'").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("docker compose up".to_string())
         );
     }
@@ -54434,7 +54289,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
         assert_eq!(
-            detect_run_command(&dir.path().to_path_buf()),
+            detect_run_command(dir.path()),
             Some("npm run dev".to_string())
         );
     }

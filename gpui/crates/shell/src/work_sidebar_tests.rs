@@ -3719,3 +3719,69 @@ fn editor_outcome_is_read_only_safe_and_emitted_in_preview(cx: &mut gpui::TestAp
     sidebar.update(cx, |sidebar, cx| sidebar.emit(outcome.clone(), cx));
     assert_eq!(*events.borrow(), [outcome]);
 }
+
+#[gpui::test]
+fn live_repo_controls_emit_writes_and_open_the_existing_inline_editors(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir().unwrap();
+    let store = gitterm_core::desktop_store::DesktopStore::open(root.path()).unwrap();
+    cx.update(|cx| cx.set_global(LiveRepoStore(store)));
+    let mut fixture = fixture(false);
+    fixture.open.insert(Fold::Repo("/repos/tools".into()));
+    let (sidebar, cx) = cx.add_window_view(|_, _| fixture);
+    let events = subscribe_outcomes(&sidebar, cx);
+    cx.simulate_resize(gpui::size(px(800.), px(2000.)));
+    draw_sidebar(cx);
+    click_control(&sidebar, cx, "Repos", "+ Add repo…");
+    click_control(
+        &sidebar,
+        cx,
+        "tools added to this workspace's repos",
+        "Undo",
+    );
+    click_control(&sidebar, cx, "tools", "×");
+    assert_eq!(
+        *events.borrow(),
+        [
+            WorkSidebarOutcome::AddRepo,
+            WorkSidebarOutcome::UndoAutoRepo {
+                workspace: 7,
+                repos: vec!["/repos/tools".into()]
+            },
+            WorkSidebarOutcome::RemoveRepo {
+                workspace: 7,
+                repo: "/repos/tools".into()
+            },
+        ]
+    );
+    click_control(&sidebar, cx, "tools", "+ run command");
+    assert!(sidebar.read_with(cx, |s, _| s.editing.is_some()));
+    click_control(&sidebar, cx, "Parity", "✎");
+    assert!(sidebar.read_with(cx, |s, _| s.renaming.is_some()));
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::Rename {
+                workspace: 7,
+                name: "Renamed".into(),
+            },
+            cx,
+        )
+    });
+    assert!(
+        matches!(events.borrow().last(), Some(WorkSidebarOutcome::Rename { name, .. }) if name == "Renamed")
+    );
+    assert!(sidebar.read_with(cx, |s, _| s.error.is_none()));
+    // Unrelated writes retain their existing Preview notice even in this slice.
+    sidebar.update(cx, |s, cx| {
+        s.emit(
+            WorkSidebarOutcome::MakeWorkspace {
+                chat: "root".into(),
+            },
+            cx,
+        )
+    });
+    assert_eq!(events.borrow().len(), 4);
+}

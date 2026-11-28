@@ -24,7 +24,7 @@ pub(crate) enum GitAction {
     BackToWork,
     OpenWorktree(PathBuf),
     AdoptWorktree(PathBuf),
-    RemoveWorktree(PathBuf),
+    RemoveWorktree { path: PathBuf, force: bool },
     EditFile(PathBuf),
 }
 impl EventEmitter<GitAction> for GitView {}
@@ -44,6 +44,7 @@ pub(crate) struct GitView {
     snapshot: Option<Snapshot>,
     loading: bool,
     generation: u64,
+    operations: std::collections::HashMap<PathBuf, WorktreeOperation>,
 }
 impl GitView {
     pub(crate) fn new(
@@ -69,10 +70,14 @@ impl GitView {
             snapshot: None,
             loading: false,
             generation: 0,
+            operations: Default::default(),
         }
     }
     fn root(&self, cx: &App) -> Option<PathBuf> {
         if let Some(owner) = self.data.local_owner() {
+            if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
+                return Some(saved.dir.clone().into());
+            }
             return owner
                 .read(cx)
                 .model
@@ -163,25 +168,49 @@ impl GitView {
                 } else {
                     actions = actions.child("Unavailable");
                 }
-                if !row.current {
+                let managed = managed_task(path, cx);
+                let op = self.operations.get(path);
+                if let Some(task) = &managed {
+                    panel = panel.child(format!(
+                        "task: {}",
+                        task.issue
+                            .as_ref()
+                            .map(|i| i.key.as_str())
+                            .unwrap_or(&task.title)
+                    ));
+                }
+                if let Some(error) = op.and_then(|op| op.error.as_ref()) {
+                    panel = panel.child(div().text_color(rgb(p.red)).child(error.clone()));
+                }
+                if !row.current && managed.is_none() && op.is_some_and(|op| op.busy) {
+                    actions = actions.child("working…");
+                } else if !row.current && managed.is_none() {
                     if row.available && !row.detached && !row.prunable {
                         let path = path.clone();
                         actions = actions.child(
                             Button::new("git-adopt")
                                 .ghost()
                                 .label("Adopt as task")
+                                .text_color(rgb(p.blue))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.emit(GitAction::AdoptWorktree(path.clone()))
                                 })),
                         );
                     }
                     let path = path.clone();
-                    actions =
-                        actions.child(Button::new("git-remove").ghost().label("Remove").on_click(
-                            cx.listener(move |_, _, _, cx| {
-                                cx.emit(GitAction::RemoveWorktree(path.clone()))
-                            }),
-                        ));
+                    let force = op.is_some_and(|op| op.offer_force);
+                    actions = actions.child(
+                        Button::new("git-remove")
+                            .ghost()
+                            .label(if force { "Force remove" } else { "Remove" })
+                            .text_color(rgb(if force { p.red } else { p.subtext0 }))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(GitAction::RemoveWorktree {
+                                    path: path.clone(),
+                                    force,
+                                })
+                            })),
+                    );
                 }
             }
             Selection::Branch(name) => {
@@ -205,6 +234,68 @@ impl GitView {
         }
         Some(panel.child(actions))
     }
+    pub(crate) fn begin_operation(
+        &mut self,
+        path: &std::path::Path,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<String>, String> {
+        if self.operations.get(path).is_some_and(|op| op.busy) {
+            return Err("Worktree operation is already running".into());
+        }
+        let previous = self
+            .operations
+            .get(path)
+            .filter(|op| op.offer_force)
+            .and_then(|op| op.error.clone());
+        gitterm_core::task_worktree::removal_force(force, previous.as_deref())?;
+        self.operations.insert(
+            path.to_path_buf(),
+            WorktreeOperation {
+                busy: true,
+                offer_force: false,
+                error: None,
+            },
+        );
+        cx.notify();
+        Ok(previous)
+    }
+    pub(crate) fn finish_operation(
+        &mut self,
+        path: &std::path::Path,
+        result: Result<(), String>,
+        removing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.operations.remove(path);
+                if !path.exists()
+                    && let Some(snapshot) = &mut self.snapshot
+                {
+                    snapshot.worktrees.retain(|row| row.path != path);
+                    for branch in &mut snapshot.branches {
+                        if branch.worktree.as_deref() == Some(path) {
+                            branch.worktree = None;
+                        }
+                    }
+                }
+                self.load_worktrees(cx);
+            }
+            Err(error) => {
+                self.operations.insert(
+                    path.to_path_buf(),
+                    WorktreeOperation {
+                        busy: false,
+                        offer_force: removing && gitterm_core::task_worktree::offer_force(&error),
+                        error: Some(error),
+                    },
+                );
+            }
+        }
+        cx.notify();
+    }
+
     fn open_button(&self, path: &std::path::Path, cx: &Context<Self>) -> Button {
         let has_session = self.data.local_owner().is_some_and(|owner| {
             owner
@@ -904,3 +995,536 @@ fn collect(root: PathBuf) -> Snapshot {
 #[cfg(test)]
 #[path = "git_view_tests.rs"]
 mod tests;
+
+#[derive(Default)]
+struct WorktreeOperation {
+    busy: bool,
+    offer_force: bool,
+    error: Option<String>,
+}
+
+fn managed_task(path: &std::path::Path, cx: &App) -> Option<gitterm_core::tasks::TaskRecord> {
+    cx.try_global::<crate::task_host::GpuiTaskHost>()?
+        .0
+        .read(cx)
+        .host()
+        .store()
+        .as_ref()?
+        .tasks()
+        .iter()
+        .find(|t| {
+            t.worktree.path.as_deref().is_some_and(|p| {
+                gitterm_core::workspace_config::RepoKey::local(p)
+                    == gitterm_core::workspace_config::RepoKey::local(path)
+            })
+        })
+        .cloned()
+}
+
+impl crate::Shell {
+    pub(crate) fn live_worktree_action(
+        &mut self,
+        workspace: WorkspaceId,
+        action: &GitAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gitterm_core::{
+            task_worktree as rules,
+            workspace_config::{RepoKey, WorkspaceTarget},
+        };
+        let Some(desktop) = cx
+            .try_global::<crate::work_sidebar::LiveRepoStore>()
+            .cloned()
+        else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Worktree actions are not available in preview".into());
+                cx.notify();
+            });
+            return;
+        };
+        let Some(saved) = self.owner.read(cx).iced_workspace(workspace).cloned() else {
+            return;
+        };
+        let target = WorkspaceTarget::of(&saved);
+        let repository = PathBuf::from(&saved.dir);
+        let (path, force) = match action {
+            GitAction::OpenWorktree(path) | GitAction::AdoptWorktree(path) => (path.clone(), false),
+            GitAction::RemoveWorktree { path, force } => (path.clone(), *force),
+            _ => return,
+        };
+        let Some(view) = self
+            .workspaces
+            .iter()
+            .find(|w| w.workspace.id == workspace)
+            .and_then(|w| w.panes.values().find_map(|p| p.read(cx).git.clone()))
+        else {
+            return;
+        };
+        let local = !saved.is_legacy_remote()
+            && !matches!(
+                saved.location,
+                Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })
+            );
+        let managed = managed_task(&path, cx);
+        if matches!(action, GitAction::RemoveWorktree { .. }) {
+            if let Err(error) = rules::check_unmanaged_removal(
+                local.then_some(repository.as_path()),
+                &path,
+                managed.as_ref().map(|t| t.title.as_str()),
+            ) {
+                view.update(cx, |v, cx| v.finish_operation(&path, Err(error), false, cx));
+                return;
+            }
+        } else if matches!(action, GitAction::AdoptWorktree(_)) {
+            if managed.is_some() {
+                return;
+            }
+            if !local {
+                view.update(cx, |v, cx| {
+                    v.finish_operation(
+                        &path,
+                        Err("Adopting a worktree needs a local workspace".into()),
+                        false,
+                        cx,
+                    )
+                });
+                return;
+            }
+        }
+        let previous = match view.update(cx, |v, cx| v.begin_operation(&path, force, cx)) {
+            Ok(previous) => previous,
+            Err(error) => {
+                self.owner.update(cx, |o, cx| {
+                    o.error = Some(error);
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        let removing = matches!(action, GitAction::RemoveWorktree { .. });
+        let action = action.clone();
+        let path_for_job = path.clone();
+        let repository_for_job = repository.clone();
+        let store = desktop.0.clone();
+        let target_for_job = target.clone();
+        let work = cx.background_executor().spawn(async move {
+            match &action {
+                GitAction::OpenWorktree(_) => {
+                    rules::check_open_worktree(&repository_for_job, &path_for_job)?;
+                    let file = store
+                        .try_edit_workspaces(move |file| {
+                            file.open_worktree_tab(&target_for_job, &path_for_job)?;
+                            Ok(())
+                        })
+                        .wait()?;
+                    Ok(WorktreeResult::Open(file))
+                }
+                GitAction::AdoptWorktree(_) => {
+                    let resolution =
+                        rules::resolve_worktree_adoption_blocking(&rules::AdoptWorktreeRequest {
+                            repository_path: repository_for_job,
+                            worktree_path: path_for_job,
+                        })
+                        .map_err(|e| e.to_string())?;
+                    Ok(WorktreeResult::Adopt(resolution))
+                }
+                GitAction::RemoveWorktree { .. } => {
+                    let force = rules::removal_force(force, previous.as_deref())?;
+                    rules::remove_unmanaged_worktree_blocking(
+                        &repository_for_job,
+                        &path_for_job,
+                        force,
+                    )?;
+                    Ok(WorktreeResult::Removed)
+                }
+                _ => unreachable!(),
+            }
+        });
+        cx.spawn_in(window, async move |shell, cx| {
+            let result = work.await;
+            _ = shell.update_in(cx, |shell, window, cx| {
+                let result = match result {
+                    Ok(WorktreeResult::Open(file)) => {
+                        let identity = target.index(&file).ok().and_then(|index| {
+                            let ws = &file.workspaces[index];
+                            ws.tabs
+                                .get(ws.active_tab?)
+                                .map(|tab| tab.session_identity())
+                        });
+                        shell.repo_document_saved(desktop.0.root(), file, cx);
+                        shell.select_workspace_id(workspace, window, cx);
+                        let existing = shell
+                            .workspaces
+                            .iter()
+                            .find(|w| w.workspace.id == workspace)
+                            .and_then(|w| {
+                                w.sessions
+                                    .iter()
+                                    .find(|s| {
+                                        w.panes
+                                            .get(&crate::session_pane_id(s.id))
+                                            .and_then(|p| p.read(cx).task_folder(cx))
+                                            .is_some_and(|cwd| {
+                                                RepoKey::local(&cwd) == RepoKey::local(&path)
+                                            })
+                                            || w.store.terminals.as_ref().is_some_and(|tabs| {
+                                                tabs.iter().any(|tab| {
+                                                    tab.id == s.id.0
+                                                        && RepoKey::local(&tab.cwd)
+                                                            == RepoKey::local(&path)
+                                                })
+                                            })
+                                    })
+                                    .map(|s| s.id)
+                            });
+                        if let Some(session) = existing {
+                            shell.select_session_id(session, window, cx);
+                        } else {
+                            shell.new_terminal_at(
+                                gpui_component::dock::DockPlacement::Center,
+                                Some(path.clone()),
+                                window,
+                                cx,
+                            );
+                        }
+                        if let Some(identity) = identity {
+                            let state = shell.active(cx);
+                            if let Some(pane) = state
+                                .active_session
+                                .and_then(|id| state.panes.get(&crate::session_pane_id(id)))
+                            {
+                                pane.update(cx, |pane, cx| {
+                                    if let (Some(target), Some(uid)) =
+                                        (&mut pane.session, identity.session_uid)
+                                    {
+                                        target.session_uid = uid;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        // The V6 tab is now the restore authority, including
+                        // when Open focused an older GPUI-only terminal.
+                        if let Some(state) = shell
+                            .workspaces
+                            .iter_mut()
+                            .find(|w| w.workspace.id == workspace)
+                        {
+                            if let (Some(active), Some(terminals)) =
+                                (state.active_session, &mut state.store.terminals)
+                            {
+                                terminals.retain(|terminal| terminal.id != active.0);
+                            }
+                            crate::save_layout(state, cx);
+                        }
+                        Ok(())
+                    }
+                    Ok(WorktreeResult::Adopt(resolution)) => {
+                        shell.adopt_worktree(&resolution, &saved.name, &path, cx)
+                    }
+                    Ok(WorktreeResult::Removed) => Ok(()),
+                    Err(error) => Err(error),
+                };
+                view.update(cx, |v, cx| v.finish_operation(&path, result, removing, cx));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn adopt_worktree(
+        &mut self,
+        resolution: &gitterm_core::task_worktree::AdoptedWorktreeResolution,
+        name: &str,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        use gitterm_core::{task_worktree as rules, tasks::*};
+        let host = cx
+            .try_global::<crate::task_host::GpuiTaskHost>()
+            .map(|h| h.0.clone())
+            .ok_or("The task store is unavailable")?;
+        let task_id = format!("task-{}", &TaskRecord::fresh_id()[..8]);
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let mut anchors = Vec::new();
+        host.update(cx, |host, cx| {
+            let store = host
+                .host_mut()
+                .store_mut()
+                .as_mut()
+                .ok_or("The task store is unavailable")?;
+            if store.tasks().iter().any(|t| {
+                t.worktree.path.as_deref().is_some_and(|p| {
+                    gitterm_core::workspace_config::RepoKey::local(p)
+                        == gitterm_core::workspace_config::RepoKey::local(path)
+                })
+            }) {
+                return Err("Worktree already belongs to a task".into());
+            }
+            rules::persist_adopted_worktree(
+                store,
+                resolution,
+                name.to_owned(),
+                path,
+                task_id.clone(),
+                &timestamp,
+            )
+            .map_err(|e| e.to_string())?;
+            // Existing sessions keep their backend; adoption only gives them ownership.
+            for pane in self.workspaces.iter().flat_map(|w| w.panes.values()) {
+                let inside = pane
+                    .read(cx)
+                    .task_folder(cx)
+                    .is_some_and(|p| p.starts_with(path));
+                if !inside
+                    || pane
+                        .read(cx)
+                        .session
+                        .as_ref()
+                        .is_none_or(|s| s.task_id.is_some())
+                {
+                    continue;
+                }
+                let session_id = TaskRecord::fresh_id();
+                let label = if matches!(
+                    pane.read(cx).content,
+                    crate::pane::PaneContent::PreviewChat(_)
+                ) {
+                    "Agent"
+                } else {
+                    "Terminal"
+                };
+                store
+                    .upsert_session(
+                        &task_id,
+                        TaskSessionRecord {
+                            task_session_id: session_id.clone(),
+                            label: label.into(),
+                            harness: None,
+                            conversation: None,
+                            objective_delivery: ObjectiveDeliveryState::NotDelivered,
+                            launch_identity: None,
+                            created_at: timestamp.clone(),
+                            updated_at: timestamp.clone(),
+                        },
+                        &timestamp,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if let Some(cwd) = pane.read(cx).task_folder(cx) {
+                    anchors.push((
+                        cwd,
+                        pane.read(cx).session.as_ref().unwrap().session_uid.clone(),
+                        session_id.clone(),
+                    ));
+                }
+                pane.update(cx, |pane, cx| {
+                    if let Some(session) = &mut pane.session {
+                        session.task_id = Some(task_id.clone());
+                        session.task_session_id = Some(session_id);
+                    }
+                    cx.notify();
+                });
+            }
+            cx.notify();
+            Ok::<(), String>(())
+        })?;
+        if !anchors.is_empty() {
+            let desktop = cx.global::<crate::work_sidebar::LiveRepoStore>().clone();
+            let root = desktop.0.root().to_path_buf();
+            let work = cx.background_executor().spawn(async move {
+                desktop
+                    .0
+                    .try_edit_workspaces(move |file| {
+                        for ws in &mut file.workspaces {
+                            for tab in &mut ws.tabs {
+                                if tab.task_id.is_some() {
+                                    continue;
+                                }
+                                let matching = anchors.iter().position(|(cwd, uid, _)| {
+                                    tab.session_uid.as_ref() == Some(uid)
+                                        || (tab.session_uid.is_none()
+                                            && (std::path::Path::new(&tab.dir) == cwd
+                                                || tab.repo_dir.as_deref().is_some_and(|dir| {
+                                                    std::path::Path::new(dir) == cwd
+                                                })))
+                                });
+                                if let Some(index) = matching {
+                                    let (_, uid, session_id) = anchors.remove(index);
+                                    tab.session_uid = Some(uid);
+                                    tab.task_id = Some(task_id.clone());
+                                    tab.task_session_id = Some(session_id);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .wait()
+            });
+            cx.spawn(async move |shell, cx| {
+                let result = work.await;
+                _ = shell.update(cx, |shell, cx| match result {
+                    Ok(file) => shell.repo_document_saved(&root, file, cx),
+                    Err(error) => shell.owner.update(cx, |owner, cx| {
+                        owner.error = Some(error);
+                        cx.notify();
+                    }),
+                });
+            })
+            .detach();
+        }
+        Ok(())
+    }
+}
+
+enum WorktreeResult {
+    Open(gitterm_core::workspace_config::WorkspacesFile),
+    Adopt(gitterm_core::task_worktree::AdoptedWorktreeResolution),
+    Removed,
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+    use ::core::prelude::v1::test;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn live_open_uses_the_saved_tab_identity_without_duplicate_restoration(
+        cx: &mut TestAppContext,
+    ) {
+        let (root, shell, cx) = crate::h5_tests::fixture(cx);
+        let main = root.path().join("work");
+        let linked = root.path().join("linked");
+        let git = |args: &[&str]| {
+            let output = gitterm_core::git_status::git_command()
+                .current_dir(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "file.txt"]);
+        git(&[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ]);
+        let desktop =
+            gitterm_core::desktop_store::DesktopStore::open(&root.path().join("iced")).unwrap();
+        cx.update(|_, cx| cx.set_global(crate::work_sidebar::LiveRepoStore(desktop)));
+        let id = cx.read(|cx| shell.read(cx).active_workspace(cx).unwrap());
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                shell.update(cx, |shell, cx| {
+                    shell.git_action(id, &GitAction::OpenWorktree(linked.clone()), window, cx)
+                })
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                cx.run_until_parked();
+                let complete = cx.read(|cx| {
+                    let shell = shell.read(cx);
+                    let state = shell.active(cx);
+                    state.sessions.len() == 2
+                        && state
+                            .panes
+                            .values()
+                            .filter_map(|p| p.read(cx).git.as_ref())
+                            .all(|view| {
+                                !view
+                                    .read(cx)
+                                    .operations
+                                    .get(&linked)
+                                    .is_some_and(|op| op.busy)
+                            })
+                });
+                if complete {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "Live open timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let state = shell.active(cx);
+            let owner = shell.owner.read(cx);
+            let saved = owner.iced_workspace(id).unwrap();
+            assert_eq!(saved.tabs.len(), 1);
+            let imported = crate::data::iced_sessions(saved)[0].id;
+            assert_eq!(state.active_session, Some(imported));
+            assert!(
+                !state
+                    .store
+                    .terminals
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t.id == imported.0),
+                "V6 owns this tab's restore; no second local terminal entry"
+            );
+            assert_eq!(
+                state.panes[&crate::session_pane_id(imported)]
+                    .read(cx)
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .session_uid,
+                saved.tabs[0].session_uid.as_deref().unwrap()
+            );
+            let disk: gitterm_core::workspace_config::WorkspacesFile = serde_json::from_slice(
+                &std::fs::read(root.path().join("iced/workspaces.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(disk.workspaces[0].tabs.len(), 1);
+            assert_eq!(disk.workspaces[0].tabs[0].dir, linked.to_string_lossy());
+        });
+    }
+
+    #[gpui::test]
+    fn force_is_offered_only_for_a_failed_normal_removal(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/fixture/linked");
+        let view = cx.new(|cx| GitView::new(WorkspaceId(1), Rc::new(crate::data::SampleData), cx));
+        view.update(cx, |view, cx| {
+            assert!(view.begin_operation(&path, true, cx).is_err());
+            view.begin_operation(&path, false, cx).unwrap();
+            assert!(view.begin_operation(&path, false, cx).is_err());
+            view.finish_operation(
+                &path,
+                Err("contains modified or untracked files, use --force".into()),
+                true,
+                cx,
+            );
+            let error = view.begin_operation(&path, true, cx).unwrap();
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(gitterm_core::task_worktree::offer_force)
+            );
+            view.finish_operation(&path, Err("not registered".into()), true, cx);
+            assert!(view.begin_operation(&path, true, cx).is_err());
+        });
+    }
+}

@@ -246,6 +246,29 @@ impl WorkspaceOwner {
             .workspaces
             .get(id.0.checked_sub(1)? as usize)
     }
+    /// Refresh the read catalog after the Live desktop owner acknowledges a save.
+    pub(crate) fn apply_desktop_document(
+        &mut self,
+        root: &std::path::Path,
+        file: gitterm_core::workspace_config::WorkspacesFile,
+        cx: &mut Context<Self>,
+    ) {
+        let catalog = crate::workspace_config::IcedCatalog::from_document(root, file);
+        for (local, saved) in self.model.workspaces.iter_mut().zip(&catalog.workspaces) {
+            local.status.repo_name = saved.name.clone();
+        }
+        cx.set_global(crate::work_sidebar::IcedWorkSource {
+            config: root.to_path_buf(),
+            workspaces: catalog.workspaces.clone(),
+            repos: catalog.repos.clone(),
+            owner: cx.entity().downgrade(),
+        });
+        if let Some(store) = self.store.as_mut() {
+            store.iced = Some(catalog);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn iced_catalog(&self) -> Option<&crate::workspace_config::IcedCatalog> {
         self.store.as_ref()?.iced.as_ref()
     }

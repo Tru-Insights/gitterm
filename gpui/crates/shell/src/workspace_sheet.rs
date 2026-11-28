@@ -37,6 +37,8 @@ use crate::theme::{Palette, UI_FONT_SIZE};
 pub enum FolderPickerPurpose {
     /// A machine's "+" in the Repos menu.
     NewWorkspace,
+    /// Add a repo to an existing workspace (the host retains its identity).
+    AddRepo(u64),
     /// "Open a repo…".
     OpenFolder,
     /// This sheet's Add repo…: the folder comes back to the sheet.

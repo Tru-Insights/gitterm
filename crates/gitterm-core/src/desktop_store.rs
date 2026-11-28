@@ -145,6 +145,38 @@ impl DesktopStore {
         })
     }
 
+    /// Validate a candidate before replacing the document. A refusal leaves the
+    /// owner's state and bytes intact; IO failures retain the dirty candidate.
+    pub fn try_edit_workspaces(
+        &self,
+        edit: impl FnOnce(&mut WorkspacesFile) -> Result<(), String> + Send + 'static,
+    ) -> Receipt<WorkspacesFile> {
+        self.submit(move |state, root| {
+            let mut candidate = match &state.workspaces.loaded {
+                LoadState::Valid(file) => file.clone(),
+                LoadState::Missing => WorkspacesFile::default(),
+                LoadState::Refused(error) => return Err(error.clone()),
+            };
+            edit(&mut candidate)?;
+            let unchanged = match &state.workspaces.loaded {
+                LoadState::Valid(previous) => serde_json::to_value(previous)
+                    .and_then(|previous| {
+                        serde_json::to_value(&candidate).map(|next| previous == next)
+                    })
+                    .map_err(|error| format!("compare workspace edit: {error}"))?,
+                _ => false,
+            };
+            if unchanged {
+                save(&mut state.workspaces, &root.join("workspaces.json"))?;
+                return Ok(candidate);
+            }
+            state.workspaces.loaded = LoadState::Valid(candidate.clone());
+            state.workspaces.dirty = true;
+            save(&mut state.workspaces, &root.join("workspaces.json"))?;
+            Ok(candidate)
+        })
+    }
+
     pub fn edit_settings(
         &self,
         edit: impl FnOnce(&mut DesktopSettings) + Send + 'static,

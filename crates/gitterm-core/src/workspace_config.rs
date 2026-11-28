@@ -498,3 +498,336 @@ pub fn default_remote_sessions() -> Vec<RemoteSessionConfig> {
 pub fn default_remote_agents() -> Vec<RemoteAgentConfig> {
     Vec::new()
 }
+
+/// Iced's inline rename: whitespace is trimmed and an empty draft is ignored.
+pub fn rename_workspace(name: &mut String, draft: &str) -> bool {
+    let draft = draft.trim();
+    if draft.is_empty() || name == draft {
+        return false;
+    }
+    *name = draft.to_string();
+    true
+}
+
+/// Iced's run command editor: empty means no command.
+pub fn run_command(draft: &str) -> Option<String> {
+    let draft = draft.trim();
+    (!draft.is_empty()).then(|| draft.to_string())
+}
+
+pub fn check_remove_repo(home: &Path, dir: &Path) -> Result<(), String> {
+    if RepoKey::local(home) == RepoKey::local(dir) {
+        Err("the home repo stays listed".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn add_manually(dir: &Path, added: &mut Vec<PathBuf>, removed: &mut Vec<PathBuf>) {
+    removed.retain(|gone| gone != dir);
+    if !added.iter().any(|known| known == dir) {
+        added.push(dir.to_path_buf());
+    }
+}
+
+/// Records a manual remove of `dir`: it stays out even when its chats
+/// touch it again.
+pub fn remove_manually(dir: &Path, added: &mut Vec<PathBuf>, removed: &mut Vec<PathBuf>) {
+    added.retain(|known| known != dir);
+    if !removed.iter().any(|gone| gone == dir) {
+        removed.push(dir.to_path_buf());
+    }
+}
+
+/// Identity captured by a control, checked against the owner's current document.
+/// Catalog indexes are sorted and exclude closed workspaces; never use them as
+/// file indexes. Ambiguous or stale controls fail without changing the document.
+#[derive(Clone, Debug)]
+pub struct WorkspaceTarget {
+    name: String,
+    dir: String,
+    chats: Vec<String>,
+    location: Option<WorkspaceLocationConfig>,
+    legacy_session: Option<String>,
+}
+impl WorkspaceTarget {
+    pub fn of<C>(workspace: &WorkspaceConfig<C>) -> Self {
+        Self {
+            name: workspace.name.clone(),
+            dir: workspace.dir.clone(),
+            chats: workspace.chats.clone(),
+            location: workspace.location.clone(),
+            legacy_session: workspace
+                .remote_session
+                .as_ref()
+                .map(|s| s.session_name.clone()),
+        }
+    }
+    pub fn index<C>(&self, file: &WorkspacesFile<C>) -> Result<usize, String> {
+        let mut matches = file.workspaces.iter().enumerate().filter(|(_, w)| {
+            w.active
+                && w.name == self.name
+                && w.dir == self.dir
+                && w.chats == self.chats
+                && w.location == self.location
+                && w.remote_session.as_ref().map(|s| s.session_name.as_str())
+                    == self.legacy_session.as_deref()
+        });
+        let index = matches
+            .next()
+            .map(|(i, _)| i)
+            .ok_or("Workspace is no longer open")?;
+        if matches.next().is_some() {
+            return Err("Workspace identity is ambiguous".into());
+        }
+        Ok(index)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum RepoEdit {
+    Rename(String),
+    Add {
+        dir: PathBuf,
+        detected_command: Option<String>,
+    },
+    Remove(Vec<PathBuf>),
+    RunCommand {
+        dir: PathBuf,
+        draft: String,
+    },
+}
+impl<C> WorkspacesFile<C> {
+    /// Apply to a private candidate on DesktopStore's serialized owner thread.
+    pub fn edit_repo(&mut self, target: &WorkspaceTarget, edit: RepoEdit) -> Result<(), String> {
+        let index = target.index(self)?;
+        if let RepoEdit::Rename(draft) = edit {
+            rename_workspace(&mut self.workspaces[index].name, &draft);
+            return Ok(());
+        }
+        let ws = &self.workspaces[index];
+        if ws.is_legacy_remote()
+            || matches!(
+                ws.location,
+                Some(WorkspaceLocationConfig::RemoteAgent { .. })
+            )
+        {
+            return Err("a remote workspace lists only its home".into());
+        }
+        self.normalize_repos();
+        match edit {
+            RepoEdit::Add {
+                dir,
+                detected_command,
+            } => {
+                let dir = dir.to_string_lossy().into_owned();
+                let ws = &mut self.workspaces[index];
+                let key = RepoKey::local(Path::new(&dir));
+                if !ws.repos.iter().any(|d| RepoKey::local(Path::new(d)) == key) {
+                    ws.repos.push(dir.clone());
+                }
+                ws.repos_removed
+                    .retain(|d| RepoKey::local(Path::new(d)) != key);
+                if !ws.repos_added.contains(&dir) {
+                    ws.repos_added.push(dir.clone());
+                }
+                if self.repo(&key).is_none() {
+                    self.repos.push(RepoConfig {
+                        dir,
+                        location: None,
+                        run_command: detected_command,
+                        env: HashMap::new(),
+                        bottom_terminals: Vec::new(),
+                    });
+                }
+            }
+            RepoEdit::Remove(dirs) => {
+                let ws = &mut self.workspaces[index];
+                for dir in &dirs {
+                    check_remove_repo(Path::new(ws.home_dir()), dir)?;
+                }
+                for dir in dirs {
+                    let key = RepoKey::local(&dir);
+                    ws.repos.retain(|d| RepoKey::local(Path::new(d)) != key);
+                    ws.repos_added
+                        .retain(|d| RepoKey::local(Path::new(d)) != key);
+                    let dir = dir.to_string_lossy().into_owned();
+                    if !ws.repos_removed.contains(&dir) {
+                        ws.repos_removed.push(dir);
+                    }
+                }
+                // Iced releases repo settings only after the last workspace unlists it.
+                let retained: Vec<_> = self
+                    .workspaces
+                    .iter()
+                    .flat_map(|w| w.repos.iter().filter_map(|d| w.repo_key(d)))
+                    .collect();
+                self.repos.retain(|r| retained.contains(&r.key()));
+            }
+            RepoEdit::RunCommand { dir, draft } => {
+                let key = RepoKey::local(&dir);
+                if !self.workspaces[index]
+                    .repos
+                    .iter()
+                    .any(|d| RepoKey::local(Path::new(d)) == key)
+                {
+                    return Err("Repo is no longer listed".into());
+                }
+                if self.repo(&key).is_none() {
+                    // Legacy lists can name an extra repo without a settings
+                    // record. Iced's list_repo gives it an empty environment.
+                    self.repos.push(RepoConfig {
+                        dir: dir.to_string_lossy().into_owned(),
+                        location: None,
+                        run_command: None,
+                        env: HashMap::new(),
+                        bottom_terminals: Vec::new(),
+                    });
+                }
+                let repo = self
+                    .repos
+                    .iter_mut()
+                    .find(|r| r.key() == key)
+                    .expect("listed repo settings");
+                repo.run_command = run_command(&draft);
+                // Iced writes the shared command into the legacy home copy too.
+                let command = repo.run_command.clone();
+                for ws in &mut self.workspaces {
+                    if ws.active && ws.repo_key(ws.home_dir()).as_ref() == Some(&key) {
+                        ws.run_command = command.clone();
+                    }
+                }
+            }
+            RepoEdit::Rename(_) => unreachable!(),
+        }
+        // Iced's repos_section writes open registry entries first, then settings
+        // kept only by closed workspaces. A newly attached repo precedes those.
+        let open: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|ws| ws.active)
+            .flat_map(|ws| ws.repos.iter().filter_map(|dir| ws.repo_key(dir)))
+            .collect();
+        self.repos.sort_by_key(|repo| !open.contains(&repo.key()));
+        Ok(())
+    }
+
+    /// Iced OpenWorktree focuses an existing tab by repo OR current directory.
+    pub fn open_worktree_tab(
+        &mut self,
+        target: &WorkspaceTarget,
+        path: &Path,
+    ) -> Result<usize, String> {
+        let index = target.index(self)?;
+        let ws = &mut self.workspaces[index];
+        let key = RepoKey::local(path);
+        let index = ws
+            .tabs
+            .iter()
+            .position(|t| {
+                RepoKey::local(Path::new(&t.dir)) == key
+                    || t.repo_dir
+                        .as_deref()
+                        .is_some_and(|d| RepoKey::local(Path::new(d)) == key)
+            })
+            .unwrap_or_else(|| {
+                ws.tabs.push(WorkspaceTabConfig {
+                    dir: path.to_string_lossy().into_owned(),
+                    repo_dir: Some(path.to_string_lossy().into_owned()),
+                    startup_command: None,
+                    tab_kind: None,
+                    agent_config: None,
+                    chat_session_id: None,
+                    task_id: None,
+                    task_session_id: None,
+                    worker_shutdown_refused: false,
+                    session_uid: Some(uuid::Uuid::new_v4().to_string()),
+                });
+                ws.tabs.len() - 1
+            });
+        ws.tabs[index]
+            .session_uid
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        ws.active_tab = Some(index);
+        Ok(index)
+    }
+}
+
+pub fn detect_run_command(dir: &Path) -> Option<String> {
+    // Detect package manager (used by multiple checks)
+    let detect_pm = |dir: &Path| -> &str {
+        if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
+            "bun"
+        } else if dir.join("yarn.lock").exists() {
+            "yarn"
+        } else if dir.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else {
+            "npm"
+        }
+    };
+
+    // 1. Tauri app (has src-tauri/ directory with Cargo.toml)
+    if dir.join("src-tauri").join("Cargo.toml").exists() {
+        // Check if package.json has a "tauri" script (frontend-driven setup)
+        if dir.join("package.json").exists() {
+            let pm = detect_pm(dir);
+            if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                        if scripts.contains_key("tauri") {
+                            return Some(format!("{} run tauri", pm));
+                        }
+                        if scripts.contains_key("tauri:dev") {
+                            return Some(format!("{} run tauri:dev", pm));
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: run cargo tauri dev from inside src-tauri
+        return Some("cd src-tauri && cargo tauri dev".to_string());
+    }
+
+    // 2. package.json (check before bare Cargo.toml for hybrid projects)
+    if dir.join("package.json").exists() {
+        let pm = detect_pm(dir);
+
+        if let Ok(contents) = std::fs::read_to_string(dir.join("package.json")) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
+                    // Priority: tauri dev > dev > start
+                    for script_name in &["tauri dev", "dev", "start"] {
+                        if scripts.contains_key(*script_name) {
+                            if *script_name == "start" && pm == "npm" {
+                                return Some("npm start".to_string());
+                            }
+                            return Some(format!("{} run {}", pm, script_name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Cargo.toml (plain Rust project)
+    if dir.join("Cargo.toml").exists() {
+        return Some("cargo run".to_string());
+    }
+
+    // 4. docker-compose
+    if dir.join("docker-compose.yml").exists() || dir.join("docker-compose.yaml").exists() {
+        return Some("docker compose up".to_string());
+    }
+
+    // 5. Go project
+    if dir.join("go.mod").exists() && (dir.join("main.go").exists() || dir.join("cmd").is_dir()) {
+        return Some("go run .".to_string());
+    }
+
+    None
+}
+
+#[cfg(all(test, feature = "runtime"))]
+#[path = "workspace_config/action_tests.rs"]
+mod repo_action_tests;
