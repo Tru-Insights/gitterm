@@ -328,9 +328,7 @@ fn launch_origin_mcp_vs_ui_preserved(cx: &mut TestAppContext) {
     let started = launches
         .runs
         .owner
-        .update(cx, |owner, cx| {
-            owner.launch_from_ui(&user, Some("Codex"), cx)
-        })
+        .update(cx, |owner, cx| owner.launch_from_ui(&user, Some(1), cx))
         .unwrap();
     assert!(started["session_id"].is_string(), "{started}");
     wait_until(cx, |_| launches.agent.started(1));

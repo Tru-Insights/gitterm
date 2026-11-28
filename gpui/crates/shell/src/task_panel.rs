@@ -862,7 +862,7 @@ pub(crate) struct TaskPanel {
     pub modal: Option<Modal>,
     /// The latest refusal, where Iced shows `task_ui_error`.
     pub notice: Option<String>,
-    busy: bool,
+    in_flight: std::collections::HashSet<(String, &'static str)>,
 }
 impl EventEmitter<TaskPanelOutcome> for TaskPanel {}
 
@@ -872,6 +872,25 @@ fn refuse(_services: &ServiceContext, action: &TaskMutationAction) -> String {
 }
 
 impl TaskPanel {
+    pub(crate) fn task_stopping(&self, task_id: &str) -> bool {
+        self.in_flight.contains(&(task_id.to_owned(), "stop"))
+    }
+
+    fn modal_operation(&self) -> Option<(String, &'static str)> {
+        match &self.modal {
+            Some(Modal::Create(form)) => Some((form.task_id.clone(), "create")),
+            Some(Modal::Publish { task_id, .. }) => Some((task_id.clone(), "publish")),
+            Some(Modal::Delete { task_id, .. }) => Some((task_id.clone(), "delete")),
+            Some(Modal::StopAndClose { target, .. }) => Some((target.session_uid.clone(), "close")),
+            _ => None,
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.modal_operation()
+            .is_some_and(|key| self.in_flight.contains(&key))
+    }
+
     pub(crate) fn modal_open(&self) -> bool {
         self.modal.is_some()
     }
@@ -882,7 +901,7 @@ impl TaskPanel {
     }
 
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if !self.busy {
+        if !self.busy() {
             self.modal = None;
         }
         cx.notify();
@@ -1419,12 +1438,18 @@ impl TaskPanel {
     }
 
     fn write_live(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
         let Some(owner) = cx.try_global::<GpuiTaskHost>().map(|h| h.0.clone()) else {
             return;
         };
+        let launch_task = match &write {
+            Write::Launch { task_id, .. }
+            | Write::Resume(task_id)
+            | Write::ResumeConversation { task_id, .. } => Some(task_id),
+            _ => None,
+        };
+        if launch_task.is_some_and(|id| self.task_stopping(id)) {
+            return;
+        }
         if let Write::Resume(task_id) = &write
             && owner
                 .read(cx)
@@ -1438,17 +1463,7 @@ impl TaskPanel {
             return;
         }
         if let Write::Launch { task_id, preset } = &write {
-            let preset_name = match preset {
-                Some(index) => match inputs.presets.get(*index) {
-                    Some(p) => Some(p.name.as_str()),
-                    None => {
-                        self.show_notice("The selected agent preset is unavailable".into(), cx);
-                        return;
-                    }
-                },
-                None => None,
-            };
-            match owner.update(cx, |o, cx| o.launch_from_ui(task_id, preset_name, cx)) {
+            match owner.update(cx, |o, cx| o.launch_from_ui(task_id, *preset, cx)) {
                 Ok(_) => {
                     self.modal = None;
                     cx.emit(TaskPanelOutcome::Select(task_id.clone()));
@@ -1557,9 +1572,21 @@ impl TaskPanel {
             }
             _ => {}
         }
-        let mut jobs = Vec::new();
-        let mut operation_error = None;
         for mutation in mutations {
+            let key = match &mutation {
+                TaskMutation::Close { task_id } => (task_id.clone(), "archive"),
+                TaskMutation::Stop { task_id } => (task_id.clone(), "stop"),
+                TaskMutation::CancelQueue { task_id } => (task_id.clone(), "cancel"),
+                TaskMutation::Publish { task_id, .. } => (task_id.clone(), "publish"),
+                TaskMutation::DeleteWorktree { task_id, .. } => (task_id.clone(), "delete"),
+                TaskMutation::ResumeConversation { task_id, .. } => (task_id.clone(), "resume"),
+                TaskMutation::CloseSession { target, .. } => (target.session_uid.clone(), "close"),
+                _ => unreachable!("panel mutation"),
+            };
+            if self.in_flight.contains(&key) {
+                continue;
+            }
+
             let archive_id = match &mutation {
                 TaskMutation::Close { task_id } => Some(task_id.clone()),
                 _ => None,
@@ -1604,7 +1631,6 @@ impl TaskPanel {
                     } else {
                         error
                     };
-                    operation_error = Some(error.clone());
                     self.show_notice(error, cx);
                     continue;
                 }
@@ -1629,39 +1655,28 @@ impl TaskPanel {
             };
             match owner.update(cx, |o, cx| o.execute_panel_action(action, cx)) {
                 Ok(job) => {
-                    jobs.push(job);
+                    self.in_flight.insert(key.clone());
                     if archived_selected {
                         cx.emit(TaskPanelOutcome::Back);
                     }
-                }
-                Err(error) => {
-                    operation_error = Some(error.clone());
-                    self.show_notice(error, cx);
-                }
-            }
-        }
-        if !jobs.is_empty() {
-            self.busy = true;
-            cx.notify();
-            cx.spawn(async move |panel, cx| {
-                let mut error = operation_error;
-                for job in jobs {
-                    if let Err(e) = job.await {
-                        error = Some(e);
-                    }
-                }
-                _ = panel.update(cx, |panel, cx| {
-                    panel.busy = false;
-                    if let Some(e) = error {
-                        panel.show_notice(e, cx);
-                    } else {
-                        panel.modal = None;
-                        panel.notice = None;
-                    }
                     cx.notify();
-                });
-            })
-            .detach();
+                    cx.spawn(async move |panel, cx| {
+                        let result = job.await;
+                        _ = panel.update(cx, |panel, cx| {
+                            panel.in_flight.remove(&key);
+                            if let Err(error) = result {
+                                panel.show_notice(error, cx);
+                            } else if panel.modal_operation().as_ref() == Some(&key) {
+                                panel.modal = None;
+                                panel.notice = None;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(error) => self.show_notice(error, cx),
+            }
         }
     }
 
@@ -1709,25 +1724,29 @@ impl TaskPanel {
             return;
         }
         if !owner.read(cx).host().services().is_preview() {
-            if self.busy {
-                return;
-            }
             let task_id = match &self.modal {
                 Some(Modal::Create(form)) => form.task_id.clone(),
                 _ => return,
             };
+            let key = (task_id.clone(), "create");
+            if self.in_flight.contains(&key) {
+                return;
+            }
             match owner.update(cx, |owner, cx| owner.create_from_panel(input, task_id, cx)) {
                 Ok(reply) => {
-                    self.busy = true;
+                    self.in_flight.insert(key.clone());
                     cx.notify();
                     cx.spawn(async move |panel, cx| {
                         let result = reply.await.unwrap_or_else(|_| {
                             Err("The task host closed before task creation completed".into())
                         });
                         _ = panel.update(cx, |panel, cx| {
-                            panel.busy = false;
+                            panel.in_flight.remove(&key);
                             match result {
-                                Ok(_) => panel.modal = None,
+                                Ok(_) if panel.modal_operation().as_ref() == Some(&key) => {
+                                    panel.modal = None
+                                }
+                                Ok(_) => {}
                                 Err(error) => panel.show_notice(error, cx),
                             }
                             cx.notify();
@@ -2432,13 +2451,13 @@ pub(crate) fn modal_view(
     let dismiss = |id: &'static str, label: &'static str| {
         let panel = panel.clone();
         ghost(id, label)
-            .disabled(state.busy)
+            .disabled(state.busy())
             .on_click(move |_, _, cx| panel.update(cx, |panel, cx| panel.dismiss(cx)))
     };
     let confirm = |id: &'static str, label: String, write: Write| {
         let (panel, inputs) = (panel.clone(), inputs.clone());
         ghost(id, label)
-            .disabled(state.busy)
+            .disabled(state.busy())
             .text_color(rgb(p.red))
             .on_click(move |_, _, cx| {
                 panel.update(cx, |panel, cx| panel.write(write.clone(), &inputs, cx))
@@ -2578,7 +2597,7 @@ pub(crate) fn modal_view(
                     .children(label.map(|label| {
                         confirm(
                             "task-delete-confirm",
-                            if state.busy { "Deleting…" } else { label }.into(),
+                            if state.busy() { "Deleting…" } else { label }.into(),
                             Write::DeleteConfirm,
                         )
                     })),
@@ -2642,7 +2661,7 @@ fn create_form(
     p: &Palette,
     cx: &App,
 ) -> Vec<gpui::AnyElement> {
-    let busy = panel.read(cx).busy;
+    let busy = panel.read(cx).busy();
     let label = |text: &'static str| div().text_size(px(10.)).text_color(muted(p)).child(text);
     let field = |text: &'static str, selector: &'static str, input: &Entity<InputState>| {
         div()
@@ -2892,14 +2911,14 @@ impl crate::Shell {
             return;
         }
         if stop.targets.is_empty() {
-            if let Some(host) = cx.try_global::<GpuiTaskHost>().map(|h| h.0.clone())
-                && let Err(e) = host.update(cx, |o, cx| o.panel_stop_completed(&stop.task_id, cx))
-            {
-                self.owner.update(cx, |o, cx| {
-                    o.error = Some(e);
-                    cx.notify();
+            let result = cx
+                .try_global::<GpuiTaskHost>()
+                .map(|h| h.0.clone())
+                .ok_or_else(|| "The task host closed before Stop completed".to_owned())
+                .and_then(|host| {
+                    host.update(cx, |o, cx| o.panel_stop_completed(&stop.task_id, cx))
                 });
-            }
+            stop.complete(result);
             return;
         }
         let target = stop.targets.remove(0);
@@ -2946,6 +2965,8 @@ impl crate::Shell {
                     .is_none()
                 {
                     shell.stop_panel_task(stop, window, cx);
+                } else {
+                    stop.complete(Err("The task session could not be closed".into()));
                 }
             });
         })

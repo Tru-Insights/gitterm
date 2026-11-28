@@ -40,6 +40,157 @@ fn panel_write(
 }
 
 #[gpui::test]
+fn task_panel_live_stop_waits_and_preserves_new_session(cx: &mut TestAppContext) {
+    if child("task_panel_live_stop_waits_and_preserves_new_session") {
+        return;
+    }
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, repo_fx) = fixture();
+    worker_settings(&fixture);
+    golive10_workspace(
+        &fixture,
+        &repo_fx.repo,
+        json!([{"dir":repo_fx.repo,"session_uid":"placeholder-home"}]),
+        json!([]),
+    );
+    let (host, sender) = start(&fixture, cx);
+    let created = create(cx, &sender, &repo_fx.repo);
+    let id = created["task_id"].as_str().unwrap().to_owned();
+    let queued = dispatch(cx, &sender, TaskControlOperation::Create(req(json!({
+        "title":"Placeholder queued", "objective":"Placeholder objective", "repository_path":repo_fx.repo
+    })))).unwrap()["task_id"].as_str().unwrap().to_owned();
+    let (shell, vcx) = golive10_shell(&fixture, &host, cx);
+    fake.prepare_recorder(&host, vcx);
+    let panel = shell.update_in(vcx, |s, w, cx| s.ensure_task_panel(w, cx));
+    let launch = PanelWrite::Launch {
+        task_id: id.clone(),
+        preset: Some(1),
+    };
+    panel_write(&panel, launch.clone(), &panel_inputs(&repo_fx.repo), vcx);
+    wait_until(vcx, |_| fake.file("ready", 1).exists());
+    wait_until(vcx, |cx| {
+        shell.read_with(cx, |s, cx| s.task_inputs(cx).open_session(&id).is_some())
+    });
+    let inputs = shell.read_with(vcx, |s, cx| s.task_inputs(cx));
+    let old = panel_record(&host, &id, vcx).sessions[0]
+        .task_session_id
+        .clone();
+    shell.update(vcx, |s, cx| {
+        s.owner.update(cx, |o, _| o.workspace_save_pending = true)
+    });
+    panel_write(&panel, PanelWrite::Stop(id.clone()), &inputs, vcx);
+    panel_write(&panel, launch.clone(), &inputs, vcx);
+    assert_eq!(
+        panel_record(&host, &id, vcx).sessions.len(),
+        1,
+        "Stop must remain pending through workspace persistence"
+    );
+    // Another ingress can start a session despite the panel's pending guard.
+    host.update(vcx, |h, cx| h.launch_from_ui(&id, Some(1), cx))
+        .unwrap();
+    wait_until(vcx, |_| fake.file("ready", 2).exists());
+    let new = panel_record(&host, &id, vcx).sessions[1]
+        .task_session_id
+        .clone();
+    host.update(vcx, |h, _| {
+        h.host_mut()
+            .store_mut()
+            .as_mut()
+            .unwrap()
+            .record_lifecycle_signal(&queued, TaskLifecycle::Queued, None, "2026-11-20T12:00:00Z")
+            .unwrap();
+        h.host_mut()
+            .launch_queue_mut()
+            .push(gitterm_core::task_host::QueuedTaskLaunch {
+                task_id: queued.clone(),
+                preset_idx: Some(1),
+                origin: TaskLaunchOrigin::User,
+                user_model_choice: false,
+            });
+    });
+    shell.update(vcx, |s, cx| {
+        s.owner.update(cx, |o, _| o.workspace_save_pending = false)
+    });
+    vcx.executor().advance_clock(Duration::from_millis(20));
+    wait_until(vcx, |cx| {
+        cx.executor().advance_clock(Duration::from_millis(20));
+        host.read_with(cx, |h, _| h.launched_live(&old).is_none())
+    });
+    assert_eq!(
+        host.read_with(vcx, |h, _| h.launched_live(&new)),
+        Some(true)
+    );
+    wait_until(vcx, |cx| {
+        cx.executor().advance_clock(Duration::from_millis(20));
+        !panel.read_with(cx, |p, _| p.task_stopping(&id))
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        panel_record(&host, &id, vcx).lifecycle,
+        TaskLifecycle::Running
+    );
+    assert_eq!(
+        panel_record(&host, &queued, vcx).lifecycle,
+        TaskLifecycle::Queued,
+        "A superseded Stop must not promote the queue"
+    );
+    assert!(host.read_with(vcx, |h, _| {
+        h.host().launch_queue().iter().any(|q| q.task_id == queued)
+    }));
+    // Once the closure acknowledgement arrives the panel accepts Continue again.
+    panel_write(&panel, launch, &inputs, vcx);
+    assert_eq!(panel_record(&host, &id, vcx).sessions.len(), 3);
+    host.update(vcx, |h, cx| h.quit(cx));
+}
+
+#[gpui::test]
+fn task_panel_live_launch_keeps_duplicate_preset_index(cx: &mut TestAppContext) {
+    if child("task_panel_live_launch_keeps_duplicate_preset_index") {
+        return;
+    }
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, repo_fx) = fixture();
+    std::fs::write(
+        fixture.iced.join("settings.json"),
+        serde_json::to_vec(&json!({
+            "agent_presets": [
+                {"name":"Duplicate", "command":"claude --model placeholder-first"},
+                {"name":"duplicate", "command":"codex -m placeholder-second"}
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (host, sender) = start(&fixture, cx);
+    let created = create(cx, &sender, &repo_fx.repo);
+    let id = created["task_id"].as_str().unwrap();
+    fake.prepare_recorder(&host, cx);
+    let panel = panel_new(&host, cx);
+    let mut inputs = panel_inputs(&repo_fx.repo);
+    inputs.presets = req(json!([
+        {"name":"Duplicate", "command":"claude --model placeholder-first"},
+        {"name":"duplicate", "command":"codex -m placeholder-second"}
+    ]));
+    panel_write(
+        &panel,
+        PanelWrite::Launch {
+            task_id: id.into(),
+            preset: Some(1),
+        },
+        &inputs,
+        cx,
+    );
+    wait_until(cx, |_| fake.file("ready", 1).exists());
+    let args = fake.text("args", 1);
+    assert!(args.contains("placeholder-second"), "{args}");
+    assert!(!args.contains("placeholder-first"), "{args}");
+    assert_eq!(panel_record(&host, id, cx).sessions[0].label, "duplicate");
+    host.update(cx, |h, cx| h.quit(cx));
+}
+
+#[gpui::test]
 fn task_panel_live_form_uses_form_authority_and_prepares_worktree(cx: &mut TestAppContext) {
     if child("task_panel_live_form_uses_form_authority_and_prepares_worktree") {
         return;
@@ -362,8 +513,8 @@ fn task_panel_live_archives_every_workspace_match(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn task_panel_live_confirmed_publish_uses_shared_git_and_gh(cx: &mut TestAppContext) {
-    if child("task_panel_live_confirmed_publish_uses_shared_git_and_gh") {
+fn task_panel_live_publish_allows_stop_and_cancel(cx: &mut TestAppContext) {
+    if child("task_panel_live_publish_allows_stop_and_cancel") {
         return;
     }
     cx.background_executor.allow_parking();
@@ -395,6 +546,8 @@ fn task_panel_live_confirmed_publish_uses_shared_git_and_gh(cx: &mut TestAppCont
     );
     let trace = repo_fx.root.join("gh-trace");
     let marker = repo_fx.root.join("pr-created");
+    let started = repo_fx.root.join("publication-started");
+    let release = repo_fx.root.join("publication-release");
     let q = gitterm_core::workers::shell_word;
     let script = format!(
         r#"#!/bin/sh
@@ -405,11 +558,13 @@ case "$1 $2" in
  'auth token') echo placeholder-token;;
  'api '*) echo '{{"permissions":{{"push":true}}}}';;
  'pr create') touch {marker};;
- 'pr list') if [ -f {marker} ]; then echo '[{{"url":"https://github.com/owner/repo/pull/1","number":1,"headRefOid":"placeholder","isDraft":true}}]'; else echo '[]'; fi;;
+ 'pr list') touch {started}; n=0; while [ ! -f {release} ]; do n=$((n + 1)); [ $n -lt 1000 ] || exit 1; /bin/sleep 0.01; done; if [ -f {marker} ]; then echo '[{{"url":"https://github.com/owner/repo/pull/1","number":1,"headRefOid":"placeholder","isDraft":true}}]'; else echo '[]'; fi;;
 esac
 "#,
         trace = q(trace.to_str().unwrap()),
-        marker = q(marker.to_str().unwrap())
+        marker = q(marker.to_str().unwrap()),
+        started = q(started.to_str().unwrap()),
+        release = q(release.to_str().unwrap())
     );
     let gh = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/bin/gh");
     std::fs::write(&gh, script).unwrap();
@@ -455,12 +610,47 @@ esac
         task.issue = None;
         store.replace(task).unwrap();
     });
+    host.update(cx, |h, _| h.pause_live_worker_tick());
     let panel = panel_new(&host, cx);
+    // Acknowledge the shell boundary here; F1 exercises real pane closures.
+    let _stop_subscription = cx.update(|cx| {
+        cx.subscribe(&host, |host, stop: &crate::task_host::StopTask, cx| {
+            let result = host.update(cx, |h, cx| h.panel_stop_completed(&stop.task_id, cx));
+            stop.complete(result);
+        })
+    });
     let inputs = panel_inputs(&repo_fx.repo);
     for action in [
         gitterm_core::task_commands::TaskPublish::PushBranch,
         gitterm_core::task_commands::TaskPublish::OpenDraftPr,
     ] {
+        let stopping = dispatch(cx, &sender, TaskControlOperation::Create(req(json!({
+            "title":format!("Placeholder stopping {action:?}"), "objective":"Placeholder objective", "repository_path":repo_fx.repo
+        })))).unwrap()["task_id"].as_str().unwrap().to_owned();
+        let queued = dispatch(cx, &sender, TaskControlOperation::Create(req(json!({
+            "title":format!("Placeholder queued {action:?}"), "objective":"Placeholder objective", "repository_path":repo_fx.repo
+        })))).unwrap()["task_id"].as_str().unwrap().to_owned();
+        host.update(cx, |h, _| {
+            h.host_mut()
+                .store_mut()
+                .as_mut()
+                .unwrap()
+                .record_lifecycle_signal(
+                    &queued,
+                    TaskLifecycle::Queued,
+                    None,
+                    "2026-11-20T12:00:00Z",
+                )
+                .unwrap();
+            h.host_mut()
+                .launch_queue_mut()
+                .push(gitterm_core::task_host::QueuedTaskLaunch {
+                    task_id: queued.clone(),
+                    preset_idx: Some(1),
+                    origin: TaskLaunchOrigin::User,
+                    user_model_choice: false,
+                });
+        });
         panel_write(
             &panel,
             PanelWrite::Publish {
@@ -481,7 +671,36 @@ esac
                     .contains("pr create")
         );
         panel_write(&panel, PanelWrite::PublishConfirm, &inputs, cx);
-        wait_until(cx, |cx| !panel.read_with(cx, |p, _| p.modal_open()));
+        wait_until(cx, |_| started.exists());
+        let open = &inputs;
+        panel_write(&panel, PanelWrite::CancelQueue(queued.clone()), open, cx);
+        assert_eq!(
+            panel_record(&host, &queued, cx).lifecycle,
+            TaskLifecycle::Ready,
+            "Cancel queue must run while {action:?} is pending"
+        );
+        panel_write(&panel, PanelWrite::Stop(stopping.clone()), open, cx);
+        wait_until(cx, |cx| {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            panel_record(&host, &stopping, cx).lifecycle == TaskLifecycle::Stopped
+        });
+        assert!(
+            panel.read_with(cx, |p, _| matches!(
+                &p.modal, Some(PanelModal::Publish { task_id, .. }) if task_id == id
+            )),
+            "Other tasks' completions must preserve the pending publication modal"
+        );
+        assert!(host.read_with(cx, |h, cx| {
+            h.panel_facts(cx).publish_busy.contains(&id.to_owned())
+        }));
+        assert!(!release.exists());
+        std::fs::write(&release, "placeholder release").unwrap();
+
+        wait_until(cx, |cx| {
+            host.read_with(cx, |h, cx| h.panel_facts(cx).publish_busy.is_empty())
+        });
+        std::fs::remove_file(&started).unwrap();
+        std::fs::remove_file(&release).unwrap();
         assert!(
             panel.read_with(cx, |p, _| p.notice.is_none()),
             "{:?}",

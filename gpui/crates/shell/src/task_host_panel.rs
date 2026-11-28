@@ -3,10 +3,20 @@
 use super::*;
 use gitterm_core::task_commands::TaskPublish;
 
+type StopCompletion = tokio::sync::oneshot::Sender<Result<(), String>>;
+
 #[derive(Clone, Debug)]
 pub(crate) struct StopTask {
     pub task_id: String,
     pub targets: Vec<session::Target>,
+    completion: Arc<std::sync::Mutex<Option<StopCompletion>>>,
+}
+impl StopTask {
+    pub(crate) fn complete(&self, result: Result<(), String>) {
+        if let Some(send) = self.completion.lock().unwrap().take() {
+            _ = send.send(result);
+        }
+    }
 }
 impl gpui::EventEmitter<StopTask> for TaskHostOwner {}
 
@@ -132,16 +142,13 @@ impl TaskHostOwner {
                     .into_iter()
                     .filter(|target| !self.stop_panel_unadopted(target, cx))
                     .collect();
-                cx.emit(StopTask { task_id, targets });
+                return Ok(self.stop_panel_tabs(task_id, targets, cx));
             }
             TaskMutationAction::Session(session::Effect::Close(target)) => {
                 if self.stop_panel_unadopted(&target, cx) {
                     return Ok(Task::ready(Ok(())));
                 }
-                cx.emit(StopTask {
-                    task_id: String::new(),
-                    targets: vec![target],
-                });
+                return Ok(self.stop_panel_tabs(String::new(), vec![target], cx));
             }
             TaskMutationAction::ClearWorktree { task_id } => {
                 self.panel_worktree_removed(&task_id)?
@@ -318,21 +325,41 @@ impl TaskHostOwner {
             .map_err(|e| e.to_string())
     }
 
+    fn stop_panel_tabs(
+        &mut self,
+        task_id: String,
+        targets: Vec<session::Target>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        cx.emit(StopTask {
+            task_id,
+            targets,
+            completion: Arc::new(std::sync::Mutex::new(Some(send))),
+        });
+        cx.spawn(async move |_, _| {
+            receive.await.unwrap_or_else(|_| {
+                Err("The shell closed before the task's tabs could be stopped".into())
+            })
+        })
+    }
+
     pub(crate) fn panel_stop_completed(
         &mut self,
         task_id: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if !task_id.is_empty() {
+        if !task_id.is_empty()
+            && let Some((target, detail)) =
+                self.task_session_outcome(task_id, Some((TaskLifecycle::Stopped, None)), cx)
+        {
+            // A new session may have started while shell persistence was pending.
             self.writable_store()?
-                .record_lifecycle_signal(
-                    task_id,
-                    TaskLifecycle::Stopped,
-                    None,
-                    &chrono::Utc::now().to_rfc3339(),
-                )
+                .record_lifecycle_signal(task_id, target, detail, &chrono::Utc::now().to_rfc3339())
                 .map_err(|e| e.to_string())?;
-            self.promote_queued_tasks(cx);
+            if target == TaskLifecycle::Stopped {
+                self.promote_queued_tasks(cx);
+            }
             cx.notify();
         }
         Ok(())
