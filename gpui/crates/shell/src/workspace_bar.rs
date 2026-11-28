@@ -696,6 +696,8 @@ pub struct Machine {
 pub enum BrowserAction {
     Open,
     Focus,
+    Disconnect,
+    Evidence,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Menu {
@@ -798,7 +800,7 @@ impl Input {
         match self.browser.action {
             Some(BrowserAction::Open) => entries.push("Open browser"),
             Some(BrowserAction::Focus) => entries.extend(["Focus browser", "Disconnect browser"]),
-            None => {}
+            _ => {}
         }
         if self.browser.has_evidence {
             entries.push("Browser evidence");
@@ -1426,6 +1428,7 @@ pub fn render(
             .on_click(move |_, window, cx| emit(Outcome::Browser(action), window, cx));
     }
     let more_input = input.clone();
+    let more_emit = emit.clone();
     let more = Button::new("pstrip-more")
         .ghost()
         .label("⋯")
@@ -1465,6 +1468,7 @@ pub fn render(
                         .font_family(crate::theme::LABEL_FONT)
                         .text_size(px(11.));
                     for (index, label) in more_input.more_entries().into_iter().enumerate() {
+                        let emit = more_emit.clone();
                         let weak = cx.entity().downgrade();
                         menu = menu.child(
                             control(
@@ -1486,12 +1490,14 @@ pub fn render(
                                             cx,
                                         );
                                     } else {
-                                        window.dispatch_action(
-                                            Box::new(crate::app_menus::PreviewUnavailable {
-                                                label: label.into(),
-                                            }),
-                                            cx,
-                                        );
+                                        let action = match label {
+                                            "Open browser" => BrowserAction::Open,
+                                            "Focus browser" => BrowserAction::Focus,
+                                            "Disconnect browser" => BrowserAction::Disconnect,
+                                            "Browser evidence" => BrowserAction::Evidence,
+                                            _ => return,
+                                        };
+                                        emit(Outcome::Browser(action), window, cx);
                                     }
                                 }),
                             )
@@ -1820,7 +1826,7 @@ pub(crate) mod tests {
         }
     }
     #[gpui::test]
-    fn browser_more_entries_only_emit_preview_notices(cx: &mut TestAppContext) {
+    fn browser_more_entries_emit_host_actions(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let mut input = input();
@@ -1849,13 +1855,14 @@ pub(crate) mod tests {
             click(cx, selector);
         }
         assert_eq!(
-            *notices.borrow(),
-            ["Focus browser", "Disconnect browser", "Browser evidence"]
+            *events.borrow(),
+            [
+                Outcome::Browser(BrowserAction::Focus),
+                Outcome::Browser(BrowserAction::Disconnect),
+                Outcome::Browser(BrowserAction::Evidence)
+            ]
         );
-        assert!(
-            events.borrow().is_empty(),
-            "preview entries cannot emit an owner effect"
-        );
+        assert!(notices.borrow().is_empty());
     }
 
     #[gpui::test]

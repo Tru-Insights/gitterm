@@ -710,6 +710,31 @@ impl TaskHostOwner {
         })
     }
 
+    /// The chrome uses exactly the MCP host's context, engine and runtime.
+    pub(crate) fn browser_host(&self) -> Option<crate::browser::Host> {
+        let servers = self.servers.as_ref()?;
+        if servers
+            .jobs
+            .iter()
+            .any(tokio::task::JoinHandle::is_finished)
+        {
+            return None;
+        }
+        Some(crate::browser::Host {
+            admission: servers.browser.ui_admission(),
+            browser: servers.browser.browser(),
+            engine: servers.browser.engine(),
+            runtime: servers.runtime.handle().clone(),
+            services: Arc::new(self.host.services().clone()),
+        })
+    }
+
+    pub(crate) fn browser_environment(&self, caller: &str) -> Vec<(String, String)> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            servers.browser.terminal_environment(Some(caller)).into()
+        })
+    }
+
     pub(crate) fn host(&self) -> &TaskHost {
         &self.host
     }
@@ -2093,7 +2118,6 @@ mod live_tests {
             assert!(owner._deliver.is_none());
             assert!(owner.fixtures.is_empty());
             for effect in [
-                gitterm_core::preview::service::RunnerEffect::HtmlPreview,
                 gitterm_core::preview::service::RunnerEffect::RestoreSession,
                 gitterm_core::preview::service::RunnerEffect::AutomaticDelivery,
             ] {

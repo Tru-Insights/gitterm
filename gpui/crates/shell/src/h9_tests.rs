@@ -483,6 +483,10 @@ fn modal_allowances_are_iceds_menu_bar_and_own_keys() {
 
 fn open_modal(shell: &Entity<Shell>, modal: Modal, cx: &mut VisualTestContext) {
     cx.update(|window, cx| match modal {
+        Modal::BrowserEvidence => shell.update(cx, |s, cx| {
+            s.browser.evidence_open = true;
+            cx.notify();
+        }),
         Modal::TaskSwitcher => shell.update(cx, |s, cx| s.open_task_switcher(window, cx)),
         Modal::Usage => shell.update(cx, |s, cx| s.toggle_usage(window, cx)),
         Modal::Dialog => dialogs::shortcuts(window, cx),

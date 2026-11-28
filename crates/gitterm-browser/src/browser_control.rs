@@ -2648,6 +2648,11 @@ impl BrowserControlService {
         controller.registry.mark_active(&key);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn own_test_child(&self, child: Child) {
+        self.controller.lock().await.child = Some(child);
+    }
+
     /// Test seam: treat a `test_support::FakeDevTools` as the running
     /// browser.
     #[cfg(test)]
@@ -2666,6 +2671,8 @@ pub(crate) mod test_support {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    type OnClose = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
     pub(crate) struct FakeDevTools {
         pub port: u16,
         /// Page target ids Chrome would list; closing one removes it.
@@ -2673,6 +2680,7 @@ pub(crate) mod test_support {
         /// Every CDP method received, with its `targetId` when it has one.
         pub calls: Arc<std::sync::Mutex<Vec<String>>>,
         pub created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        pub on_close: OnClose,
         server: JoinHandle<()>,
     }
 
@@ -2699,6 +2707,8 @@ pub(crate) mod test_support {
                 Arc::clone(&calls),
                 Arc::clone(&created_target_params),
             );
+            let on_close: OnClose = Default::default();
+            let server_close = on_close.clone();
             let server = tokio::spawn(async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
@@ -2709,7 +2719,14 @@ pub(crate) mod test_support {
                         Arc::clone(&server_calls),
                         Arc::clone(&server_created_target_params),
                     );
-                    tokio::spawn(serve(socket, port, pages, calls, created_target_params));
+                    tokio::spawn(serve(
+                        socket,
+                        port,
+                        pages,
+                        calls,
+                        created_target_params,
+                        server_close.clone(),
+                    ));
                 }
             });
             Self {
@@ -2717,6 +2734,7 @@ pub(crate) mod test_support {
                 pages,
                 calls,
                 created_target_params,
+                on_close,
                 server,
             }
         }
@@ -2728,6 +2746,7 @@ pub(crate) mod test_support {
         pages: Arc<std::sync::Mutex<Vec<String>>>,
         calls: Arc<std::sync::Mutex<Vec<String>>>,
         created_target_params: Arc<std::sync::Mutex<Vec<Value>>>,
+        on_close: OnClose,
     ) {
         let mut head = [0_u8; 16];
         let Ok(read) = socket.peek(&mut head).await else {
@@ -2779,14 +2798,25 @@ pub(crate) mod test_support {
                         .lock()
                         .unwrap()
                         .push(request["params"].clone());
-                    pages.lock().unwrap().push("created-page".to_string());
-                    json!({ "targetId": "created-page" })
+                    let count = created_target_params.lock().unwrap().len();
+                    let target = if count == 1 {
+                        "created-page".to_string()
+                    } else {
+                        format!("created-page-{count}")
+                    };
+                    pages.lock().unwrap().push(target.clone());
+                    json!({ "targetId": target })
                 }
                 _ => json!({}),
             };
             let reply = json!({ "id": request["id"], "result": result }).to_string();
             if websocket.send(Message::Text(reply)).await.is_err() {
                 return;
+            }
+            if method == "Browser.close" {
+                if let Some(close) = on_close.lock().unwrap().take() {
+                    close();
+                }
             }
         }
     }

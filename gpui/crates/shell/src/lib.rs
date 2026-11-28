@@ -6,6 +6,7 @@ mod agent_sidebar;
 mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
+mod browser;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -204,6 +205,7 @@ pub struct Shell {
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
     bar_menu: Option<workspace_bar::Menu>,
+    browser: browser::State,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
@@ -515,6 +517,7 @@ impl Shell {
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
             bar_menu: None,
+            browser: browser::State::new(cx),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             agent_sidebars: HashMap::new(),
@@ -525,6 +528,7 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.start_browser_poll(cx);
         shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
@@ -2098,13 +2102,7 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: workspace_bar::Browser {
-                color: colors.muted,
-                driving: false,
-                hint: "Browser idle".into(),
-                action: Some(workspace_bar::BrowserAction::Open),
-                has_evidence: false,
-            },
+            browser: self.browser.bar(colors),
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
@@ -2446,12 +2444,6 @@ impl Shell {
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.open_ready_list(window, cx),
                         O::OpenParked => shell.open_parked_list(window, cx),
-                        O::Browser(workspace_bar::BrowserAction::Open) => {
-                            shell.chrome_unavailable("Open browser", cx)
-                        }
-                        O::Browser(workspace_bar::BrowserAction::Focus) => {
-                            shell.chrome_unavailable("Focus browser", cx)
-                        }
                         outcome => shell.bar_outcome(outcome, window, cx),
                     }
                 });
@@ -3296,21 +3288,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        let launch = {
-            let mut launch = launch;
-            launch.program = "/bin/zsh".into();
-            launch.args = vec!["-d".into(), "-l".into()];
-            launch.env.insert(
-                "HOME".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch.env.insert(
-                "ZDOTDIR".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch
-        };
         let preview = self.owner.read(cx).preview();
         if let Err(error) = preview::executable(
             preview.as_deref(),
@@ -3329,6 +3306,25 @@ impl Shell {
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
+        let mut launch = launch;
+        if let Some(target) = &target {
+            browser::terminal_environment(&mut launch, &target.session_uid, cx);
+        }
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
             gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
@@ -3545,6 +3541,9 @@ impl Shell {
         if self.dictation_enabled() {
             context.push_str(" IcedStt");
         }
+        if self.browser.evidence_open {
+            return context;
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3623,6 +3622,7 @@ impl Shell {
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
         [
+            (self.browser.evidence_open, Modal::BrowserEvidence),
             (self.task_switcher.is_some(), Modal::TaskSwitcher),
             (self.usage_open, Modal::Usage),
             (Self::has_dialog(window, cx), Modal::Dialog),
@@ -3651,7 +3651,8 @@ impl Shell {
     /// switcher, the new-task form and task prompts, the New Work and Park
     /// sheets (not the Parked and Ready lists) and a PR action confirmation.
     fn pty_blocked(&self, cx: &App) -> bool {
-        self.task_switcher.is_some()
+        self.browser.evidence_open
+            || self.task_switcher.is_some()
             || self.task_panel_modal_open(cx)
             || self.new_work_sheet.is_some()
             || self
@@ -4126,7 +4127,10 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.browser.evidence_open
+                || self.plans_open
+                || self.task_switcher.is_some()
+                || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -4316,6 +4320,9 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_browser_evidence(window, cx) {
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -4460,6 +4467,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser.evidence_open {
+            if event.keystroke.key == "escape" {
+                self.close_browser_evidence(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
@@ -4604,7 +4618,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open
+            content.picker = self.browser.evidence_open
+                || self.plans_open
                 || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
@@ -4695,6 +4710,7 @@ impl Render for Shell {
                 )
                 .children(self.new_work_sheet.clone())
                 .children(self.remote_overlays())
+                .children(self.browser_evidence_view(window, cx))
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -4835,6 +4851,7 @@ impl Render for Shell {
             )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
+            .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
