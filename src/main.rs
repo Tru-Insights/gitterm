@@ -2444,10 +2444,8 @@ fn chat_event_wake(event: &tab::AgentEvent) -> Option<WakeReason> {
 
 /// A running parked workspace as `workspaces.json` stores it (TRU-186):
 /// an ordinary parked entry, since quitting GitTerm stops its processes.
-fn running_parked_config(mut cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
-    cfg.active = false;
-    cfg.parked = Some(info.clone());
-    cfg
+fn running_parked_config(cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
+    gitterm_core::park::parked_config(cfg, info.clone())
 }
 
 /// The open workspace a Parked list row names when it is parked running
@@ -2580,32 +2578,11 @@ fn park_note_chats<'a>(
 /// list. Close (TRU-190) parks, then ends here.
 #[cfg(test)]
 fn finish_parked(configs: &mut [WorkspaceConfig], key: &ParkedKey, stamp: String) -> bool {
-    match configs
-        .iter_mut()
-        .find(|cfg| cfg.is_parked() && key.matches(cfg))
-    {
-        Some(cfg) => {
-            cfg.done_at = Some(stamp);
-            true
-        }
-        None => false,
-    }
+    gitterm_core::park::finish_parked(configs, &App::park_key(key), stamp)
 }
 
-/// Reopen (TRU-205): clears the done state of the closed entry matching
-/// `key`, which puts it back on the Parked list. False when no done entry
-/// matches.
 fn reopen_done(configs: &mut [WorkspaceConfig], key: &ParkedKey) -> bool {
-    match configs
-        .iter_mut()
-        .find(|cfg| !cfg.active && cfg.done_at.is_some() && key.matches(cfg))
-    {
-        Some(cfg) => {
-            cfg.done_at = None;
-            true
-        }
-        None => false,
-    }
+    gitterm_core::park::reopen_done(configs, &App::park_key(key))
 }
 
 fn park_note_input_id() -> iced::widget::Id {
@@ -10574,6 +10551,7 @@ impl App {
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
         let home = self.repo(ws.home);
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: ws.collapsed_issue_groups.clone(),
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
@@ -10588,6 +10566,7 @@ impl App {
                 .tabs
                 .iter()
                 .map(|tab| WorkspaceTabConfig {
+                    extra: Default::default(),
                     // Terminal-style tabs persist their tracked local
                     // cwd; source-browsing tabs persist the browser dir
                     // so remote workspaces restore where they left off.
@@ -10856,10 +10835,10 @@ impl App {
             .get(self.active_workspace_index())
             .map(|ws| &ws.dir);
         if let Ok(mut p) = self.log_server_state.plans_dir.write() {
-            *p = workspace_dir.map(|dir| dir.join(".plans"));
+            *p = workspace_dir.map(|dir| gitterm_core::workspace_config::document_roots(dir).0);
         }
         if let Ok(mut p) = self.log_server_state.docs_dir.write() {
-            *p = workspace_dir.map(|dir| dir.join("docs"));
+            *p = workspace_dir.map(|dir| gitterm_core::workspace_config::document_roots(dir).1);
         }
     }
 
@@ -15376,9 +15355,8 @@ impl App {
     fn park_stopping(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
         self.dismiss_viewer_surface();
         let uid = self.workspaces[idx].uid;
-        let mut cfg = self.workspace_config(&self.workspaces[idx]);
-        cfg.active = false;
-        cfg.parked = Some(info);
+        let cfg =
+            gitterm_core::park::parked_config(self.workspace_config(&self.workspaces[idx]), info);
         eprintln!(
             "[workspace] parked {:?} with {} tab(s)",
             cfg.name,
@@ -15664,7 +15642,11 @@ impl App {
             .get_mut(finish)
             .filter(|cfg| cfg.is_parked() && key.matches(cfg));
         let cleanup = if let Some(cfg) = cfg {
-            cfg.done_at = Some(chrono::Utc::now().to_rfc3339());
+            gitterm_core::park::finish_parked(
+                std::slice::from_mut(cfg),
+                &Self::park_key(key),
+                chrono::Utc::now().to_rfc3339(),
+            );
             eprintln!("[workspace] {:?} marked done", key.name);
             self.mark_workspaces_dirty();
             self.maintain_turn_snapshots(Some(chats))
@@ -55500,6 +55482,7 @@ mod tests {
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             name: name.to_string(),
             abbrev: "AC".to_string(),
