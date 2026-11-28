@@ -616,3 +616,153 @@ fn work_sidebar_and_chat_navigation_reach_the_shared_editor_request(cx: &mut Tes
     });
     assert_eq!(std::fs::read_to_string(path).unwrap(), "unchanged");
 }
+
+#[gpui::test]
+fn review_host_live_marks_use_iced_file_and_reader(cx: &mut TestAppContext) {
+    review_host_marks_mode(true, cx);
+}
+
+#[gpui::test]
+fn review_host_preview_marks_leave_iced_bytes_untouched(cx: &mut TestAppContext) {
+    review_host_marks_mode(false, cx);
+}
+
+fn review_host_marks_mode(live: bool, cx: &mut TestAppContext) {
+    use gitterm_core::review::{
+        model::ReviewSource,
+        state::{Effect, Intent},
+        viewed::{VIEWED_FILE, ViewedMarks, ViewedState},
+    };
+    use gitterm_gpui_review::model::AggregateModel;
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let iced = root.path().join("iced");
+    let iced_path = iced.join(VIEWED_FILE);
+    let initial = br#"{"checkouts":{"/tmp/other-checkout":{"other.rs":"existing"}}}"#;
+    std::fs::write(&iced_path, initial).unwrap();
+    let host = cx.update(|_, cx| {
+        if live {
+            let services = gitterm_core::preview::service::ServiceContext::production(
+                &iced,
+                "review-marks-test",
+            )
+            .unwrap();
+            crate::chat::policy::install_live(services, cx).unwrap();
+        }
+        shell.update(cx, |shell, cx| shell.review_host(WorkspaceId(1), cx))
+    });
+    let repo = edit_card_repo();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (target, _) = executor
+        .block_on(gitterm_gpui_review::repo::aggregate_target(
+            repo.path().into(),
+        ))
+        .unwrap();
+    let mut model = AggregateModel::default();
+    model.dispatch(Intent::MarksLoaded(
+        gitterm_gpui_review::marks::load_merged(
+            host.iced_marks_dir.as_deref(),
+            host.preview_marks_dir.as_deref(),
+        ),
+    ));
+    let effects = model.dispatch(Intent::Open {
+        target,
+        source: ReviewSource::Uncommitted,
+        hide_noise: false,
+        focus: None,
+        page: AggregateModel::page(),
+    });
+    let stamp = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Collect(stamp) => Some(stamp),
+            _ => None,
+        })
+        .unwrap();
+    model.dispatch(executor.block_on(gitterm_gpui_review::repo::collect_aggregate(stamp)));
+    let file = model.projection().files[0].file.clone();
+    let intent = model.viewed_intent(&file.path).unwrap();
+    assert!(
+        model
+            .dispatch(intent)
+            .iter()
+            .any(|effect| matches!(effect, Effect::SaveMarks))
+    );
+    let marks = model.state().marks().unwrap().as_ref().unwrap();
+    let overlay = gitterm_gpui_review::marks::overlay(
+        host.iced_marks_dir.as_deref(),
+        host.preview_marks_dir.as_deref(),
+        marks,
+    )
+    .unwrap();
+    (host.save_marks.as_ref().unwrap())(overlay.encode().unwrap()).unwrap();
+    let saved_dir = if live {
+        iced.clone()
+    } else {
+        host.preview_marks_dir.clone().unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if ViewedMarks::load(&saved_dir)
+            .unwrap()
+            .state(repo.path(), &file)
+            == ViewedState::Viewed
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "viewed marks not saved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if live {
+        assert!(host.preview_marks_dir.is_none());
+        assert_eq!(
+            ViewedMarks::load(&iced).unwrap(),
+            *marks,
+            "Iced's reader sees the mark"
+        );
+        assert_eq!(
+            std::fs::read(&iced_path).unwrap(),
+            marks.encode().unwrap(),
+            "Iced's saved bytes"
+        );
+        assert!(!root.path().join("preview").join(VIEWED_FILE).exists());
+    } else {
+        assert_eq!(std::fs::read(&iced_path).unwrap(), initial);
+        let merged =
+            gitterm_gpui_review::marks::load_merged(Some(&iced), Some(&saved_dir)).unwrap();
+        assert_eq!(merged.state(repo.path(), &file), ViewedState::Viewed);
+    }
+}
+
+fn edit_card_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir_in("/private/tmp").unwrap();
+    review_git(repo.path(), &["init", "-qb", "main"]);
+    std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+    review_git(repo.path(), &["add", "."]);
+    review_git(repo.path(), &["commit", "-qm", "base"]);
+    review_git(repo.path(), &["switch", "-qc", "feature"]);
+    std::fs::create_dir(repo.path().join("src")).unwrap();
+    std::fs::write(repo.path().join("src/done.rs"), "fn done() {}\n").unwrap();
+    review_git(repo.path(), &["add", "."]);
+    review_git(repo.path(), &["commit", "-qm", "done"]);
+    std::fs::write(repo.path().join("src/[pending].rs"), "fn pending() {}\n").unwrap();
+    repo
+}
+
+fn review_git(root: &Path, args: &[&str]) {
+    let output = gitterm_core::git_status::git_command()
+        .current_dir(root)
+        .args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
