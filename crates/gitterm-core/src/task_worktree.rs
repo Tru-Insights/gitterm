@@ -893,6 +893,162 @@ fn parse_pull_request_rows(json: &str) -> Result<Option<DiscoveredPullRequest>, 
     }))
 }
 
+/// The unmanaged-worktree UI guard, shared by both hosts before any git write.
+pub fn check_unmanaged_removal(
+    workspace: Option<&Path>,
+    path: &Path,
+    managed_title: Option<&str>,
+) -> Result<(), String> {
+    if let Some(title) = managed_title {
+        return Err(format!(
+            "{} belongs to task \"{}\" — delete it from the task instead",
+            path.display(),
+            title
+        ));
+    }
+    let workspace = workspace.ok_or("Removing a worktree needs a local workspace")?;
+    if paths_equal(path, workspace) {
+        return Err("The main checkout cannot be removed".into());
+    }
+    Ok(())
+}
+
+/// Only a failed normal removal exposing Iced's force button authorizes force.
+pub fn offer_force(error: &str) -> bool {
+    error.contains("use --force") || error.contains("contains modified or untracked files")
+}
+
+pub fn removal_force(requested: bool, previous_error: Option<&str>) -> Result<bool, String> {
+    if requested && !previous_error.is_some_and(offer_force) {
+        return Err("Force remove is only available after a failed removal".into());
+    }
+    Ok(requested)
+}
+
+/// Only stale registrations in the selected repository can take the prune path.
+pub fn remove_unmanaged_worktree_blocking(
+    repository: &Path,
+    path: &Path,
+    force: bool,
+) -> Result<(), String> {
+    check_unmanaged_removal(Some(repository), path, None)?;
+    if path.exists() {
+        return remove_task_worktree_blocking(repository, path, force).map_err(|e| e.to_string());
+    }
+    let resolved = resolve_repository(repository).map_err(|e| e.to_string())?;
+    if !registered_worktrees(&resolved.top_level)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|p| paths_equal(p, path))
+    {
+        return Err(format!(
+            "remove worktree {}: path is not a registered worktree of this repository",
+            path.display()
+        ));
+    }
+    prune_worktrees_blocking(repository).map_err(|e| e.to_string())
+}
+
+/// Exact record used by Iced's WorktreeAdoptResolved, independent of its UI.
+pub fn adopted_task_record(
+    resolution: &AdoptedWorktreeResolution,
+    workspace_name: String,
+    path: &Path,
+    task_id: String,
+    timestamp: &str,
+) -> crate::tasks::TaskRecord {
+    use crate::tasks::*;
+    let branch = &resolution.branch;
+    let stem = branch.strip_prefix("task/").unwrap_or(branch);
+    let mut segments = stem.splitn(3, '-');
+    let issue_key = match (segments.next(), segments.next()) {
+        (Some(team), Some(number)) => {
+            let candidate = format!("{team}-{number}").to_uppercase();
+            is_linear_issue_key(&candidate).then_some(candidate)
+        }
+        _ => None,
+    };
+    let mut record = TaskRecord::new_draft(
+        NewTaskRecord {
+            task_id,
+            title: stem.to_string(),
+            objective: format!(
+                "Adopted existing worktree {} on branch {}.",
+                path.display(),
+                branch
+            ),
+            workspace: WorkspaceIdentity {
+                name: workspace_name,
+                location: WorkspaceLocationIdentity::Local {
+                    directory: resolution.repository.top_level.clone(),
+                },
+            },
+            repository: resolution.repository.identity.clone(),
+            issue: issue_key.map(|key| IssueReference {
+                provider: IssueProvider::Linear,
+                key,
+                url: None,
+            }),
+            base: resolution.base.clone(),
+            branch: branch.clone(),
+            executor: ExecutorTarget::Local,
+            harness: None,
+            stopping_boundary: StoppingBoundary::ImplementUntilTestsPass,
+        },
+        timestamp,
+    );
+    record.created_by = Some(TaskCreator {
+        kind: TaskCreatorKind::Manual,
+        session_id: None,
+        harness_label: None,
+        created_at: timestamp.to_string(),
+    });
+    record.lifecycle = TaskLifecycle::Preparing;
+    record.worktree = TaskWorktree {
+        state: TaskWorktreeState::Preparing,
+        path: None,
+    };
+    record
+}
+
+/// Persist through the host's existing task authority, never a second TaskStore.
+pub fn persist_adopted_worktree(
+    store: &mut crate::tasks::TaskStore,
+    resolution: &AdoptedWorktreeResolution,
+    workspace_name: String,
+    path: &Path,
+    task_id: String,
+    timestamp: &str,
+) -> Result<(), crate::tasks::TaskStoreError> {
+    let record = adopted_task_record(resolution, workspace_name, path, task_id.clone(), timestamp);
+    store.insert(record)?;
+    store.complete_worktree_preparation(
+        &task_id,
+        CompletedWorktreePreparation {
+            repository: resolution.repository.identity.clone(),
+            base: resolution.base.clone(),
+            branch: resolution.branch.clone(),
+            path: path.to_path_buf(),
+        },
+        timestamp,
+    )
+}
+
+/// Revalidate the selected path against git immediately before opening a tab.
+pub fn check_open_worktree(repository: &Path, path: &Path) -> Result<(), String> {
+    let repo = resolve_repository(repository).map_err(|e| e.to_string())?;
+    if !registered_worktrees(&repo.top_level)
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|p| paths_equal(p, path))
+        || !path.is_dir()
+        || !path.join(".git").exists()
+    {
+        return Err("Worktree is no longer available".into());
+    }
+    Ok(())
+}
+
 /// Removes a task's managed worktree. Callers must run [`inspect_cleanup`]
 /// first and only proceed when `safe_to_remove()`; this function additionally
 /// refuses (git rejects removal of dirty trees without `--force`) as a second

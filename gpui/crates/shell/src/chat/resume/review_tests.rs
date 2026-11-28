@@ -63,6 +63,7 @@ fn prepare(
         .unwrap(),
     )
     .unwrap();
+    cx.update(|cx| super::tests::install_store(&root, cx));
     Some((root, preview, services, workspace))
 }
 fn history(id: &str) -> PathBuf {
@@ -294,15 +295,17 @@ fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
     let path = root.join("workspaces.json");
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     let iced = saved(&root);
-    let tab = iced.workspaces[0].tabs[0].clone();
+    let mut tab = iced.workspaces[0].tabs[0].clone();
     let iced_config = serde_json::to_value(&tab.agent_config).unwrap();
     assert!(iced_config.get("future").is_none());
+    // A real change, so the owner writes (an unchanged edit keeps the old bytes).
+    tab.dir = root.join("changed").display().to_string();
     LiveTab::new(
         ServiceContext::production(&root, "unknown-test").unwrap(),
         &workspace,
         tab,
     )
-    .persist()
+    .persist(&gitterm_core::desktop_store::DesktopStore::open(&root).unwrap())
     .unwrap();
     let gpui: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(
@@ -319,7 +322,11 @@ fn finding_f4_acknowledged_settings_survive_restart(cx: &mut gpui::TestAppContex
     };
     let tab = tab(&root, "settings-caller".into(), Some("settings-id".into()));
     LiveTab::new(services.clone(), &workspace, tab.clone())
-        .persist()
+        .persist(&cx.read(|cx| {
+            cx.global::<crate::workspace_config::LiveWorkspaces>()
+                .0
+                .clone()
+        }))
         .unwrap();
     let (pane, cx) = cx.add_window_view(|window, cx| {
         ChatPane::resume_from(
@@ -642,13 +649,17 @@ fn finding_saved_unsent_turn_updates_the_same_tab(cx: &mut gpui::TestAppContext)
     };
     let tab = unsent_tab(&root, "unsent-persist-caller");
     workspace.tabs = vec![tab.clone()];
-    std::fs::write(
-        root.join("workspaces.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"active_workspace":0,"workspaces":[workspace.clone()]}),
-        )
-        .unwrap(),
-    )
+    let seeded = workspace.clone();
+    cx.read(|cx| {
+        cx.global::<crate::workspace_config::LiveWorkspaces>()
+            .0
+            .clone()
+    })
+    .transact_workspaces(move |file| {
+        file.workspaces[0] = seeded;
+        Ok(())
+    })
+    .wait()
     .unwrap();
     let before = std::fs::read(root.join("workspaces.json")).unwrap();
     let (pane, cx) = cx.add_window_view(|window, cx| {

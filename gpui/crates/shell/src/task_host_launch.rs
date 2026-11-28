@@ -1023,8 +1023,16 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Whether launched session `session_id` shows Iced's input-needed
-    /// attention on its pane.
+    /// Raw harness title, before the pane adds folder/status decorations.
+    pub(crate) fn notification_terminal_title(&self, session_id: &str) -> Option<&str> {
+        self.launched.get(session_id)?.title.as_deref()
+    }
+    pub(crate) fn notification_session_working(&self, session_id: &str) -> bool {
+        self.launched
+            .get(session_id)
+            .is_some_and(|session| session.live == Some(TaskSessionLiveState::Working))
+    }
+    /// Whether launched session `session_id` shows Iced's input-needed attention.
     pub(crate) fn needs_input(&self, session_id: &str) -> bool {
         self.launched
             .get(session_id)
@@ -1161,7 +1169,7 @@ impl TaskHostOwner {
         Ok(env)
     }
 
-    /// Live has a worker tick without result delivery (slice 9). Imported
+    /// Live worker lifecycle tick, separate from the delivery poll. Imported
     /// records carry no process authority and are never adopted or stopped.
     pub(crate) fn live_worker_tick(&mut self, cx: &mut Context<Self>) {
         if !self.is_live() || self.is_shut_down() {
@@ -1344,9 +1352,9 @@ impl TaskHostOwner {
     }
 
     fn close_live_final_workers(&mut self, cx: &mut Context<Self>) {
-        // Automatic delivery is closed in this slice. Stored results therefore
-        // permit final close, just as Iced does with automatic delivery off.
-        let ready = self.host.final_workers_ready(&[], false);
+        let ready = self
+            .host
+            .final_workers_ready(&super::delivery::delivery_chats(cx), self.auto_tell());
         let closing = self.start_final_worker_closes(&ready);
         let sessions: Vec<_> = closing
             .iter()
@@ -1887,7 +1895,15 @@ fn spawn_terminal_launch(
                 let session = title_session.clone();
                 cx.defer(move |cx| {
                     _ = owner.update(cx, |owner, _| {
+                        let live = owner.is_live();
                         if let Some(launched) = owner.launched.get_mut(&session) {
+                            if live {
+                                // Iced's terminal-title adapter clears input attention
+                                // when the harness works again, even before a keystroke.
+                                launched
+                                    .needs_input
+                                    .store(title.starts_with('✳'), Ordering::Relaxed);
+                            }
                             launched.title = Some(title);
                         }
                     });

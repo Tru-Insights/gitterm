@@ -28,7 +28,10 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) type IdentityAliases = std::collections::BTreeMap<String, String>;
+
 pub struct WorkspaceStore {
+    pub(crate) identity_aliases: IdentityAliases,
     pub(crate) iced: Option<IcedCatalog>,
     pub(crate) chats: Vec<crate::chat::SavedChat>,
     pub(crate) parked: Vec<crate::park::SavedPark>,
@@ -40,6 +43,7 @@ impl WorkspaceStore {
     #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
+            identity_aliases: Default::default(),
             iced: None,
             chats: vec![],
             parked: vec![],
@@ -50,6 +54,7 @@ impl WorkspaceStore {
     }
     pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
+            identity_aliases: Default::default(),
             iced: None,
             chats: vec![],
             parked: vec![],
@@ -63,6 +68,30 @@ impl WorkspaceStore {
             if let Some(guard) = &self.guard {
                 guard.preview().scoped(&self.path)?;
             }
+            let alias_path = self.path.with_file_name("workspace-identities.json");
+            if let Some(guard) = &self.guard {
+                guard.preview().scoped(&alias_path)?;
+            }
+            self.identity_aliases = match std::fs::read(&alias_path) {
+                Ok(bytes) => {
+                    let aliases: IdentityAliases =
+                        serde_json::from_slice(&bytes).with_context(|| {
+                            format!("read workspace identities {}", alias_path.display())
+                        })?;
+                    ensure!(
+                        aliases
+                            .iter()
+                            .all(|(key, original)| [key, original].iter().all(|value| value
+                                .strip_prefix("workspace-")
+                                .is_some_and(|suffix| suffix.len() == 16
+                                    && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())))),
+                        "invalid workspace identity alias"
+                    );
+                    aliases
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(error) => return Err(error.into()),
+            };
             let bytes = match std::fs::read(&self.path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -115,6 +144,58 @@ impl WorkspaceStore {
             parked_workspaces: self.parked.clone(),
         })?)
     }
+    pub(crate) fn layout_key(
+        &self,
+        workspace: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> String {
+        let key = iced_layout_key(workspace);
+        self.identity_aliases.get(&key).cloned().unwrap_or(key)
+    }
+
+    /// This GPUI-only record must reach disk before the V6 name changes.
+    pub(crate) fn prepare_rename_alias(
+        &self,
+        workspace: &gitterm_core::workspace_config::WorkspaceConfig,
+        draft: &str,
+    ) -> Result<Option<(IdentityAliases, crate::preview::SaveResult)>> {
+        let mut renamed = workspace.clone();
+        if !gitterm_core::workspace_config::rename_workspace(&mut renamed.name, draft) {
+            return Ok(None);
+        }
+        let destination = iced_layout_key(&renamed);
+        ensure!(
+            !self.iced.as_ref().is_some_and(|catalog| catalog
+                .workspaces
+                .iter()
+                .chain(&catalog.closed)
+                .any(|other| iced_layout_key(other) == destination)),
+            "Another workspace already uses this name and folder"
+        );
+        let mut aliases = self.identity_aliases.clone();
+        aliases.insert(destination, self.layout_key(workspace));
+        ensure!(
+            !self.refused,
+            "refusing to overwrite invalid workspace identities"
+        );
+        let bytes = serde_json::to_vec_pretty(&aliases)?;
+        let path = self.path.with_file_name("workspace-identities.json");
+        let save = if let Some(guard) = &self.guard {
+            guard.submit(path, bytes)?
+        } else {
+            #[cfg(not(test))]
+            anyhow::bail!("workspace writer has no preview guard");
+            #[cfg(test)]
+            {
+                gitterm_core::atomic_file::write_atomically(&path, &bytes)
+                    .map_err(anyhow::Error::msg)?;
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let _ = send.send(Ok(()));
+                receive
+            }
+        };
+        Ok(Some((aliases, save)))
+    }
+
     pub(crate) fn save_async(&self, folders: &[PathBuf]) -> Result<crate::preview::SaveResult> {
         let bytes = self.bytes(folders)?;
         if let Some(guard) = &self.guard {
@@ -192,6 +273,9 @@ pub(crate) struct IcedCatalog {
     pub source: PathBuf,
     pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
     pub workspaces: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+    pub closed: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+    pub claims: std::collections::HashSet<usize>,
+    pub order: Vec<usize>,
     pub active: usize,
     pub repos_on_bar: bool,
 }
@@ -211,6 +295,12 @@ impl IcedCatalog {
     ) -> Self {
         // Normalize legacy repo records in memory, just as Iced does on restore.
         file.normalize_repos();
+        let closed = file
+            .workspaces
+            .iter()
+            .filter(|w| !w.active)
+            .cloned()
+            .collect();
         let mut open: Vec<_> = file
             .workspaces
             .into_iter()
@@ -236,6 +326,9 @@ impl IcedCatalog {
         let active = open.iter().position(|(i, _)| *i == selected).unwrap_or(0);
         Self {
             source: config.to_owned(),
+            closed,
+            claims: Default::default(),
+            order: (0..open.len()).collect(),
             repos: file.repos,
             workspaces: open.into_iter().map(|(_, w)| w).collect(),
             active,
@@ -247,23 +340,36 @@ impl IcedCatalog {
         active: Option<crate::data::WorkspaceId>,
     ) -> gitterm_core::workspace::BarLayout {
         use gitterm_core::workspace::{BarChip, bar_layout};
-        let chips: Vec<_> = self
-            .workspaces
+        let order = self.ordered_indices();
+        let chips: Vec<_> = order
             .iter()
-            .map(|w| BarChip {
+            .map(|&index| (index, &self.workspaces[index]))
+            .map(|(index, w)| BarChip {
                 group: iced_group(w),
-                work: gitterm_core::work::catalog::is_work(&w.chats, false),
-                parked: false,
+                work: gitterm_core::work::catalog::is_work(&w.chats, self.claims.contains(&index)),
+                parked: !w.active,
             })
             .collect();
         let active = active
             .and_then(|id| id.0.checked_sub(1))
             .map(|i| i as usize)
             .unwrap_or(self.active);
+        let active = order.iter().position(|&index| index == active).unwrap_or(0);
         bar_layout(&chips, active, self.repos_on_bar)
     }
+    pub(crate) fn ordered_indices(&self) -> Vec<usize> {
+        if self.order.is_empty() {
+            (0..self.workspaces.len()).collect()
+        } else {
+            self.order.clone()
+        }
+    }
     pub fn visible_order(&self, active: Option<crate::data::WorkspaceId>) -> Vec<usize> {
+        let order = self.ordered_indices();
         gitterm_core::workspace::visible_order(&self.bar_layout(active))
+            .into_iter()
+            .map(|index| order[index])
+            .collect()
     }
 }
 fn iced_group(w: &gitterm_core::workspace_config::WorkspaceConfig) -> String {
@@ -786,6 +892,872 @@ mod live_constructor_tests {
         assert_eq!(
             std::fs::read(temp.path().join("workspaces.json")).unwrap(),
             bytes
+        );
+    }
+}
+
+/// Installed only after Live admission; Preview has no catalog write authority.
+#[derive(Clone)]
+pub(crate) struct LiveWorkspaces(pub gitterm_core::desktop_store::DesktopStore);
+impl gpui::Global for LiveWorkspaces {}
+
+#[derive(Clone)]
+pub(crate) enum LiveWorkspaceAction {
+    Create {
+        name: String,
+        start: gitterm_core::work::catalog::WorkStart,
+        home: PathBuf,
+    },
+    Park {
+        active_tab: Option<usize>,
+        tabs: Vec<gitterm_core::workspace_config::WorkspaceTabConfig>,
+        bottom_terminals: Vec<gitterm_core::workspace_config::BottomTerminalConfig>,
+        key: gitterm_core::park::Key,
+        info: gitterm_core::park::Info,
+        done: bool,
+    },
+    Resume {
+        key: gitterm_core::park::Key,
+        reopen: bool,
+        open: Vec<gitterm_core::park::Key>,
+    },
+    Done(gitterm_core::park::Key),
+    Return {
+        key: gitterm_core::park::Key,
+        ordinal: usize,
+    },
+}
+
+pub(crate) struct LiveWorkspaceSaved {
+    pub repos: Vec<gitterm_core::workspace_config::RepoConfig>,
+    pub workspace: gitterm_core::workspace_config::WorkspaceConfig,
+    pub closed: Vec<gitterm_core::workspace_config::WorkspaceConfig>,
+}
+
+/// Runs on a background executor; DesktopStore owns the complete document and
+/// publishes no candidate on a failed save. UI callers apply effects only on Ok.
+pub(crate) fn save_live_workspace(
+    store: &gitterm_core::desktop_store::DesktopStore,
+    action: LiveWorkspaceAction,
+    active: Option<gitterm_core::park::Key>,
+) -> Result<LiveWorkspaceSaved, String> {
+    use gitterm_core::{park, workspace_config::ParkedInfo};
+    let created = if let LiveWorkspaceAction::Create { name, home, .. } = &action {
+        Some(
+            gitterm_core::workspace_config::create_work_folder(&home.join("Work"), name).map_err(
+                |error| {
+                    format!(
+                        "cannot create a folder in {}: {error}",
+                        home.join("Work").display()
+                    )
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    let folder = created.clone();
+    let result = store
+        .transact_workspaces(move |file| {
+            let previous_active = active.as_ref().and_then(|key| file.workspaces.iter().filter(|w| w.active).position(|w| key.matches(w))).unwrap_or(file.active_workspace);
+            let returning_at = if let LiveWorkspaceAction::Return { ordinal, .. } = &action { Some(*ordinal) } else { None };
+            let target = match &action {
+                LiveWorkspaceAction::Create { .. } => None,
+                LiveWorkspaceAction::Park { key, .. } | LiveWorkspaceAction::Resume { key, .. } | LiveWorkspaceAction::Done(key) | LiveWorkspaceAction::Return { key, .. } => Some(key),
+            };
+            if let Some(key) = target && file.workspaces.iter().filter(|w| key.matches(w)).count() > 1 {
+                return Err(format!("Several saved workspaces are named {} in {}; this workspace cannot be changed in Live.", key.name, key.dir));
+            }
+            if let Some(workspace) = target.and_then(|key| file.workspaces.iter().find(|w| key.matches(w))) {
+                if workspace.is_legacy_remote() || matches!(workspace.location, Some(gitterm_core::remote::config::WorkspaceLocationConfig::RemoteAgent { .. })) {
+                    return Err("Remote workspaces cannot be changed in Live yet.".into());
+                }
+                // shortcut: task restore still requires task_host_runs::fixture_of;
+                // use that host's restore path once it accepts Live callers.
+                if matches!(action, LiveWorkspaceAction::Resume { .. }) && workspace.tabs.iter().any(|t| t.task_id.is_some() && t.startup_command.is_some()) {
+                    return Err("This task terminal cannot be resumed in Live yet.".into());
+                }
+            }
+            let mut workspace = match action {
+                LiveWorkspaceAction::Create { name, start, .. } => {
+                    use gitterm_core::settings::WorkspaceColor as C;
+                    let used: Vec<_> = file
+                        .workspaces
+                        .iter()
+                        .filter(|w| w.active)
+                        .map(|w| w.color)
+                        .collect();
+                    let colors = [
+                        C::Lavender,
+                        C::Blue,
+                        C::Green,
+                        C::Peach,
+                        C::Pink,
+                        C::Yellow,
+                        C::Red,
+                        C::Teal,
+                    ];
+                    let color = colors
+                        .iter()
+                        .copied()
+                        .find(|c| !used.contains(c))
+                        .unwrap_or(colors[used.len() % colors.len()]);
+                    let dir = folder.as_ref().expect("created folder");
+                    let mut workspace = new_work_config(&name, dir, color, start);
+                    workspace.tabs.push(crate::chat::resume::tab(
+                        dir,
+                        crate::sessions::fresh_target().session_uid,
+                        None,
+                    ));
+                    workspace
+                }
+                LiveWorkspaceAction::Park {
+                    key,
+                    info,
+                    done,
+                    tabs,
+                    bottom_terminals,
+                    active_tab,
+                } => {
+                    let index = file
+                        .workspaces
+                        .iter()
+                        .position(|w| key.matches(w) && (w.active || w.is_parked()))
+                        .ok_or_else(|| format!("Workspace {} is no longer open", key.name))?;
+                    let mut workspace = park::parked_config(
+                        file.workspaces.remove(index),
+                        ParkedInfo {
+                            note: info.note,
+                            parked_at: info.parked_at,
+                        },
+                    );
+                    let mut tabs = tabs;
+                    // A provider acknowledgement can reach the serialized owner
+                    // after the UI captured its park request. Keep that metadata
+                    // and fields this desktop cannot render.
+                    for tab in &mut tabs {
+                        if tab.session_uid.is_some()
+                            && let Some(confirmed) = workspace.tabs.iter().find(|saved| saved.session_uid == tab.session_uid) {
+                            let mut extra = confirmed.extra.clone();
+                            extra.extend(tab.extra.clone());
+                            tab.extra = extra;
+                            if confirmed.chat_session_id.is_some()
+                                && (tab.chat_session_id.is_none() || tab.chat_session_id == confirmed.chat_session_id) {
+                                tab.chat_session_id = confirmed.chat_session_id.clone();
+                                tab.agent_config = confirmed.agent_config.clone();
+                                tab.repo_dir = confirmed.repo_dir.clone();
+                            }
+                        }
+                    }
+                    workspace.tabs = tabs;
+                    workspace.bottom_terminals = bottom_terminals;
+                    workspace.active_tab = active_tab;
+                    if done {
+                        workspace.done_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    workspace
+                }
+                LiveWorkspaceAction::Resume { key, reopen, open } => {
+                    if reopen {
+                        park::reopen_done(&mut file.workspaces, &key);
+                    }
+                    let index = file
+                        .workspaces
+                        .iter()
+                        .position(|w| key.matches(w) && w.is_parked())
+                        .ok_or_else(|| format!("Workspace {} is no longer parked", key.name))?;
+                    let mut workspace = file.workspaces.remove(index);
+                    // Reuse Iced's conversation ownership and active-tab mapping.
+                    let state = park::State {
+                        open: file.workspaces.iter().filter(|w| w.active || open.iter().any(|key| key.matches(w))).map(|w| park::OpenWorkspace {
+                            target: park::Target { uid: 0, tabs: vec![] },
+                            key: park::Key { name: w.name.clone(), dir: w.dir.clone() },
+                            running: None, remote_id: None,
+                            conversations: w.tabs.iter().filter_map(|t| t.chat_session_id.clone()).collect(),
+                        }).collect(),
+                        closed: vec![],
+                    };
+                    let park::Effect::FilteredRestore { indices, active_tab } = state.reduce(park::Intent::FilterRestore {
+                        remote_id: None, tabs: workspace.tabs.iter().map(|t| t.session_identity()).collect(), active_tab: workspace.active_tab,
+                    }) else { unreachable!("filter restore effect") };
+                    workspace.tabs = workspace.tabs.into_iter().enumerate().filter_map(|(i,t)| indices.contains(&i).then_some(t)).collect();
+                    workspace.active_tab = active_tab;
+                    if workspace.tabs.is_empty() {
+                        workspace.tabs.push(gitterm_core::workspace_config::WorkspaceTabConfig {
+                            extra: Default::default(),
+                            dir: workspace.dir.clone(), repo_dir: Some(workspace.dir.clone()), startup_command: None, tab_kind: None, agent_config: None, chat_session_id: None, task_id: None, task_session_id: None, worker_shutdown_refused: false, session_uid: None,
+                        });
+                        workspace.active_tab = Some(0);
+                    }
+                    for tab in &mut workspace.tabs { if tab.session_uid.is_none() { tab.session_uid = Some(crate::sessions::fresh_target().session_uid); } }
+                    workspace.active = true;
+                    workspace.parked = None;
+                    workspace.done_at = None;
+                    workspace
+                }
+                LiveWorkspaceAction::Return { key, .. } => {
+                    let index = file.workspaces.iter().position(|w| key.matches(w) && w.is_parked()).ok_or_else(|| format!("Workspace {} is no longer parked", key.name))?;
+                    let mut workspace = file.workspaces.remove(index);
+                    workspace.active = true;
+                    workspace.parked = None;
+                    workspace
+                }
+                LiveWorkspaceAction::Done(key) => {
+                    if !park::finish_parked(
+                        &mut file.workspaces,
+                        &key,
+                        chrono::Utc::now().to_rfc3339(),
+                    ) {
+                        return Err(format!("Workspace {} is no longer parked", key.name));
+                    }
+                    file.workspaces
+                        .iter()
+                        .find(|w| key.matches(w) && !w.active && w.done_at.is_some())
+                        .unwrap()
+                        .clone()
+                }
+            };
+            // Mirror Iced's open-then-closed full-document order. Running parks are
+            // saved closed too; their runtime ownership stays exclusively in Shell.
+            let key = park::Key {
+                name: workspace.name.clone(),
+                dir: workspace.dir.clone(),
+            };
+            if !file.workspaces.iter().any(|w| {
+                key.matches(w) && w.done_at == workspace.done_at && w.active == workspace.active
+            }) {
+                file.workspaces.push(workspace.clone());
+            }
+            file.workspaces.sort_by_key(|w| !w.active);
+            if let Some(ordinal) = returning_at {
+                let index = file.workspaces.iter().position(|w| w.active && key.matches(w)).expect("returned workspace");
+                let returned = file.workspaces.remove(index);
+                let at = ordinal.min(file.workspaces.iter().filter(|w| w.active).count());
+                file.workspaces.insert(at, returned);
+            }
+            if let Some(selected) = active.as_ref().or(workspace.active.then_some(&key)) {
+                file.active_workspace = file
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.active)
+                    .position(|w| selected.matches(w))
+                    .unwrap_or_else(|| {
+                        previous_active.min(
+                            file.workspaces
+                                .iter()
+                                .filter(|w| w.active)
+                                .count()
+                                .saturating_sub(1),
+                        )
+                    });
+            }
+            file.normalize_repos();
+            // Return the normalized wire DTO, including all tabs/settings/notes.
+            if let Some(saved) = file
+                .workspaces
+                .iter()
+                .find(|w| key.matches(w) && w.active == workspace.active)
+            {
+                workspace = saved.clone();
+            }
+            Ok(LiveWorkspaceSaved {
+                workspace,
+                repos: file.repos.clone(),
+                closed: file
+                    .workspaces
+                    .iter()
+                    .filter(|w| !w.active)
+                    .cloned()
+                    .collect(),
+            })
+        })
+        .wait();
+    if result.is_err()
+        && let Some(created) = created
+    {
+        // Only our newly-created, still empty folder can be removed on failure.
+        // Never remove user files which appeared while the save was in flight.
+        if let Err(error) = std::fs::remove_dir(&created) {
+            eprintln!("Remove unsaved workspace {}: {error}", created.display());
+        }
+    }
+    result
+}
+
+fn new_work_config(
+    name: &str,
+    dir: &Path,
+    color: gitterm_core::settings::WorkspaceColor,
+    start: gitterm_core::work::catalog::WorkStart,
+) -> gitterm_core::workspace_config::WorkspaceConfig {
+    use gitterm_core::workspace_config::WorkspaceConfig;
+    let dir = dir.to_string_lossy().into_owned();
+    let added: Vec<String> = start
+        .repos
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    WorkspaceConfig {
+        extra: Default::default(),
+        collapsed_issue_groups: gitterm_core::issues::IssueGroup::default_collapsed(),
+        name: name.into(),
+        abbrev: name.chars().take(2).collect::<String>().to_uppercase(),
+        dir: dir.clone(),
+        color,
+        location: Some(
+            gitterm_core::remote::config::WorkspaceLocationConfig::Local { root: dir.clone() },
+        ),
+        remote_session: None,
+        active_tab: Some(0),
+        tabs: vec![],
+        run_command: None,
+        bottom_terminals: vec![],
+        env: Default::default(),
+        active: true,
+        chats: vec![],
+        parked: None,
+        done_at: None,
+        guidelines_off: false,
+        claude_in_chrome: false,
+        decisions_repo: start
+            .decisions_repo
+            .map(|p| p.to_string_lossy().into_owned()),
+        repos: std::iter::once(dir.clone())
+            .chain(added.iter().filter(|r| **r != dir).cloned())
+            .collect(),
+        home: Some(dir),
+        env_overrides: Default::default(),
+        repos_added: added,
+        repos_removed: vec![],
+    }
+}
+
+#[cfg(test)]
+mod live_workspace_tests {
+    use super::*;
+    use gitterm_core::{
+        desktop_store::{DesktopStore, LoadState},
+        park::{Info, Key},
+        workspace_config::WorkspacesFile,
+    };
+    fn isolated(name: &str, test: impl FnOnce(&Path, &Path)) {
+        if std::env::var("GITTERM_WORKSPACE_CONTRACT").as_deref() == Ok(name) {
+            let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+            let root = PathBuf::from(std::env::var_os("GITTERM_V6_CONFIG_DIR").unwrap());
+            assert!(root.is_absolute() && home.is_absolute());
+            test(&root, &home);
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("desktop");
+        let home = fixture.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("workspace_config::live_workspace_tests::{name}"),
+                "--nocapture",
+            ])
+            .env("GITTERM_WORKSPACE_CONTRACT", name)
+            .env("HOME", home)
+            .env("GITTERM_V6_CONFIG_DIR", root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    fn fixture(root: &Path) -> Key {
+        // The original Iced format, before repo normalization and park notes.
+        std::fs::write(root.join("workspaces.json"), br#"{"active_workspace":0,"workspaces":[
+            {"name":"Open","abbrev":"O","dir":"/fixture/open","color":"blue","tabs":[]},
+            {"name":"Old work","abbrev":"OW","dir":"/fixture/old","color":"green","active":false,"chats":["owned"],"tabs":[{"dir":"/fixture/repo","tab_kind":"agent","agent_config":{"backend":"claude","model":"default"},"chat_session_id":"owned"}],"env":{"KEEP":"yes"}}
+        ]}"#).unwrap();
+        Key {
+            name: "Old work".into(),
+            dir: "/fixture/old".into(),
+        }
+    }
+    fn document(root: &Path) -> WorkspacesFile {
+        serde_json::from_slice(&std::fs::read(root.join("workspaces.json")).unwrap()).unwrap()
+    }
+    #[test]
+    fn old_iced_park_round_trip() {
+        isolated("old_iced_park_round_trip", |root, _| {
+            let key = fixture(root);
+            let store = DesktopStore::open(root).unwrap();
+            let old = document(root).workspaces[1].clone();
+            let resumed = save_live_workspace(
+                &store,
+                LiveWorkspaceAction::Resume {
+                    key: key.clone(),
+                    reopen: false,
+                    open: vec![],
+                },
+                None,
+            )
+            .unwrap();
+            assert!(resumed.workspace.active);
+            assert_eq!(resumed.workspace.env, old.env);
+            let resumed_uid = resumed.workspace.tabs[0].session_uid.clone();
+            assert!(resumed_uid.as_ref().is_some_and(|uid| !uid.is_empty()));
+            // Iced assigns a caller id when an old tab predates that field.
+            let mut expected_tabs = old.tabs.clone();
+            expected_tabs[0].session_uid = resumed_uid.clone();
+            assert_eq!(
+                serde_json::to_value(&resumed.workspace.tabs).unwrap(),
+                serde_json::to_value(&expected_tabs).unwrap()
+            );
+            let info = Info::new("  come back here  ", "2026-11-27T20:00:00Z".into());
+            let parked = save_live_workspace(
+                &store,
+                LiveWorkspaceAction::Park {
+                    active_tab: resumed.workspace.active_tab,
+                    key: key.clone(),
+                    info: info.clone(),
+                    done: false,
+                    bottom_terminals: resumed.workspace.bottom_terminals,
+                    tabs: resumed.workspace.tabs,
+                },
+                None,
+            )
+            .unwrap();
+            assert!(!parked.workspace.active);
+            assert_eq!(parked.workspace.parked.unwrap().note, "come back here");
+            drop(store);
+            let restarted = DesktopStore::open(root).unwrap();
+            let done =
+                save_live_workspace(&restarted, LiveWorkspaceAction::Done(key.clone()), None)
+                    .unwrap();
+            assert!(done.workspace.done_at.is_some());
+            let reopened = save_live_workspace(
+                &restarted,
+                LiveWorkspaceAction::Resume {
+                    key,
+                    reopen: true,
+                    open: vec![],
+                },
+                None,
+            )
+            .unwrap();
+            assert!(reopened.workspace.active && reopened.workspace.done_at.is_none());
+            assert_eq!(reopened.workspace.chats, ["owned"]);
+            assert_eq!(reopened.workspace.tabs.len(), 1);
+            assert_eq!(reopened.workspace.tabs[0].session_uid, resumed_uid);
+        });
+    }
+    #[test]
+    fn cancel_creates_no_folder_or_document() {
+        isolated("cancel_creates_no_folder_or_document", |root, home| {
+            // Cancel emits no catalog mutation, even after editing the draft.
+            let mut sheet = gitterm_core::work::catalog::NewWorkSheet {
+                name: "Cancelled work".into(),
+                ..Default::default()
+            };
+            sheet.use_picked_folder(home.join("repo"));
+            let store = DesktopStore::open(root).unwrap();
+            drop(sheet);
+            store.drain().wait().unwrap();
+            assert!(!root.join("workspaces.json").exists());
+            assert!(!home.join("Work").exists());
+        });
+    }
+    #[test]
+    fn failed_save_keeps_old_file_and_owner_snapshot() {
+        isolated(
+            "failed_save_keeps_old_file_and_owner_snapshot",
+            |root, _| {
+                use std::os::unix::fs::PermissionsExt;
+                let key = fixture(root);
+                let bytes = std::fs::read(root.join("workspaces.json")).unwrap();
+                let store = DesktopStore::open(root).unwrap();
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+                let result = save_live_workspace(
+                    &store,
+                    LiveWorkspaceAction::Resume {
+                        key,
+                        reopen: false,
+                        open: vec![],
+                    },
+                    None,
+                );
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(root.join("workspaces.json")).unwrap(), bytes);
+                let snapshot = store.snapshot().wait().unwrap();
+                assert!(!snapshot.workspaces.dirty);
+                let LoadState::Valid(file) = snapshot.workspaces.loaded else {
+                    panic!("valid")
+                };
+                assert!(!file.workspaces[1].active);
+                store.drain().wait().unwrap();
+                assert_eq!(std::fs::read(root.join("workspaces.json")).unwrap(), bytes);
+            },
+        );
+    }
+    #[test]
+    fn create_plans_root_and_bidirectional_wire_contract() {
+        isolated(
+            "create_plans_root_and_bidirectional_wire_contract",
+            |root, home| {
+                fixture(root);
+                let store = DesktopStore::open(root).unwrap();
+                let repo = home.join("repo");
+                let created = save_live_workspace(
+                    &store,
+                    LiveWorkspaceAction::Create {
+                        name: "Cloud migration".into(),
+                        home: home.into(),
+                        start: gitterm_core::work::catalog::WorkStart::new(
+                            vec![repo.clone()],
+                            Some(repo.clone()),
+                        )
+                        .unwrap(),
+                    },
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    created.workspace.dir,
+                    home.join("Work/cloud-migration").to_string_lossy()
+                );
+                assert_eq!(
+                    created.workspace.decisions_repo,
+                    Some(repo.to_string_lossy().into_owned())
+                );
+                assert_eq!(created.workspace.repos_added, [repo.to_string_lossy()]);
+                let (plans, docs) = gitterm_core::workspace_config::document_roots(Path::new(
+                    &created.workspace.dir,
+                ));
+                assert_eq!(plans, home.join("Work/cloud-migration/.plans"));
+                assert_eq!(docs, home.join("Work/cloud-migration/docs"));
+                // GPUI reads Iced's shared DTO, and Iced's reader accepts GPUI's write.
+                let iced: WorkspacesFile = document(root);
+                let gpui = IcedCatalog::read(root).unwrap();
+                let saved = gpui
+                    .workspaces
+                    .iter()
+                    .find(|w| w.name == "Cloud migration")
+                    .unwrap();
+                let from_iced = iced
+                    .workspaces
+                    .iter()
+                    .find(|w| w.name == "Cloud migration")
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    serde_json::to_value(from_iced).unwrap()
+                );
+                assert_eq!(iced.active_workspace, 1);
+                drop(store);
+                std::fs::write(
+                    root.join("workspaces.json"),
+                    serde_json::to_vec_pretty(&iced).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(IcedCatalog::read(root).unwrap().workspaces[1].tabs.len(), 1);
+            },
+        );
+    }
+    #[test]
+    fn resume_skips_a_chat_open_in_a_running_park() {
+        isolated("resume_skips_a_chat_open_in_a_running_park", |root, _| {
+            let key = fixture(root);
+            let mut file = document(root);
+            let tab = file.workspaces[1].tabs[0].clone();
+            file.workspaces[0].active = false;
+            file.workspaces[0].tabs.push(tab);
+            let running = Key {
+                name: file.workspaces[0].name.clone(),
+                dir: file.workspaces[0].dir.clone(),
+            };
+            std::fs::write(
+                root.join("workspaces.json"),
+                serde_json::to_vec(&file).unwrap(),
+            )
+            .unwrap();
+            let store = DesktopStore::open(root).unwrap();
+            let restored = save_live_workspace(
+                &store,
+                LiveWorkspaceAction::Resume {
+                    key,
+                    reopen: false,
+                    open: vec![running],
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(restored.workspace.chats, ["owned"]);
+            assert!(
+                restored
+                    .workspace
+                    .tabs
+                    .iter()
+                    .all(|tab| tab.chat_session_id.is_none())
+            );
+            assert_eq!(restored.workspace.tabs.len(), 1); // Iced's default shell after filtering.
+        });
+    }
+    #[test]
+    fn ambiguous_legacy_identity_never_changes_the_wrong_workspace() {
+        isolated(
+            "ambiguous_legacy_identity_never_changes_the_wrong_workspace",
+            |root, _| {
+                let key = fixture(root);
+                let mut file = document(root);
+                file.workspaces.push(file.workspaces[1].clone());
+                let bytes = serde_json::to_vec(&file).unwrap();
+                std::fs::write(root.join("workspaces.json"), &bytes).unwrap();
+                let store = DesktopStore::open(root).unwrap();
+                assert!(
+                    save_live_workspace(
+                        &store,
+                        LiveWorkspaceAction::Resume {
+                            key,
+                            reopen: false,
+                            open: vec![]
+                        },
+                        None
+                    )
+                    .is_err()
+                );
+                assert_eq!(std::fs::read(root.join("workspaces.json")).unwrap(), bytes);
+                store.drain().wait().unwrap();
+                assert_eq!(std::fs::read(root.join("workspaces.json")).unwrap(), bytes);
+            },
+        );
+    }
+    #[test]
+    fn park_keeps_a_provider_identity_confirmed_after_ui_capture() {
+        isolated(
+            "park_keeps_a_provider_identity_confirmed_after_ui_capture",
+            |root, _| {
+                let key = fixture(root);
+                let mut file = document(root);
+                file.workspaces[1].active = true;
+                file.workspaces[1].tabs[0].session_uid = Some("caller".into());
+                let mut captured = file.workspaces[1].tabs.clone();
+                captured[0].chat_session_id = None;
+                std::fs::write(
+                    root.join("workspaces.json"),
+                    serde_json::to_vec(&file).unwrap(),
+                )
+                .unwrap();
+                let store = DesktopStore::open(root).unwrap();
+                let saved = save_live_workspace(
+                    &store,
+                    LiveWorkspaceAction::Park {
+                        key,
+                        info: Info::new("note", "2026-11-27T00:00:00Z".into()),
+                        done: false,
+                        active_tab: Some(0),
+                        bottom_terminals: file.workspaces[1].bottom_terminals.clone(),
+                        tabs: captured,
+                    },
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    saved.workspace.tabs[0].chat_session_id.as_deref(),
+                    Some("owned")
+                );
+            },
+        );
+    }
+}
+
+/// Called off the UI thread before newly discovered repo controls are published.
+pub(crate) fn persist_auto_repo_joins(
+    desktop: &gitterm_core::desktop_store::DesktopStore,
+    target: gitterm_core::workspace_config::WorkspaceTarget,
+    dirs: Vec<PathBuf>,
+) -> Result<gitterm_core::workspace_config::WorkspacesFile, String> {
+    desktop
+        .try_edit_workspaces(move |file| file.join_discovered_repos(&target, dirs))
+        .wait()
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use gitterm_core::{
+        desktop_store::{DesktopStore, LoadState},
+        workspace_config::{RepoEdit, WorkspaceTarget, WorkspacesFile},
+    };
+
+    fn fixture(root: &Path) -> WorkspacesFile {
+        let file = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[{
+            "name":"Original", "abbrev":"O", "color":"blue", "dir":"/fixture/home", "repos":["/fixture/home"],
+            "tabs":[{"dir":"/fixture/home", "session_uid":"saved-shell"}, {"dir":"/fixture/home", "tab_kind":"agent", "chat_session_id":"saved-chat"}]
+        }]})).unwrap();
+        std::fs::write(
+            root.join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn review_regression_f2_rename_restart_keeps_layout_inventory_and_imported_ids() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let file = fixture(root.path());
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let mut metadata = WorkspaceStore::new(&root.path().join("gpui"));
+        metadata.iced = Some(IcedCatalog::from_document(root.path(), file.clone()));
+        let saved = &file.workspaces[0];
+        let key = metadata.layout_key(saved);
+        let sessions = crate::data::iced_sessions_with_key(saved, &key);
+        let path = crate::layout::workspace_layout_path(&root.path().join("gpui"), &key);
+        let mut layout = crate::layout::LayoutStore::new(path.clone());
+        layout.regions.sidebar_width = 421.;
+        layout.terminals = Some(vec![crate::layout::TerminalSession {
+            id: 777,
+            cwd: "/fixture/extra".into(),
+            startup_command: None,
+            task_id: None,
+            task_session_id: None,
+        }]);
+        layout.save(&Default::default()).unwrap();
+        for name in ["Renamed", "Renamed again"] {
+            let (aliases, receipt) = metadata
+                .prepare_rename_alias(&metadata.iced.as_ref().unwrap().workspaces[0], name)
+                .unwrap()
+                .unwrap();
+            receipt.blocking_recv().unwrap().unwrap();
+            // A concurrent chat metadata save cannot overwrite the alias file.
+            metadata.save(&[]).unwrap();
+            metadata.identity_aliases = aliases;
+            let target = WorkspaceTarget::of(&metadata.iced.as_ref().unwrap().workspaces[0]);
+            let name = name.to_string();
+            let file = desktop
+                .try_edit_workspaces(move |file| file.edit_repo(&target, RepoEdit::Rename(name)))
+                .wait()
+                .unwrap();
+            metadata.iced = Some(IcedCatalog::from_document(root.path(), file));
+        }
+        let mut restarted = WorkspaceStore::new(&root.path().join("gpui"));
+        restarted.load().unwrap();
+        let catalog = IcedCatalog::read(root.path()).unwrap();
+        let renamed = &catalog.workspaces[0];
+        assert_eq!(restarted.layout_key(renamed), key);
+        assert_eq!(
+            crate::data::iced_sessions_with_key(renamed, &restarted.layout_key(renamed))
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            sessions.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        let mut restored = crate::layout::LayoutStore::new(crate::layout::workspace_layout_path(
+            &root.path().join("gpui"),
+            &restarted.layout_key(renamed),
+        ));
+        assert_eq!(restored.load_terminals().unwrap().unwrap()[0].id, 777);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["regions"]["sidebar_width"], 421.);
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("workspaces.json")).unwrap())
+                .unwrap();
+        assert!(wire["workspaces"][0].get("identity_aliases").is_none());
+    }
+
+    #[test]
+    fn review_regression_f7_failed_repo_save_retains_acknowledged_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let file = fixture(root.path());
+        let before = std::fs::read(root.path().join("workspaces.json")).unwrap();
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let no_op = target.clone();
+        desktop
+            .try_edit_workspaces(move |file| file.edit_repo(&no_op, RepoEdit::Rename("  ".into())))
+            .wait()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            before
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = desktop
+            .try_edit_workspaces(move |file| {
+                file.edit_repo(&target, RepoEdit::Rename("Unsaved".into()))
+            })
+            .wait();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        let snapshot = desktop.snapshot().wait().unwrap();
+        assert!(!snapshot.workspaces.dirty);
+        let LoadState::Valid(file) = snapshot.workspaces.loaded else {
+            panic!("expected valid acknowledged document")
+        };
+        assert_eq!(file.workspaces[0].name, "Original");
+        assert_eq!(
+            IcedCatalog::read(root.path()).unwrap().workspaces[0].name,
+            "Original"
+        );
+        desktop.drain().wait().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn review_regression_f8_chat_repo_joins_are_saved_before_command_edit() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let mut file = fixture(root.path());
+        file.workspaces[0]
+            .repos_removed
+            .push("/fixture/removed".into());
+        std::fs::write(
+            root.path().join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let joined = persist_auto_repo_joins(
+            &desktop,
+            target.clone(),
+            vec!["/fixture/joined".into(), "/fixture/removed".into()],
+        )
+        .unwrap();
+        assert!(
+            joined.workspaces[0].repos_added.is_empty(),
+            "automatic joins are not manual pins"
+        );
+        assert!(
+            !joined.workspaces[0]
+                .repos
+                .contains(&"/fixture/removed".into())
+        );
+        assert!(
+            IcedCatalog::read(root.path()).unwrap().workspaces[0]
+                .repos
+                .contains(&"/fixture/joined".into())
+        );
+        desktop
+            .try_edit_workspaces(move |file| {
+                file.edit_repo(
+                    &target,
+                    RepoEdit::RunCommand {
+                        dir: "/fixture/joined".into(),
+                        draft: "placeholder run".into(),
+                    },
+                )
+            })
+            .wait()
+            .unwrap();
+        let disk = IcedCatalog::read(root.path()).unwrap();
+        assert_eq!(
+            disk.repos
+                .iter()
+                .find(|repo| repo.dir == "/fixture/joined")
+                .unwrap()
+                .run_command
+                .as_deref(),
+            Some("placeholder run")
         );
     }
 }

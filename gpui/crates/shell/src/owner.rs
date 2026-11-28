@@ -13,10 +13,13 @@ use std::{
 /// Process/window owner. Dock panels hold read handles only. The executor and
 /// outcome bridge survive every dock close, move, hide and reconstruction.
 pub struct WorkspaceOwner {
+    pub(crate) worktree_operations: crate::pane::git_view::WorktreeOperations,
     /// Startup park metadata blocks PTY construction until explicit resume.
     pub(crate) stopped_workspaces: std::collections::HashSet<crate::data::WorkspaceId>,
+    pub(crate) notifications: Option<crate::notifications::Notifications>,
     pub model: WorkspaceStatus,
     pub error: Option<String>,
+    pub(crate) workspace_save_pending: bool,
     pub(crate) chat_shutdown: Arc<crate::chat::RuntimeShutdown>,
     _chat_quit: Subscription,
     pub(crate) chats: std::collections::HashMap<String, Entity<crate::chat::ChatPane>>,
@@ -184,7 +187,13 @@ impl WorkspaceOwner {
             }
             std::future::ready(())
         });
+        let notifications = crate::chat::policy::is_live(cx).then(|| {
+            tasks.push(crate::notifications::start(cx));
+            crate::notifications::Notifications::new(Instant::now())
+        });
         Self {
+            worktree_operations: Default::default(),
+            notifications,
             stopped_workspaces: Default::default(),
             model,
             files: Default::default(),
@@ -192,6 +201,7 @@ impl WorkspaceOwner {
             file_jobs: Default::default(),
             file_sender,
             error: None,
+            workspace_save_pending: false,
             chats: Default::default(),
             chat_shutdown,
             _chat_quit: chat_quit,
@@ -235,6 +245,52 @@ impl WorkspaceOwner {
             .collect()
     }
 
+    pub(crate) fn layout_key(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> String {
+        self.store
+            .as_ref()
+            .map(|store| store.layout_key(saved))
+            .unwrap_or_else(|| crate::workspace_config::iced_layout_key(saved))
+    }
+    pub(crate) fn iced_sessions(
+        &self,
+        saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> Vec<crate::data::Session> {
+        crate::data::iced_sessions_with_key(saved, &self.layout_key(saved))
+    }
+    pub(crate) fn prepare_rename_alias(
+        &self,
+        target: &gitterm_core::workspace_config::WorkspaceTarget,
+        draft: &str,
+    ) -> anyhow::Result<
+        Option<(
+            crate::workspace_config::IdentityAliases,
+            crate::preview::SaveResult,
+        )>,
+    > {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Workspace store is unavailable"))?;
+        let catalog = store
+            .iced
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Live catalog is unavailable"))?;
+        let file = gitterm_core::workspace_config::WorkspacesFile {
+            workspaces: catalog.workspaces.clone(),
+            ..Default::default()
+        };
+        let index = target.index(&file).map_err(anyhow::Error::msg)?;
+        store.prepare_rename_alias(&file.workspaces[index], draft)
+    }
+    pub(crate) fn install_aliases(&mut self, aliases: crate::workspace_config::IdentityAliases) {
+        if let Some(store) = &mut self.store {
+            store.identity_aliases = aliases;
+        }
+    }
+
     pub(crate) fn iced_workspace(
         &self,
         id: crate::data::WorkspaceId,
@@ -246,6 +302,42 @@ impl WorkspaceOwner {
             .workspaces
             .get(id.0.checked_sub(1)? as usize)
     }
+    /// Refresh the read catalog after the Live desktop owner acknowledges a save.
+    pub(crate) fn apply_desktop_document(
+        &mut self,
+        root: &std::path::Path,
+        file: gitterm_core::workspace_config::WorkspacesFile,
+        cx: &mut Context<Self>,
+    ) {
+        let mut catalog = crate::workspace_config::IcedCatalog::from_document(root, file);
+        if let Some(previous) = self.iced_catalog() {
+            catalog.claims = previous.claims.clone();
+            if previous.workspaces.len() == catalog.workspaces.len() {
+                catalog.order = previous.ordered_indices();
+            }
+            for (old, next) in previous.workspaces.iter().zip(&catalog.workspaces) {
+                if old.name != next.name && old.dir == next.dir {
+                    for chat in self.chats.values() {
+                        chat.update(cx, |chat, _| chat.rebind_live_workspace(old, next));
+                    }
+                }
+            }
+        }
+        for (local, saved) in self.model.workspaces.iter_mut().zip(&catalog.workspaces) {
+            local.status.repo_name = saved.name.clone();
+        }
+        cx.set_global(crate::work_sidebar::IcedWorkSource {
+            config: root.to_path_buf(),
+            workspaces: catalog.workspaces.clone(),
+            repos: catalog.repos.clone(),
+            owner: cx.entity().downgrade(),
+        });
+        if let Some(store) = self.store.as_mut() {
+            store.iced = Some(catalog);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn iced_catalog(&self) -> Option<&crate::workspace_config::IcedCatalog> {
         self.store.as_ref()?.iced.as_ref()
     }
@@ -277,13 +369,100 @@ impl WorkspaceOwner {
         tab: gitterm_core::workspace_config::WorkspaceTabConfig,
         cx: &mut Context<Self>,
     ) {
+        if let Some(desktop) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|s| s.0.clone())
+        {
+            let name = name.to_owned();
+            let dir = dir.to_owned();
+            let tab = tab.clone();
+            let claim = self.iced_catalog().is_some_and(|c| {
+                c.workspaces
+                    .iter()
+                    .position(|w| w.name == name && w.dir == dir)
+                    .is_some_and(|i| c.claims.contains(&i))
+            });
+            let save = desktop.transact_workspaces(move |file| {
+                let mut matches = file
+                    .workspaces
+                    .iter_mut()
+                    .filter(|w| w.name == name && w.dir == dir);
+                let workspace = matches.next().ok_or("Live chat workspace no longer exists")?;
+                if matches.next().is_some() {
+                    return Err("Several saved workspaces have the same name and folder; this workspace cannot be changed in Live.".into());
+                }
+                let uid = tab
+                    .session_uid
+                    .as_deref()
+                    .ok_or("Live chat has no caller identity")?;
+                let id = tab
+                    .chat_session_id
+                    .as_deref()
+                    .ok_or("Live chat has no confirmed provider identity")?;
+                if workspace.tabs.iter().any(|saved| {
+                    saved.chat_session_id.as_deref() == Some(id)
+                        && saved
+                            .session_uid
+                            .as_deref()
+                            .is_some_and(|saved_uid| saved_uid != uid)
+                }) {
+                    return Err("Confirmed Claude session already belongs to another tab".into());
+                }
+                if (claim || !workspace.chats.is_empty())
+                    && let Some(id) = &tab.chat_session_id
+                    && !workspace.chats.contains(id)
+                {
+                    workspace.chats.push(id.clone());
+                }
+                if let Some(saved) = workspace.tabs.iter_mut().find(|t| {
+                    t.session_uid == tab.session_uid
+                        || (t.session_uid.is_none() && t.chat_session_id == tab.chat_session_id)
+                }) {
+                    *saved = tab;
+                } else {
+                    workspace.tabs.push(tab);
+                }
+                let workspace = workspace.clone();
+                Ok(crate::workspace_config::LiveWorkspaceSaved {
+                    workspace,
+                    repos: file.repos.clone(),
+                    closed: file
+                        .workspaces
+                        .iter()
+                        .filter(|w| !w.active)
+                        .cloned()
+                        .collect(),
+                })
+            });
+            let work = cx.background_executor().spawn(async move { save.wait() });
+            cx.spawn(async move |owner, cx| {
+                let result = work.await;
+                let _ = owner.update(cx, |owner, cx| match result {
+                    Ok(saved) => {
+                        owner.publish_workspace(saved, false, cx);
+                    }
+                    Err(error) => {
+                        owner.error = Some(format!("Save confirmed workspace chat: {error}"));
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        let claims = self.iced_catalog().is_some_and(|c| {
+            c.workspaces
+                .iter()
+                .position(|w| w.name == name && w.dir == dir)
+                .is_some_and(|i| c.claims.contains(&i))
+        });
         if let Some(catalog) = self.store.as_mut().and_then(|store| store.iced.as_mut())
             && let Some(workspace) = catalog
                 .workspaces
                 .iter_mut()
                 .find(|workspace| workspace.name == name && workspace.dir == dir)
         {
-            if !workspace.chats.is_empty()
+            if (claims || !workspace.chats.is_empty())
                 && let Some(id) = &tab.chat_session_id
                 && !workspace.chats.contains(id)
             {
@@ -643,4 +822,62 @@ impl EventEmitter<FileOpen> for WorkspaceOwner {}
 struct ReviewWorkers {
     closed: bool,
     jobs: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl WorkspaceOwner {
+    pub(crate) fn resumed_workspace_order(&mut self, id: crate::WorkspaceId) {
+        if let Some(catalog) = self.store.as_mut().and_then(|s| s.iced.as_mut()) {
+            let index = id.0 as usize - 1;
+            catalog.order = catalog.ordered_indices();
+            catalog.order.retain(|&i| i != index);
+            catalog.order.push(index);
+        }
+    }
+    pub(crate) fn publish_workspace(
+        &mut self,
+        saved: crate::workspace_config::LiveWorkspaceSaved,
+        claims_new_chats: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::WorkspaceId> {
+        let catalog = self
+            .store
+            .as_mut()
+            .and_then(|s| s.iced.as_mut())
+            .expect("Live catalog");
+        catalog.order = catalog.ordered_indices();
+        let workspace = saved.workspace;
+        let index = catalog
+            .workspaces
+            .iter()
+            .position(|w| w.name == workspace.name && w.dir == workspace.dir)
+            .unwrap_or(catalog.workspaces.len());
+        let id = crate::WorkspaceId(index as u64 + 1);
+        if claims_new_chats {
+            catalog.claims.insert(index);
+        }
+        if index == catalog.workspaces.len() && workspace.active {
+            let mut single = crate::workspace_config::IcedCatalog::default();
+            single.workspaces.push(workspace.clone());
+            let mut model = WorkspaceStatus::from_iced(&single);
+            let mut local = model.workspaces.remove(0);
+            local.id = id;
+            self.model.workspaces.push(local);
+            catalog.workspaces.push(workspace);
+            catalog.order.push(index);
+        } else if index < catalog.workspaces.len() {
+            catalog.workspaces[index] = workspace;
+        }
+        let id = (index < catalog.workspaces.len()).then_some(id);
+        catalog.closed = saved.closed;
+        catalog.repos = saved.repos;
+        cx.set_global(crate::work_sidebar::IcedWorkSource {
+            config: catalog.source.clone(),
+            workspaces: catalog.workspaces.clone(),
+            repos: catalog.repos.clone(),
+            owner: cx.entity().downgrade(),
+        });
+        self.error = None;
+        cx.notify();
+        id
+    }
 }

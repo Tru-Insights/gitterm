@@ -311,7 +311,7 @@ impl ShellData for LocalData {
                     repositories.extend(saved.repos.iter().filter(|r| **r != home).cloned());
                     return Workspace {
                         id: w.id,
-                        layout_key: crate::workspace_config::iced_layout_key(saved),
+                        layout_key: self.0.read(cx).layout_key(saved),
                         name: saved.name.clone(),
                         status: w.status.branch_name.clone(),
                         repositories,
@@ -334,7 +334,7 @@ impl ShellData for LocalData {
     }
     fn sessions(&self, workspace: WorkspaceId, cx: &App) -> Vec<Session> {
         if let Some(saved) = self.0.read(cx).iced_workspace(workspace) {
-            return iced_sessions(saved);
+            return self.0.read(cx).iced_sessions(saved);
         }
         let model = &self.0.read(cx).model;
         let folder = &model
@@ -352,14 +352,14 @@ impl ShellData for LocalData {
     fn active_session(&self, workspace: WorkspaceId, cx: &App) -> Option<SessionId> {
         let owner = self.0.read(cx);
         let saved = owner.iced_workspace(workspace)?;
-        let sessions = iced_sessions(saved);
+        let sessions = owner.iced_sessions(saved);
         let active = iced_active_tab(saved);
         sessions.get(active).map(|s| s.id)
     }
     fn imported_session(&self, workspace: WorkspaceId, id: SessionId, cx: &App) -> Option<String> {
         let owner = self.0.read(cx);
         let saved = owner.iced_workspace(workspace)?;
-        let sessions = iced_sessions(saved);
+        let sessions = owner.iced_sessions(saved);
         let index = sessions.iter().position(|s| s.id == id)?;
         let dir = saved
             .tabs
@@ -397,7 +397,7 @@ impl ShellData for LocalData {
         {
             return None;
         }
-        let index = iced_sessions(saved).iter().position(|s| s.id == id)?;
+        let index = owner.iced_sessions(saved).iter().position(|s| s.id == id)?;
         saved
             .tabs
             .get(index)
@@ -418,10 +418,16 @@ impl ShellData for LocalData {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn iced_sessions(
     saved: &gitterm_core::workspace_config::WorkspaceConfig,
 ) -> Vec<Session> {
-    let key = crate::workspace_config::iced_layout_key(saved);
+    iced_sessions_with_key(saved, &crate::workspace_config::iced_layout_key(saved))
+}
+pub(crate) fn iced_sessions_with_key(
+    saved: &gitterm_core::workspace_config::WorkspaceConfig,
+    key: &str,
+) -> Vec<Session> {
     let mut sessions: Vec<_> = saved
         .tabs
         .iter()
@@ -892,6 +898,7 @@ impl IcedWorkData {
                     .iter()
                     .find(|repo| Path::new(&repo.dir) == dir && repo.key().is_local())
                     .and_then(|repo| repo.run_command.clone());
+                facts.auto_added.push(dir.clone());
                 facts.repos.push(crate::work_sidebar::RepoFacts {
                     dir,
                     local: true,
@@ -923,7 +930,7 @@ impl IcedWorkData {
             .flat_map(|f| f.documents.iter().cloned())
             .collect();
         let request = documents::ScanRequest {
-            docs_dir: Path::new(&saved.dir).join("docs"),
+            docs_dir: gitterm_core::workspace_config::document_roots(Path::new(&saved.dir)).1,
             written,
             repos: facts.repos.iter().map(|r| r.dir.clone()).collect(),
             task_worktrees,

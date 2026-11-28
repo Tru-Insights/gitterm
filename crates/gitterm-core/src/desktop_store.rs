@@ -145,6 +145,53 @@ impl DesktopStore {
         })
     }
 
+    /// Repo actions publish only after the atomic replacement is acknowledged.
+    pub fn try_edit_workspaces(
+        &self,
+        edit: impl FnOnce(&mut WorkspacesFile) -> Result<(), String> + Send + 'static,
+    ) -> Receipt<WorkspacesFile> {
+        self.transact_workspaces(move |file| {
+            edit(file)?;
+            Ok(file.clone())
+        })
+    }
+
+    /// Save a candidate before publishing it. A rejected edit or failed atomic
+    /// replacement leaves both the owner snapshot and the previous file intact.
+    pub fn transact_workspaces<T: Send + 'static>(
+        &self,
+        edit: impl FnOnce(&mut WorkspacesFile) -> Result<T, String> + Send + 'static,
+    ) -> Receipt<T> {
+        self.submit(move |state, root| {
+            let mut candidate = match &state.workspaces.loaded {
+                LoadState::Missing => WorkspacesFile::default(),
+                LoadState::Valid(document) => document.clone(),
+                LoadState::Refused(error) => return Err(error.clone()),
+            };
+            let result = edit(&mut candidate)?;
+            let unchanged = match &state.workspaces.loaded {
+                LoadState::Valid(previous) => serde_json::to_value(previous)
+                    .and_then(|previous| {
+                        serde_json::to_value(&candidate).map(|next| previous == next)
+                    })
+                    .map_err(|error| format!("compare workspace edit: {error}"))?,
+                _ => false,
+            };
+            // No-op controls must preserve the original serialized bytes too.
+            if unchanged && !state.workspaces.dirty {
+                return Ok(result);
+            }
+            let mut pending = FileState {
+                loaded: LoadState::Valid(candidate),
+                dirty: true,
+                error: None,
+            };
+            save(&mut pending, &root.join("workspaces.json"))?;
+            state.workspaces = pending;
+            Ok(result)
+        })
+    }
+
     pub fn edit_settings(
         &self,
         edit: impl FnOnce(&mut DesktopSettings) + Send + 'static,
@@ -534,6 +581,37 @@ mod tests {
         assert_eq!(
             std::fs::read(temp.path().join("workspaces.json")).unwrap(),
             b"\"saved\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    #[test]
+    fn refused_candidate_leaves_file_and_snapshot_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = br#"{"workspaces":[],"active_workspace":7}"#;
+        std::fs::write(root.path().join("workspaces.json"), bytes).unwrap();
+        let store = DesktopStore::open(root.path()).unwrap();
+        let result = store
+            .transact_workspaces(|file| {
+                file.active_workspace = 99;
+                Err::<(), _>("cancelled candidate".into())
+            })
+            .wait();
+        assert_eq!(result.unwrap_err(), "cancelled candidate");
+        let snapshot = store.snapshot().wait().unwrap();
+        assert!(!snapshot.workspaces.dirty);
+        let LoadState::Valid(file) = snapshot.workspaces.loaded else {
+            panic!("valid file")
+        };
+        assert_eq!(file.active_workspace, 7);
+        store.drain().wait().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            bytes
         );
     }
 }

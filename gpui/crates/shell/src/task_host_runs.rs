@@ -40,6 +40,7 @@ const START_LABEL: &str = "Start delegation";
 pub(crate) enum CodexRequest {
     Review(ReviewDelegationRequest),
     Consult(ConsultDelegationRequest),
+    Rerun(String),
 }
 
 type Outcome = Result<Box<CodexRunOutcome>, RunFailure>;
@@ -72,6 +73,13 @@ impl TaskHostOwner {
                 .review
                 .codex_model;
             let new = match request {
+                CodexRequest::Rerun(id) => {
+                    let chats = super::delivery::delivery_chats(cx);
+                    let delegation =
+                        self.host
+                            .chat_delegation(&chats, identity.target.tab_id, &id)?;
+                    gitterm_core::delegation_state::rerun(delegation, &identity.tab)
+                }
                 CodexRequest::Review(request) => gitterm_core::delegations::review_delegation(
                     &(&request).into(),
                     &identity.tab,

@@ -351,6 +351,7 @@ struct DeferredLive {
 
 pub(crate) struct ChatPane {
     controller: Controller,
+    pub(crate) notification_attention: crate::notifications::ChatAttention,
     deferred_live: Option<DeferredLive>,
     guidelines_status: Option<std::sync::mpsc::Receiver<bool>>,
     live_claim: Option<Arc<provider::ConversationClaim>>,
@@ -373,6 +374,7 @@ pub(crate) struct ChatPane {
     _head_load: Option<gpui::Task<()>>,
     _release: gpui::Subscription,
     _roster_subscription: gpui::Subscription,
+    _delegation_subscription: gpui::Subscription,
     _review_subscription: gpui::Subscription,
     _review_context_load: Option<gpui::Task<()>>,
 }
@@ -430,8 +432,12 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
-            view.set_dismiss_gate(dismiss_gate(controller.live), cx)
+            view.set_dismiss_gate(dismiss_gate(controller.live), cx);
+            if controller.live {
+                view.enable_delegation_actions(cx);
+            }
         });
         let review_subscription = Self::handle_review(&view, saved.cwd.clone(), window, cx);
         let callback = Self::intent_callback(cx.weak_entity());
@@ -473,6 +479,7 @@ impl ChatPane {
         let mut pane = Self {
             controller,
             deferred_live,
+            notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
             live_tab: None,
@@ -491,6 +498,7 @@ impl ChatPane {
             _head_load: None,
             _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
+            _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         };
@@ -516,6 +524,25 @@ impl ChatPane {
             view,
             |_, _, outcome: &gitterm_gpui_chat::model::roster::RosterOutcome, cx| {
                 cx.emit(outcome.clone());
+            },
+        )
+    }
+    fn handle_delegation(view: &Entity<ChatView>, cx: &mut Context<Self>) -> gpui::Subscription {
+        cx.subscribe(
+            view,
+            |pane, _, action: &gitterm_gpui_chat::interactions::TranscriptAction, cx| {
+                let tab_id = pane.target().tab_id;
+                let action = action.clone();
+                // The host may synchronously submit into this pane. Release both
+                // the view and pane updates before asking it to execute the action.
+                cx.defer(move |cx| {
+                    if let Some(host) = cx
+                        .try_global::<crate::task_host::GpuiTaskHost>()
+                        .map(|h| h.0.clone())
+                    {
+                        host.update(cx, |host, cx| host.card_action(tab_id, action, cx));
+                    }
+                });
             },
         )
     }
@@ -625,7 +652,11 @@ impl ChatPane {
                 return Receipt::rejected(error);
             }
         }
+        let sending = matches!(&intent, ChatIntent::Send { .. });
         let (receipt, update) = self.controller.dispatch(intent);
+        if sending && receipt.state == gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted {
+            self.notification_attention.working();
+        }
         self.pending.push(update);
         self.changed(cx);
         receipt
@@ -745,6 +776,7 @@ impl ChatPane {
             view
         });
         let roster_subscription = Self::forward_roster(&view, cx);
+        let delegation_subscription = Self::handle_delegation(&view, cx);
         view.update(cx, |view, cx| {
             view.set_dismiss_gate(dismiss_gate(false), cx)
         });
@@ -752,6 +784,7 @@ impl ChatPane {
         Self {
             controller,
             deferred_live: None,
+            notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
             live_tab: None,
@@ -770,6 +803,7 @@ impl ChatPane {
             _head_load: None,
             _release: cx.on_release(|pane, cx| pane.shutdown_runtime(cx)),
             _roster_subscription: roster_subscription,
+            _delegation_subscription: delegation_subscription,
             _review_subscription: review_subscription,
             _review_context_load: None,
         }
@@ -998,9 +1032,24 @@ impl ChatPane {
         ) {
             crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
         }
+        let attention_event = match &event {
+            RuntimeEvent::Harness(
+                event @ (HarnessEvent::RuntimeRequest { .. }
+                | HarnessEvent::RuntimeRequestResolved { .. }
+                | HarnessEvent::TurnCompleted { .. }
+                | HarnessEvent::Error(_)),
+            ) => Some(event.clone()),
+            _ => None,
+        };
         let previous_settings = self.controller.adapter.state().acknowledged.clone();
         if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
             self.pending.push(update);
+            if let Some(event) = &attention_event {
+                self.notification_attention.event(
+                    event,
+                    self.controller.adapter.state().has_pending_requests(),
+                );
+            }
             self.changed(cx);
         }
         if self.controller.live
@@ -1205,6 +1254,7 @@ enum ShutdownCommand {
     Session(OwnedRuntime),
     Persist(
         Box<resume::LiveTab>,
+        gitterm_core::desktop_store::DesktopStore,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     ),
     Drain(std::sync::mpsc::SyncSender<std::result::Result<(), String>>),
@@ -1227,8 +1277,8 @@ impl RuntimeShutdown {
                                 errors.push(error);
                             }
                         }
-                        ShutdownCommand::Persist(tab, reply) => {
-                            let result = tab.persist().map_err(|error| {
+                        ShutdownCommand::Persist(tab, store, reply) => {
+                            let result = tab.persist(&store).map_err(|error| {
                                 format!("Save confirmed Claude session: {error:#}")
                             });
                             if let Err(error) = &result {
@@ -1314,12 +1364,17 @@ impl Render for ChatPane {
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
-            .children(self.resume_error.clone().map(|error| {
-                div().p_2().child(error).child(
-                    gpui_component::button::Button::new("start-fresh-chat")
-                        .label("Start a fresh chat here")
-                        .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
-                )
+            .children(self.resume_error.as_ref().map(|_| {
+                div()
+                    .id("resume-failure-recovery")
+                    .debug_selector(|| "resume-failure-recovery".into())
+                    .p_2()
+                    .child(
+                        gpui_component::button::Button::new("start-fresh-chat")
+                            .debug_selector(|| "start-fresh-chat".into())
+                            .label("Start a fresh chat here")
+                            .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
+                    )
             }))
     }
 }

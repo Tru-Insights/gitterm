@@ -9,6 +9,7 @@ use std::{path::PathBuf, time::Instant};
 
 pub struct LocalWorkspace {
     pub id: WorkspaceId,
+    pub name: String,
     pub folder: PathBuf,
     pub root: PathBuf,
     pub status: GitStatusState,
@@ -75,6 +76,7 @@ impl WorkspaceStatus {
             .into_owned();
         self.workspaces.push(LocalWorkspace {
             id,
+            name: name.clone(),
             root: folder.clone(),
             folder,
             status: GitStatusState::new(name, false, now),
@@ -90,6 +92,7 @@ impl WorkspaceStatus {
             let folder = PathBuf::from(&saved.dir);
             model.workspaces.push(LocalWorkspace {
                 id: WorkspaceId(index as u64 + 1),
+                name: saved.name.clone(),
                 root: folder.clone(),
                 folder,
                 status: GitStatusState::new(saved.name.clone(), false, now),

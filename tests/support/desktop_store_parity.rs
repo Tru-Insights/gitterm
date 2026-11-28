@@ -229,7 +229,7 @@ fn normalization_is_explicit_and_matches_iced_without_filtering_or_reordering() 
 }
 
 #[test]
-fn unknown_fields_drop_on_mutation_and_no_gpui_fields_appear() {
+fn unknown_fields_survive_live_mutation_and_no_gpui_fields_appear() {
     let temp = tempfile::tempdir().unwrap();
     let mut value = fixture();
     value["future_top"] = json!("unknown");
@@ -246,7 +246,12 @@ fn unknown_fields_drop_on_mutation_and_no_gpui_fields_appear() {
     let saved: Value =
         serde_json::from_slice(&std::fs::read(temp.path().join("workspaces.json")).unwrap())
             .unwrap();
-    assert_eq!(saved, serde_json::to_value(iced).unwrap());
+    // Workspace and tab fields round-trip in both apps (shared core types). Iced's
+    // own top-level type still drops unknown fields, but a Live save keeps them so
+    // a newer Iced's top-level field survives an older GPUI build.
+    let mut expected = serde_json::to_value(iced).unwrap();
+    expected["future_top"] = json!("unknown");
+    assert_eq!(saved, expected);
 }
 
 #[test]
