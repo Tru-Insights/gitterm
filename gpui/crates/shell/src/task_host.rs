@@ -96,6 +96,9 @@ mod delegate;
 mod delivery;
 #[path = "task_host_launch.rs"]
 mod launch;
+#[path = "task_host_panel.rs"]
+mod panel;
+pub(crate) use panel::StopTask;
 #[path = "task_host_runs.rs"]
 mod runs;
 pub(crate) use delivery::forward_turn_ends;
@@ -309,6 +312,7 @@ pub(crate) struct TaskHostOwner {
     fixtures: Vec<PathBuf>,
     /// Creates between their first check and their last save.
     creating: usize,
+    panel_publishing: std::collections::HashSet<String>,
     /// The preview store holds the host's own writes, which a re-seed from
     /// Iced's file would discard.
     wrote: bool,
@@ -362,6 +366,11 @@ pub(crate) struct TaskHostOwner {
 }
 
 impl TaskHostOwner {
+    /// Read the existing Live allowance state for the Usage rail projection.
+    pub(crate) fn chrome_plan_limits(&self) -> Option<&gitterm_core::plan_limits::PlanLimitsFile> {
+        self.plan_limits.as_ref().map(|state| state.file())
+    }
+
     /// Lock, seed, bind, then create the entity. Startup errors fail closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start(config: HostConfig, cx: &mut App) -> Result<Entity<Self>> {
@@ -676,6 +685,7 @@ impl TaskHostOwner {
                 reap_reply: Some(reap_reply),
                 fixtures,
                 creating: 0,
+                panel_publishing: Default::default(),
                 wrote: false,
                 runs: Default::default(),
                 own_delegations: Default::default(),
@@ -720,6 +730,19 @@ impl TaskHostOwner {
             vec![
                 servers.task_mcp.claude_mcp_server(Some(caller)),
                 servers.browser.claude_mcp_server(Some(caller)),
+            ]
+        })
+    }
+
+    pub(crate) fn acp_mcp_servers(
+        &self,
+        caller: &str,
+    ) -> Vec<gitterm_core::harness::acp::AcpMcpServer> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            self.host.issue_caller(caller);
+            vec![
+                servers.task_mcp.acp_mcp_server(Some(caller)),
+                servers.browser.acp_mcp_server(Some(caller)),
             ]
         })
     }
@@ -1321,7 +1344,7 @@ impl TaskHostOwner {
         if !self.host.services().is_preview() {
             self.host.require_issued_caller(caller.as_deref(), label)?;
         }
-        let mutation = TaskMutation::Create(TaskCreate {
+        let input = TaskCreate {
             title: request.title,
             objective: request.objective,
             repository_path: request.repository_path,
@@ -1332,7 +1355,20 @@ impl TaskHostOwner {
                 request.stopping_boundary,
             ),
             origin: TaskCreateOrigin::Control,
-        });
+        };
+        self.begin_create_input(Some(reply), caller, input, label, None)
+    }
+
+    fn begin_create_input(
+        &mut self,
+        reply: Option<TaskControlReply>,
+        caller: Option<String>,
+        input: TaskCreate,
+        label: &'static str,
+        ui_reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+    ) -> Result<PendingCreate, String> {
+        let manual = input.origin == TaskCreateOrigin::Form;
+        let mutation = TaskMutation::Create(input);
         let TaskMutationAction::PrepareTask(input) = self.reduce(mutation, &Default::default())?
         else {
             return Err("task_create: the reducer did not prepare a task".into());
@@ -1359,6 +1395,8 @@ impl TaskHostOwner {
         let authorized = self.authorize_write(label, &targets)?;
         Ok(PendingCreate {
             reply,
+            ui_reply,
+            manual,
             caller,
             label,
             task_id: assembled.task_id,
@@ -1405,7 +1443,7 @@ impl TaskHostOwner {
             if let Some(worker) = &pending.worker {
                 self.cancel_worker_preparation(worker.authority());
             }
-            pending.reply.send(Err(error));
+            pending.respond(Err(error));
             return;
         }
         let request = pending.request.clone();
@@ -1474,7 +1512,11 @@ impl TaskHostOwner {
             timestamp.clone(),
         );
         record.created_by = Some(TaskCreator {
-            kind: TaskCreatorKind::Coordinator,
+            kind: if pending.manual {
+                TaskCreatorKind::Manual
+            } else {
+                TaskCreatorKind::Coordinator
+            },
             session_id: pending.caller.clone(),
             harness_label: None,
             created_at: timestamp,
@@ -1588,7 +1630,7 @@ impl TaskHostOwner {
             Err(error) => Err(error),
         };
         cx.notify();
-        pending.reply.send(result);
+        pending.respond(result);
     }
 
     fn reduce(
@@ -1901,7 +1943,9 @@ impl OpenChat {
 
 /// A create between its first check and its last save.
 struct PendingCreate {
-    reply: TaskControlReply,
+    reply: Option<TaskControlReply>,
+    ui_reply: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>,
+    manual: bool,
     caller: Option<String>,
     label: &'static str,
     request: PrepareTaskWorktreeRequest,
@@ -1919,6 +1963,17 @@ struct PendingCreate {
     /// Set by `delegate_task`: once the worktree is ready its worker is
     /// recorded and launched, instead of answering with the bare task.
     worker: Option<delegate::PendingWorker>,
+}
+
+impl PendingCreate {
+    fn respond(self, result: Result<serde_json::Value, String>) {
+        if let Some(reply) = self.reply {
+            reply.send(result.clone());
+        }
+        if let Some(reply) = self.ui_reply {
+            let _ = reply.send(result);
+        }
+    }
 }
 
 /// The workspace owner's open chat panes; none before the window exists.

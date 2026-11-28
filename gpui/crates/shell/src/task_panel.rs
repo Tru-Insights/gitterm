@@ -4,12 +4,8 @@
 //! `view_task_tab_close_modal`), mounted over the preview task host's seeded
 //! store (H5b B8a).
 //!
-//! Reads work: filters, selection, opening and dismissing the forms, typing,
-//! the worktree inspection behind `Delete worktree…` (read-only git) and the
-//! handoff-prompt clipboard copy. Every write or launch is built as the core
-//! `TaskMutationAction` Iced would run, checked by
-//! `ServiceContext::task_action`, and stops at its preview notice. Nothing
-//! here writes the store, runs a writing git command or starts a process.
+//! Live commands enter core's TaskAuthority and execute on the task host.
+//! Preview retains the same read surfaces and refuses every task write.
 use crate::{task_host::GpuiTaskHost, theme::Palette};
 use gitterm_core::{
     preview::service::{ServiceContext, classify_task_action},
@@ -156,6 +152,7 @@ pub(crate) struct Inputs {
     pub presets: Vec<gitterm_core::settings::AgentPreset>,
     /// The local chat tabs, by provider conversation id (Iced `find_chat_tab`).
     pub open_chats: Vec<OpenChat>,
+    pub conversations: Vec<gitterm_core::task_commands::TaskConversationFact>,
 }
 
 /// An open chat tab and the provider conversation it carries.
@@ -177,7 +174,7 @@ impl Inputs {
             .first()
             .map_or("agent", |preset| preset.name.as_str())
     }
-    fn open_session(&self, task_id: &str) -> Option<&Target> {
+    pub(crate) fn open_session(&self, task_id: &str) -> Option<&Target> {
         self.open_sessions
             .iter()
             .find(|target| target.task_id.as_deref() == Some(task_id))
@@ -618,7 +615,7 @@ pub(crate) enum Write {
 pub(crate) enum TaskPanelOutcome {
     Select(String),
     Back,
-    Review(PathBuf),
+    Review(String),
     Notice(String),
     /// Iced `TaskChildAdd`: the task's session picker.
     Pick(String),
@@ -626,8 +623,6 @@ pub(crate) enum TaskPanelOutcome {
     FocusSession(String),
     /// Focus the open tab (by `session_uid`) carrying a conversation.
     FocusConversation(String),
-    /// Iced `TaskTabStopAndClose`: close the confirmed task session.
-    StopAndClose(Target),
 }
 
 /// Iced `TaskResume` resumes the newest recorded conversation.
@@ -867,23 +862,35 @@ pub(crate) struct TaskPanel {
     pub modal: Option<Modal>,
     /// The latest refusal, where Iced shows `task_ui_error`.
     pub notice: Option<String>,
+    in_flight: std::collections::HashSet<(String, &'static str)>,
 }
 impl EventEmitter<TaskPanelOutcome> for TaskPanel {}
 
-/// A denied action's notice. GPUI only runs preview contexts, which deny
-/// every task write and launch.
-// shortcut: an allowed write is reported, not run; B9–B11 add the executor.
-fn refuse(services: &ServiceContext, action: &TaskMutationAction) -> String {
-    match services.task_action(action, None) {
-        Err(denied) => denied.notice().to_owned(),
-        Ok(()) => format!(
-            "{} · not wired in the GPUI preview",
-            classify_task_action(action).label
-        ),
-    }
+/// UI writes remain read-only even on a fixture-capable Preview host.
+fn refuse(_services: &ServiceContext, action: &TaskMutationAction) -> String {
+    gitterm_core::preview::service::preview_notice(classify_task_action(action).label)
 }
 
 impl TaskPanel {
+    pub(crate) fn task_stopping(&self, task_id: &str) -> bool {
+        self.in_flight.contains(&(task_id.to_owned(), "stop"))
+    }
+
+    fn modal_operation(&self) -> Option<(String, &'static str)> {
+        match &self.modal {
+            Some(Modal::Create(form)) => Some((form.task_id.clone(), "create")),
+            Some(Modal::Publish { task_id, .. }) => Some((task_id.clone(), "publish")),
+            Some(Modal::Delete { task_id, .. }) => Some((task_id.clone(), "delete")),
+            Some(Modal::StopAndClose { target, .. }) => Some((target.session_uid.clone(), "close")),
+            _ => None,
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.modal_operation()
+            .is_some_and(|key| self.in_flight.contains(&key))
+    }
+
     pub(crate) fn modal_open(&self) -> bool {
         self.modal.is_some()
     }
@@ -894,7 +901,9 @@ impl TaskPanel {
     }
 
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.modal = None;
+        if !self.busy() {
+            self.modal = None;
+        }
         cx.notify();
     }
 
@@ -1093,39 +1102,61 @@ impl TaskPanel {
     /// the preview allows it) runs off the UI thread; until it returns the
     /// modal shows `Checking for unsaved work…`.
     pub(crate) fn open_delete(&mut self, task_id: &str, inputs: &Inputs, cx: &mut Context<Self>) {
-        let Some(host) = host(cx) else { return };
-        let Some(store) = host.store().as_ref() else {
+        let Some(owner) = cx.try_global::<GpuiTaskHost>().map(|h| h.0.clone()) else {
             return;
         };
-        let Some(task) = store.get(task_id) else {
-            return;
+        let decided = owner.update(cx, |o, cx| {
+            let mut facts = o.panel_facts(cx);
+            facts
+                .sessions
+                .extend(inputs.open_sessions.iter().map(|target| session::State {
+                    target: target.clone(),
+                    control: session::TurnControl::Terminal,
+                    task_live: true,
+                    last_tab: false,
+                }));
+            o.host_mut()
+                .reduce_mutation(
+                    TaskMutationCommand {
+                        reply: None,
+                        mutation: TaskMutation::InspectDelete {
+                            task_id: task_id.into(),
+                        },
+                    },
+                    &facts,
+                )
+                .action
+        });
+        let inspect = match decided {
+            Ok(action) => action,
+            Err(e) => {
+                self.show_notice(e, cx);
+                return;
+            }
         };
-        let (Some(path), WorkspaceLocationIdentity::Local { directory }) =
-            (task.worktree.path.clone(), &task.workspace.location)
+        let TaskMutationAction::InspectCleanup {
+            repository,
+            path,
+            branch,
+            base_commit,
+            process_running,
+            pull_request_url,
+            ..
+        } = &inspect
         else {
             return;
         };
-        // The core `TaskMutation::InspectDelete` facts: an active lifecycle
-        // or an open session of the task.
-        let context = CleanupContext {
-            process_running: task.lifecycle.is_active() || inputs.open_session(task_id).is_some(),
-            pull_request_url: task.delivery.pr_url.clone(),
-        };
-        let (repository, branch, base_commit) = (
-            directory.clone(),
-            task.branch.clone(),
-            task.base.commit.clone(),
+        let (repository, path, branch, base_commit) = (
+            repository.clone(),
+            path.clone(),
+            branch.clone(),
+            base_commit.clone(),
         );
-        let inspect = TaskMutationAction::InspectCleanup {
-            task_id: task_id.to_owned(),
-            repository: repository.clone(),
-            path: path.clone(),
-            branch: branch.clone(),
-            base_commit: base_commit.clone(),
-            process_running: context.process_running,
-            pull_request_url: context.pull_request_url.clone(),
+        let context = CleanupContext {
+            process_running: *process_running,
+            pull_request_url: pull_request_url.clone(),
         };
-        let (inspection, job) = match host.services().task_action(&inspect, None) {
+        let (inspection, job) = match owner.read(cx).host().services().task_action(&inspect, None) {
             Err(denied) => (Some(Err(denied.notice().to_owned())), gpui::Task::ready(())),
             Ok(()) => {
                 let (id, worktree) = (task_id.to_owned(), path.clone());
@@ -1298,19 +1329,15 @@ impl TaskPanel {
             self.submit_create(cx);
             return;
         }
-        // Iced `TaskTabStopAndClose` for a session the task host launched,
-        // which it can stop; any other still answers the preview notice.
+        // Preserve the test host's existing ability to close a fixture session
+        // it actually launched; ordinary Preview still owns no such process.
         if write == Write::StopAndClose
             && let Some(Modal::StopAndClose { target, .. }) = &self.modal
-            && target.task_session_id.as_deref().is_some_and(|session| {
-                cx.try_global::<GpuiTaskHost>()
-                    .is_some_and(|host| host.0.read(cx).launched_live(session).is_some())
-            })
+            && cx
+                .try_global::<GpuiTaskHost>()
+                .is_some_and(|h| h.0.read(cx).owns_fixture_terminal(target))
         {
-            let target = target.clone();
-            self.modal = None;
-            cx.emit(TaskPanelOutcome::StopAndClose(target));
-            cx.notify();
+            self.write_live(write, inputs, cx);
             return;
         }
         // Iced `resume_task_conversation` focuses the tab of an open conversation.
@@ -1362,6 +1389,10 @@ impl TaskPanel {
     }
 
     fn write_launch(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
+        if host(cx).is_some_and(|h| !h.services().is_preview()) {
+            self.write_live(write, inputs, cx);
+            return;
+        }
         // Without a recorded conversation Iced's Resume opens the picker.
         if let Write::Resume(task_id) = &write
             && host(cx)
@@ -1404,6 +1435,249 @@ impl TaskPanel {
         }
         let notice = refuse(host.services(), &action);
         self.show_notice(notice, cx);
+    }
+
+    fn write_live(&mut self, write: Write, inputs: &Inputs, cx: &mut Context<Self>) {
+        let Some(owner) = cx.try_global::<GpuiTaskHost>().map(|h| h.0.clone()) else {
+            return;
+        };
+        let launch_task = match &write {
+            Write::Launch { task_id, .. }
+            | Write::Resume(task_id)
+            | Write::ResumeConversation { task_id, .. } => Some(task_id),
+            _ => None,
+        };
+        if launch_task.is_some_and(|id| self.task_stopping(id)) {
+            return;
+        }
+        if let Write::Resume(task_id) = &write
+            && owner
+                .read(cx)
+                .host()
+                .store()
+                .as_ref()
+                .and_then(|s| s.get(task_id))
+                .is_some_and(|t| latest_conversation(t).is_none())
+        {
+            cx.emit(TaskPanelOutcome::Pick(task_id.clone()));
+            return;
+        }
+        if let Write::Launch { task_id, preset } = &write {
+            match owner.update(cx, |o, cx| o.launch_from_ui(task_id, *preset, cx)) {
+                Ok(_) => {
+                    self.modal = None;
+                    cx.emit(TaskPanelOutcome::Select(task_id.clone()));
+                    cx.notify();
+                }
+                Err(e) => self.show_notice(e, cx),
+            }
+            return;
+        }
+        let mut mutations = Vec::new();
+        match &write {
+            Write::ArchiveFailed | Write::ArchiveFinished => {
+                if let Some(store) = owner.read(cx).host().store().as_ref() {
+                    // Iced batches every matching task in the workspace, regardless of rail filter.
+                    for task in store
+                        .tasks()
+                        .iter()
+                        .filter(|t| in_workspace(t, &inputs.location))
+                    {
+                        let matches = if write == Write::ArchiveFailed {
+                            task.lifecycle == TaskLifecycle::Failed
+                        } else {
+                            !task.lifecycle.is_active()
+                                && task.lifecycle != TaskLifecycle::Archived
+                                && store.task_worktree_missing(&task.task_id)
+                        };
+                        if matches {
+                            mutations.push(TaskMutation::Close {
+                                task_id: task.task_id.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            Write::Archive(id) => mutations.push(TaskMutation::Close {
+                task_id: id.clone(),
+            }),
+            Write::Stop(id) => mutations.push(TaskMutation::Stop {
+                task_id: id.clone(),
+            }),
+            Write::CancelQueue(id) => mutations.push(TaskMutation::CancelQueue {
+                task_id: id.clone(),
+            }),
+            Write::Publish { task_id, action } => mutations.push(TaskMutation::Publish {
+                task_id: task_id.clone(),
+                action: *action,
+                confirmed: false,
+            }),
+            Write::PublishConfirm => {
+                if let Some(Modal::Publish {
+                    task_id, action, ..
+                }) = &self.modal
+                {
+                    mutations.push(TaskMutation::Publish {
+                        task_id: task_id.clone(),
+                        action: *action,
+                        confirmed: true,
+                    });
+                }
+            }
+            Write::DeleteConfirm => {
+                if let Some(Modal::Delete {
+                    task_id,
+                    path,
+                    inspection: Some(Ok(inspection)),
+                    ..
+                }) = &self.modal
+                {
+                    mutations.push(TaskMutation::DeleteWorktree {
+                        task_id: task_id.clone(),
+                        path: path.clone(),
+                        inspection: inspection.clone(),
+                    });
+                }
+            }
+            Write::Resume(id) => {
+                if let Some(chat_id) = owner
+                    .read(cx)
+                    .host()
+                    .store()
+                    .as_ref()
+                    .and_then(|s| s.get(id))
+                    .and_then(latest_conversation)
+                {
+                    mutations.push(TaskMutation::ResumeConversation {
+                        task_id: id.clone(),
+                        chat_id: chat_id.into(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    });
+                }
+            }
+            Write::ResumeConversation { task_id, chat_id } => {
+                mutations.push(TaskMutation::ResumeConversation {
+                    task_id: task_id.clone(),
+                    chat_id: chat_id.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                })
+            }
+            Write::StopAndClose => {
+                if let Some(Modal::StopAndClose { target, .. }) = &self.modal {
+                    mutations.push(TaskMutation::CloseSession {
+                        target: target.clone(),
+                        confirmed: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+        for mutation in mutations {
+            let key = match &mutation {
+                TaskMutation::Close { task_id } => (task_id.clone(), "archive"),
+                TaskMutation::Stop { task_id } => (task_id.clone(), "stop"),
+                TaskMutation::CancelQueue { task_id } => (task_id.clone(), "cancel"),
+                TaskMutation::Publish { task_id, .. } => (task_id.clone(), "publish"),
+                TaskMutation::DeleteWorktree { task_id, .. } => (task_id.clone(), "delete"),
+                TaskMutation::ResumeConversation { task_id, .. } => (task_id.clone(), "resume"),
+                TaskMutation::CloseSession { target, .. } => (target.session_uid.clone(), "close"),
+                _ => unreachable!("panel mutation"),
+            };
+            if self.in_flight.contains(&key) {
+                continue;
+            }
+
+            let archive_id = match &mutation {
+                TaskMutation::Close { task_id } => Some(task_id.clone()),
+                _ => None,
+            };
+            let action = owner.update(cx, |o, cx| {
+                let mut facts = o.panel_facts(cx);
+                facts
+                    .sessions
+                    .extend(inputs.open_sessions.iter().map(|target| session::State {
+                        target: target.clone(),
+                        control: session::TurnControl::Terminal,
+                        task_live: true,
+                        last_tab: false,
+                    }));
+                facts.conversations = inputs.conversations.clone();
+                o.panel_resume_facts(&mutation, &mut facts);
+                o.host_mut()
+                    .reduce_mutation(
+                        TaskMutationCommand {
+                            reply: None,
+                            mutation,
+                        },
+                        &facts,
+                    )
+                    .action
+            });
+            let action = match action {
+                Ok(a) => a,
+                Err(error) => {
+                    let error = if let Some(task_id) = archive_id {
+                        match owner.read(cx).host().store().as_ref() {
+                            None => "GitTerm's task store is unavailable".into(),
+                            Some(store) if store.get(&task_id).is_none() => format!(
+                                "failed to archive task store {}: task {task_id} does not exist",
+                                store.path().display()
+                            ),
+                            Some(store) => format!(
+                                "failed to replace task store {}: {error}",
+                                store.path().display()
+                            ),
+                        }
+                    } else {
+                        error
+                    };
+                    self.show_notice(error, cx);
+                    continue;
+                }
+            };
+            if matches!(action, TaskMutationAction::None) {
+                continue;
+            }
+            if let TaskMutationAction::ConfirmPublish { task_id, action } = action {
+                self.modal = Some(Modal::Publish {
+                    task_id,
+                    action,
+                    error: None,
+                });
+                cx.notify();
+                continue;
+            }
+            let archived_selected = match &action {
+                TaskMutationAction::ArchiveTask { task_id } => {
+                    inputs.selected.as_deref() == Some(task_id)
+                }
+                _ => false,
+            };
+            match owner.update(cx, |o, cx| o.execute_panel_action(action, cx)) {
+                Ok(job) => {
+                    self.in_flight.insert(key.clone());
+                    if archived_selected {
+                        cx.emit(TaskPanelOutcome::Back);
+                    }
+                    cx.notify();
+                    cx.spawn(async move |panel, cx| {
+                        let result = job.await;
+                        _ = panel.update(cx, |panel, cx| {
+                            panel.in_flight.remove(&key);
+                            if let Err(error) = result {
+                                panel.show_notice(error, cx);
+                            } else if panel.modal_operation().as_ref() == Some(&key) {
+                                panel.modal = None;
+                                panel.notice = None;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                Err(error) => self.show_notice(error, cx),
+            }
+        }
     }
 
     /// Iced `TaskCreateSubmit`: the form's raw values, as Iced sends them.
@@ -1449,29 +1723,62 @@ impl TaskPanel {
             self.show_notice("The task store is unavailable".into(), cx);
             return;
         }
-        // Create reads no facts; Iced's facts concern sessions and paths.
-        let decided = owner.update(cx, |owner, _| {
-            owner
-                .host_mut()
-                .reduce_mutation(
-                    TaskMutationCommand {
-                        reply: None,
-                        mutation: TaskMutation::Create(input),
-                    },
-                    &TaskMutationFacts::default(),
-                )
-                .action
-        });
-        match decided {
-            Ok(action) => {
-                let notice = refuse(owner.read(cx).host().services(), &action);
-                self.show_notice(notice, cx);
+        if !owner.read(cx).host().services().is_preview() {
+            let task_id = match &self.modal {
+                Some(Modal::Create(form)) => form.task_id.clone(),
+                _ => return,
+            };
+            let key = (task_id.clone(), "create");
+            if self.in_flight.contains(&key) {
+                return;
             }
-            Err(error) => {
-                if let Some(Modal::Create(form)) = &mut self.modal {
-                    form.error = Some(error);
+            match owner.update(cx, |owner, cx| owner.create_from_panel(input, task_id, cx)) {
+                Ok(reply) => {
+                    self.in_flight.insert(key.clone());
+                    cx.notify();
+                    cx.spawn(async move |panel, cx| {
+                        let result = reply.await.unwrap_or_else(|_| {
+                            Err("The task host closed before task creation completed".into())
+                        });
+                        _ = panel.update(cx, |panel, cx| {
+                            panel.in_flight.remove(&key);
+                            match result {
+                                Ok(_) if panel.modal_operation().as_ref() == Some(&key) => {
+                                    panel.modal = None
+                                }
+                                Ok(_) => {}
+                                Err(error) => panel.show_notice(error, cx),
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
                 }
-                cx.notify();
+                Err(error) => self.show_notice(error, cx),
+            }
+        } else {
+            let decided = owner.update(cx, |owner, _| {
+                owner
+                    .host_mut()
+                    .reduce_mutation(
+                        TaskMutationCommand {
+                            reply: None,
+                            mutation: TaskMutation::Create(input),
+                        },
+                        &TaskMutationFacts::default(),
+                    )
+                    .action
+            });
+            match decided {
+                Ok(action) => {
+                    self.show_notice(refuse(owner.read(cx).host().services(), &action), cx)
+                }
+                Err(error) => {
+                    if let Some(Modal::Create(form)) = &mut self.modal {
+                        form.error = Some(error);
+                    }
+                    cx.notify();
+                }
             }
         }
     }
@@ -1813,12 +2120,12 @@ pub(crate) fn overview_view(
             Verb::GoToSession(session) => ghost("task-go-to-session", "Go to session")
                 .on_click(emit(TaskPanelOutcome::FocusSession(session))),
             Verb::ReviewChanges => {
-                let review = task.worktree.path.clone();
+                let review = id;
                 let panel = panel.clone();
                 ghost("task-review-changes", "Review changes").on_click(move |_, _, cx| {
-                    if let Some(path) = review.clone() {
-                        panel.update(cx, |_, cx| cx.emit(TaskPanelOutcome::Review(path)));
-                    }
+                    panel.update(cx, |_, cx| {
+                        cx.emit(TaskPanelOutcome::Review(review.clone()))
+                    });
                 })
             }
             Verb::PushBranch => {
@@ -2143,11 +2450,14 @@ pub(crate) fn modal_view(
     };
     let dismiss = |id: &'static str, label: &'static str| {
         let panel = panel.clone();
-        ghost(id, label).on_click(move |_, _, cx| panel.update(cx, |panel, cx| panel.dismiss(cx)))
+        ghost(id, label)
+            .disabled(state.busy())
+            .on_click(move |_, _, cx| panel.update(cx, |panel, cx| panel.dismiss(cx)))
     };
     let confirm = |id: &'static str, label: String, write: Write| {
         let (panel, inputs) = (panel.clone(), inputs.clone());
         ghost(id, label)
+            .disabled(state.busy())
             .text_color(rgb(p.red))
             .on_click(move |_, _, cx| {
                 panel.update(cx, |panel, cx| panel.write(write.clone(), &inputs, cx))
@@ -2285,7 +2595,11 @@ pub(crate) fn modal_view(
                 buttons()
                     .child(dismiss("task-delete-keep", "Keep worktree"))
                     .children(label.map(|label| {
-                        confirm("task-delete-confirm", label.into(), Write::DeleteConfirm)
+                        confirm(
+                            "task-delete-confirm",
+                            if state.busy() { "Deleting…" } else { label }.into(),
+                            Write::DeleteConfirm,
+                        )
                     })),
             );
         }
@@ -2347,6 +2661,7 @@ fn create_form(
     p: &Palette,
     cx: &App,
 ) -> Vec<gpui::AnyElement> {
+    let busy = panel.read(cx).busy();
     let label = |text: &'static str| div().text_size(px(10.)).text_color(muted(p)).child(text);
     let field = |text: &'static str, selector: &'static str, input: &Entity<InputState>| {
         div()
@@ -2357,7 +2672,7 @@ fn create_form(
             .child(
                 div()
                     .debug_selector(move || selector.into())
-                    .child(Input::new(input).small()),
+                    .child(Input::new(input).small().disabled(busy)),
             )
     };
     let issue = form.issue.read(cx).value().trim().to_owned();
@@ -2487,10 +2802,20 @@ fn create_form(
             .gap(px(8.))
             .child(
                 ghost("task-create-cancel", "Cancel")
+                    .disabled(busy)
                     .on_click(move |_, _, cx| cancel.update(cx, |panel, cx| panel.dismiss(cx))),
             )
             .child(
-                ghost("task-create-submit", "Create task").on_click(move |_, _, cx| {
+                ghost(
+                    "task-create-submit",
+                    if busy {
+                        "Checking repository…"
+                    } else {
+                        "Create task"
+                    },
+                )
+                .disabled(busy)
+                .on_click(move |_, _, cx| {
                     let (panel, inputs) = &submit;
                     panel.update(cx, |panel, cx| panel.write(Write::CreateSubmit, inputs, cx))
                 }),
@@ -2525,8 +2850,8 @@ impl crate::Shell {
                     }
                     // Iced lands on a task tab with Git Changes; the preview opens
                     // the worktree's review, a read.
-                    TaskPanelOutcome::Review(checkout) => {
-                        shell.open_work_review(checkout.clone(), false, window, cx)
+                    TaskPanelOutcome::Review(task_id) => {
+                        shell.review_task_changes(task_id, window, cx)
                     }
                     TaskPanelOutcome::Notice(notice) => shell.owner.update(cx, |owner, cx| {
                         owner.error = Some(notice.clone());
@@ -2539,9 +2864,6 @@ impl crate::Shell {
                     TaskPanelOutcome::FocusConversation(uid) => {
                         shell.focus_open_session(uid, window, cx)
                     }
-                    TaskPanelOutcome::StopAndClose(target) => {
-                        shell.close_target_with(target, true, window, cx)
-                    }
                 }
             },
         );
@@ -2550,9 +2872,213 @@ impl crate::Shell {
         if let Some(host) = cx.try_global::<GpuiTaskHost>().map(|host| host.0.clone()) {
             self._subscriptions
                 .push(cx.observe(&host, |_, _, cx| cx.notify()));
+            self._subscriptions.push(cx.subscribe_in(
+                &host,
+                window,
+                |shell, _, stop: &crate::task_host::StopTask, window, cx| {
+                    shell.stop_panel_task(stop.clone(), window, cx);
+                },
+            ));
         }
         self.task_panel = Some(panel.clone());
         panel
+    }
+
+    fn stop_panel_task(
+        &mut self,
+        mut stop: crate::task_host::StopTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending {
+            cx.spawn_in(window, async move |shell, cx| {
+                loop {
+                    if !shell
+                        .read_with(cx, |s, cx| s.owner.read(cx).workspace_save_pending)
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(10))
+                        .await;
+                }
+                _ = shell.update_in(cx, |shell, window, cx| {
+                    shell.stop_panel_task(stop, window, cx)
+                });
+            })
+            .detach();
+            return;
+        }
+        if stop.targets.is_empty() {
+            let result = cx
+                .try_global::<GpuiTaskHost>()
+                .map(|h| h.0.clone())
+                .ok_or_else(|| "The task host closed before Stop completed".to_owned())
+                .and_then(|host| {
+                    host.update(cx, |o, cx| o.panel_stop_completed(&stop.task_id, cx))
+                });
+            stop.complete(result);
+            return;
+        }
+        let target = stop.targets.remove(0);
+        let replacement = self
+            .workspaces
+            .iter()
+            .find(|state| {
+                state.sessions.len() == 1
+                    && state
+                        .panes
+                        .values()
+                        .any(|p| p.read(cx).session.as_ref() == Some(&target))
+            })
+            .map(|state| {
+                (
+                    state.workspace.id,
+                    self.data.terminal_cwd(state.workspace.id, cx),
+                )
+            });
+        if let Some((workspace, cwd)) = replacement {
+            let previous = self.active_workspace(cx);
+            self.select_workspace_id(workspace, window, cx);
+            self.new_terminal_launch(crate::DockPlacement::Center, cwd, None, window, cx);
+            if let Some(previous) = previous {
+                self.select_workspace_id(previous, window, cx);
+            }
+        }
+        self.close_target_with(&target, true, window, cx);
+        cx.spawn_in(window, async move |shell, cx| {
+            loop {
+                let pending = shell
+                    .read_with(cx, |shell, cx| shell.owner.read(cx).workspace_save_pending)
+                    .unwrap_or(false);
+                if !pending {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(10))
+                    .await;
+            }
+            _ = shell.update_in(cx, |shell, window, cx| {
+                if shell
+                    .find_open_session(|current| current == &target, cx)
+                    .is_none()
+                {
+                    shell.stop_panel_task(stop, window, cx);
+                } else {
+                    stop.complete(Err("The task session could not be closed".into()));
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn sync_task_git_changes(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let task = self
+            .active(cx)
+            .active_session
+            .and_then(|id| self.session_task(id, cx));
+        let root = task
+            .as_deref()
+            .and_then(|id| host(cx)?.store().as_ref()?.get(id)?.worktree.path.clone())
+            .or_else(|| {
+                let id = self.active(cx).active_session?;
+                self.owner
+                    .read(cx)
+                    .model
+                    .session_contexts
+                    .get(&id)
+                    .map(|tab| tab.panel_root())
+            })
+            .or_else(|| self.active_repo_dir(workspace, cx));
+        let Some(root) = root else {
+            return;
+        };
+        if self
+            .owner
+            .read(cx)
+            .model
+            .workspaces
+            .iter()
+            .any(|w| w.id == workspace && w.root != root)
+        {
+            self.owner.update(cx, |owner, cx| {
+                owner.dispatch(
+                    crate::workspace_status::Intent::ContextChanged { workspace, root },
+                    std::time::Instant::now(),
+                    cx,
+                )
+            });
+        }
+    }
+
+    fn review_task_changes(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if host(cx).is_some_and(|h| h.services().is_preview()) {
+            if let Some(panel) = &self.task_panel {
+                panel.update(cx, |p, cx| {
+                    p.show_notice("Launch session · not available in preview".into(), cx)
+                });
+            }
+            return;
+        }
+        let inputs = self.task_inputs(cx);
+        if let Some(target) = inputs.open_session(task_id) {
+            self.focus_open_session(&target.session_uid, window, cx);
+        } else if let Some(owner) = cx.try_global::<GpuiTaskHost>().map(|h| h.0.clone()) {
+            match owner.update(cx, |o, cx| o.launch_from_ui(task_id, None, cx)) {
+                Ok(_) => {}
+                Err(e) => {
+                    self.owner.update(cx, |o, cx| {
+                        o.error = Some(e);
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        }
+        self.selected_task = Some(task_id.into());
+        self.remember_context(Some(task_id.into()));
+        self.sync_task_git_changes(cx);
+        // The adopted task tab restores its own sidebar state; apply the
+        // explicit Review action again after focusing it below.
+        self.show_task_git_changes(cx);
+        let task_id = task_id.to_owned();
+        cx.spawn_in(window, async move |shell, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::ZERO)
+                .await;
+            _ = shell.update_in(cx, |s, window, cx| {
+                if let Some(target) = s.task_inputs(cx).open_session(&task_id).cloned() {
+                    s.focus_open_session(&target.session_uid, window, cx);
+                    s.sync_task_git_changes(cx);
+                    s.show_task_git_changes(cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn show_task_git_changes(&mut self, cx: &mut Context<Self>) {
+        self.update_regions(
+            |r| {
+                r.sidebar_mode = crate::layout::SidebarMode::Git;
+                r.sidebar_collapsed = false;
+            },
+            cx,
+        );
+        let id = format!("workspace-{}-git", self.active(cx).workspace.layout_key);
+        if let Some(git) = self
+            .active(cx)
+            .panes
+            .get(&id)
+            .and_then(|p| p.read(cx).git.clone())
+        {
+            git.update(cx, |git, cx| git.show_changes(cx));
+        }
     }
 
     /// A rail row, archived ones included: the rail lists the active
@@ -2802,11 +3328,12 @@ impl crate::Shell {
                     .panes
                     .get(&crate::session_pane_id(session.id))?
                     .read(cx);
-                let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
-                    return None;
-                };
+                let chat_id = match &pane.content {
+                    crate::pane::PaneContent::PreviewChat(view) => view.read(cx).chat_session_id(),
+                    _ => pane.chat_session_id.clone(),
+                }?;
                 Some(OpenChat {
-                    chat_id: view.read(cx).chat_session_id()?,
+                    chat_id,
                     target: pane.session.clone()?,
                 })
             })
@@ -2818,6 +3345,29 @@ impl crate::Shell {
                 .and_then(|_| self.active_repo_dir(workspace, cx)),
             presets: self.agent_presets.clone(),
             open_chats,
+            conversations: self
+                .work_sidebars
+                .iter()
+                .flat_map(|(workspace, sidebar)| {
+                    let remote = self
+                        .owner
+                        .read(cx)
+                        .iced_workspace(*workspace)
+                        .is_some_and(|w| {
+                            matches!(
+                                w.location,
+                                Some(WorkspaceLocationConfig::RemoteAgent { .. })
+                            )
+                        });
+                    sidebar.read(cx).indexed_chats().iter().map(move |entry| {
+                        gitterm_core::task_commands::TaskConversationFact {
+                            chat_id: entry.id.clone(),
+                            cwd: entry.cwd.clone(),
+                            remote,
+                        }
+                    })
+                })
+                .collect(),
             workspace_name: state.workspace.name.clone(),
             location,
             selected: self.selected_task.clone(),

@@ -41,6 +41,28 @@ pub enum WakeReason {
     Failed,
 }
 
+impl WakeReason {
+    pub fn for_attention(reason: crate::attention::AttentionReason) -> Option<Self> {
+        use crate::attention::AttentionReason;
+        match reason {
+            AttentionReason::HumanInputRequired => Some(Self::NeedsYou),
+            AttentionReason::CompletedUnread => Some(Self::Finished),
+            AttentionReason::AgentFailed => Some(Self::Failed),
+            AttentionReason::DelegationReady(_)
+            | AttentionReason::DelegationFailed(_)
+            | AttentionReason::DelegationBlocked(_) => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs you",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Workspace incarnation and its exact current tab bindings. A workspace stop
 /// bypasses the per-tab Close policy, which would protect its last ordinary tab.
 #[derive(Debug, Clone, PartialEq, Eq)]

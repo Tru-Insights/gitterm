@@ -653,7 +653,7 @@ impl TaskHostOwner {
         prepared: Result<PreparedTaskWorktree, String>,
         cx: &mut Context<Self>,
     ) {
-        let reply = pending.reply.clone();
+        let reply = pending.reply.clone().expect("worker control reply");
         if !self.continues("worker prepared") {
             self.cancel_worker_preparation(worker.authority);
             return reply.send(Err(SHUT_DOWN.to_string()));

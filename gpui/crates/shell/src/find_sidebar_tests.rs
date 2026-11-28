@@ -100,7 +100,7 @@ fn chats(rows: Vec<Row>) -> Vec<ChatRow> {
     rows.into_iter()
         .filter_map(|row| {
             if let Row::Chat(row) = row {
-                Some(row)
+                Some(*row)
             } else {
                 None
             }
@@ -914,6 +914,7 @@ fn n13b_summary_folds_match_iced_limits_and_files_emit_local_open(cx: &mut TestA
                         .join("\n"),
                 ),
                 files: vec!["src/main.rs".into()],
+                ..Summary::default()
             },
         },
     );
@@ -967,11 +968,13 @@ fn n12_and_n13d_workspace_and_waiting_actions_are_notice_only(cx: &mut TestAppCo
     let (mut state, mut facts) = fixture();
     facts.workspaces = vec![
         WorkspaceFacts {
+            id: 1,
             name: "Owner".into(),
             chats: vec!["first".into()],
             open: true,
         },
         WorkspaceFacts {
+            id: 1,
             name: "Other".into(),
             chats: vec![],
             open: true,
@@ -1507,6 +1510,7 @@ fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppCont
             preview_state(&mut state, id.clone(), ChatPreview::default().into());
             v.facts.running_remote = if remote { vec![id] } else { vec![] };
             v.facts.workspaces = vec![WorkspaceFacts {
+                id: 1,
                 name: "Target".into(),
                 chats: vec![],
                 open: true,
@@ -1533,7 +1537,11 @@ fn n10_n11_and_n12b_child_controls_emit_exact_notice_labels(cx: &mut TestAppCont
 #[gpui::test]
 fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
     let _test_app = crate::test_app::Cleanup::new(cx);
-    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][0]["dir"] = serde_json::json!(directory.path());
+        file["workspaces"][0]["tabs"][0]["dir"] = serde_json::json!(directory.path());
+    });
     let id = format!(
         "unopened-{}",
         root.path()
@@ -1553,7 +1561,11 @@ fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
             load(
                 &mut shell.find_state.borrow_mut(),
                 None,
-                vec![chat(&id, "/fixture/folder", ChatBackend::Claude)],
+                vec![chat(
+                    &id,
+                    directory.path().to_str().unwrap(),
+                    ChatBackend::Claude,
+                )],
             );
             let before = shell.active(cx).sessions.len();
             let owner = shell.find_owner(cx);
@@ -1580,4 +1592,638 @@ fn live_find_mounts_unopened_chat_and_work_reuses_it(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn find_sidebar_remote_resume_keeps_machine_routing_without_local_directory_checks(
+    cx: &mut TestAppContext,
+) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][1]["location"] = serde_json::json!({
+            "kind":"remote_agent", "remote_id":"placeholder-remote",
+            "workspace_id":"placeholder", "root":"/remote/placeholder"
+        });
+    });
+    cx.update(|window, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "remote-find-resume-test",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap();
+        shell.update(cx, |shell, cx| {
+            let owner = shell.find_owner(cx);
+            for (machine, expected) in [
+                (
+                    "placeholder-missing",
+                    "Open a workspace on this remote machine",
+                ),
+                (
+                    "placeholder-remote",
+                    "No remote agent named placeholder-remote",
+                ),
+            ] {
+                let id = ChatRef {
+                    remote_id: Some(machine.into()),
+                    id: "placeholder-chat".into(),
+                };
+                load(
+                    &mut shell.find_state.borrow_mut(),
+                    id.remote_id.clone(),
+                    vec![chat(
+                        &id.id,
+                        "/remote/placeholder/absent",
+                        ChatBackend::Claude,
+                    )],
+                );
+                shell.find_outcome(
+                    &owner,
+                    &FindOutcome::Resume {
+                        id,
+                        mode: ResumeMode::Chat,
+                    },
+                    window,
+                    cx,
+                );
+                let error = shell.owner.read(cx).error.as_deref().unwrap();
+                assert!(error.contains(expected), "{error}");
+            }
+        });
+    });
+}
+
+#[gpui::test]
+fn find_sidebar_live_resume_buttons_and_owner_emit_actions(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "find-controls",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let (mut state, mut facts) = fixture();
+    facts.workspaces = vec![WorkspaceFacts {
+        id: 1,
+        name: "Owner".into(),
+        chats: vec!["first".into()],
+        open: true,
+    }];
+    preview_state(
+        &mut state,
+        ChatRef::local("first"),
+        ChatPreview::default().into(),
+    );
+    let (window_root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = window_root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1400.)));
+    click("find-preview-action-0", cx);
+    click("find-preview-action-1", cx);
+    click("find-workspace-owner", cx);
+    view.update(cx, |view, cx| {
+        let mut dead = chat("first", "/tmp/deleted", ChatBackend::Claude);
+        dead.dead_cwd = true;
+        let mut state = view.state.borrow_mut();
+        state.reduce(Intent::SourceChanged(None));
+        load(&mut state, None, vec![dead]);
+        preview_state(
+            &mut state,
+            ChatRef::local("first"),
+            ChatPreview::default().into(),
+        );
+        cx.notify();
+    });
+    click("find-preview-action-0", cx);
+    assert_eq!(
+        *events.borrow(),
+        [
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::Session
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::Chat
+            },
+            FindOutcome::GoToChatOwner {
+                id: ChatRef::local("first")
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("first"),
+                mode: ResumeMode::RecreateDirectory
+            },
+        ]
+    );
+}
+
+#[gpui::test]
+fn find_sidebar_preview_refuses_resume_owner_and_index_without_writes(cx: &mut TestAppContext) {
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    let before = std::fs::read(root.path().join("iced/workspaces.json")).unwrap();
+    shell.update_in(cx, |shell, window, cx| {
+        let sessions: usize = shell.workspaces.iter().map(|w| w.sessions.len()).sum();
+        let owner = shell.find_owner(cx);
+        for action in [
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::Session,
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::Chat,
+            },
+            FindOutcome::Resume {
+                id: ChatRef::local("saved-chat"),
+                mode: ResumeMode::RecreateDirectory,
+            },
+            FindOutcome::GoToChatOwner {
+                id: ChatRef::local("saved-chat"),
+            },
+            FindOutcome::IndexOlderChats,
+        ] {
+            shell.find_outcome(&owner, &action, window, cx);
+            assert!(
+                shell
+                    .owner
+                    .read(cx)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not available in preview")
+            );
+            assert_eq!(
+                shell
+                    .workspaces
+                    .iter()
+                    .map(|w| w.sessions.len())
+                    .sum::<usize>(),
+                sessions
+            );
+        }
+    });
+    assert_eq!(
+        std::fs::read(root.path().join("iced/workspaces.json")).unwrap(),
+        before
+    );
+    assert!(!root.path().join("iced/chat-meta").exists());
+}
+
+#[gpui::test]
+fn find_sidebar_live_index_control_emits_index(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "find-index-control",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let (state, facts) = fixture();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            FindSidebar::new(
+                Rc::new(RefCell::new(state)),
+                "tab".into(),
+                facts,
+                window,
+                cx,
+            )
+        });
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindSidebar>().unwrap()
+    });
+    let events = Rc::new(RefCell::new(vec![]));
+    cx.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(&view, move |_, outcome: &FindOutcome, _| {
+            events.borrow_mut().push(outcome.clone())
+        })
+        .detach();
+    });
+    click("find-backfill", cx);
+    assert_eq!(*events.borrow(), [FindOutcome::IndexOlderChats]);
+}
+
+pub(crate) fn load_local_fixture(state: &mut State, id: &str, title: &str) {
+    let mut entry = chat(id, "/fixture/folder", ChatBackend::Claude);
+    entry.title = title.into();
+    load(state, None, vec![entry]);
+}
+
+#[gpui::test]
+fn remaining_find_workspace_picker_emits_live_make_and_add_coordinator(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let root = tempfile::tempdir_in("/private/tmp").unwrap();
+    cx.update(|cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                root.path(),
+                "remaining-find-controls",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let (mut state, mut facts) = fixture();
+    facts.workspaces = vec![WorkspaceFacts {
+        id: 7,
+        name: "Target".into(),
+        chats: vec![],
+        open: true,
+    }];
+    preview_state(
+        &mut state,
+        ChatRef::local("first"),
+        ChatPreview::default().into(),
+    );
+    let (root_view, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|_| FindPreview::new(Rc::new(RefCell::new(state)), "tab".into(), facts));
+        gpui_component::Root::new(view, window, cx)
+    });
+    let view = root_view.read_with(cx, |root, _| {
+        root.view().clone().downcast::<FindPreview>().unwrap()
+    });
+    let events = observe_preview(&view, cx);
+    cx.simulate_resize(gpui::size(px(1000.), px(1400.)));
+    click("find-workspace-make", cx);
+    assert_eq!(
+        events.borrow().last(),
+        Some(&FindOutcome::MakeWorkspace {
+            id: ChatRef::local("first")
+        })
+    );
+    view.update(cx, |view, cx| {
+        let mut entry = chat("child", "/fixture", ChatBackend::Claude);
+        entry.root_id = Some("first".into());
+        let mut state = view.state.borrow_mut();
+        state.reduce(Intent::SourceChanged(None));
+        load(&mut state, None, vec![entry]);
+        preview_state(
+            &mut state,
+            ChatRef::local("child"),
+            ChatPreview::default().into(),
+        );
+        cx.notify();
+    });
+    click("find-workspace-add", cx);
+    click("find-workspace-target-7", cx);
+    assert_eq!(
+        events.borrow().last(),
+        Some(&FindOutcome::AddToWorkspace {
+            id: ChatRef::local("child"),
+            workspace: 7
+        })
+    );
+}
+
+#[gpui::test]
+fn remaining_find_add_coordinator_live_saved_json_matches_iced_and_preview_refuses(
+    cx: &mut TestAppContext,
+) {
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][0]["future_workspace"] = true.into();
+        file["workspaces"][1]["tabs"][1]["session_uid"] = "coordinator-tab".into();
+        file["workspaces"][1]["tabs"][1]["future_tab"] = "keep".into();
+    });
+    let path = root.path().join("iced/workspaces.json");
+    let before = std::fs::read(&path).unwrap();
+    let request = FindOutcome::AddToWorkspace {
+        id: ChatRef::local("child"),
+        workspace: 1,
+    };
+    cx.update(|window, cx| {
+        shell.update(cx, |s, cx| {
+            let mut entry = chat("child", "/fixture/work", ChatBackend::Claude);
+            entry.root_id = Some("saved-chat".into());
+            load(&mut s.find_state.borrow_mut(), None, vec![entry]);
+            let owner = s.find_owner(cx);
+            s.find_outcome(&owner, &request, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let mut expected: gitterm_core::workspace_config::WorkspacesFile =
+        serde_json::from_slice(&before).unwrap();
+    gitterm_core::work::summary::assign_chat(
+        expected
+            .workspaces
+            .iter_mut()
+            .enumerate()
+            .map(|(i, w)| (i == 0, &mut w.chats)),
+        "saved-chat",
+    );
+    let moved = expected.workspaces[1].tabs.remove(1);
+    expected.workspaces[0].tabs.push(moved);
+    expected.workspaces[0].active_tab = Some(1);
+    expected.workspaces[1].active_tab = Some(1);
+    expected.active_workspace = 0;
+    cx.update(|window, cx| {
+        cx.set_global(crate::workspace_config::LiveWorkspaces(
+            gitterm_core::desktop_store::DesktopStore::open(&root.path().join("iced")).unwrap(),
+        ));
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "remaining-add",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap();
+        shell.update(cx, |s, cx| {
+            let owner = s.find_owner(cx);
+            s.find_outcome(&owner, &request, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved, serde_json::to_value(&expected).unwrap());
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let target = &shell.workspaces[0];
+        assert!(
+            target
+                .sessions
+                .iter()
+                .any(|s| shell.find_conversation(target, s, cx)
+                    == Some(ChatRef::local("saved-chat")))
+        );
+        assert!(
+            shell.workspaces[1]
+                .sessions
+                .iter()
+                .all(|s| shell.find_conversation(&shell.workspaces[1], s, cx)
+                    != Some(ChatRef::local("saved-chat")))
+        );
+    });
+}
+
+#[test]
+fn remaining_find_summary_transcript_plan_projection_equals_iced_read_only() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fixture.jsonl");
+    let source=[
+        serde_json::json!({"type":"user","message":{"content":"Implement the example"}}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"todo","name":"TodoWrite","input":{"todos":[{"content":"Read","status":"completed"},{"content":"Implement","status":"in_progress"},{"content":"Test","status":"pending"}]}}]}}),
+        serde_json::json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"edit","name":"Write","input":{"file_path":"src/example.rs"}}]}}),
+    ].map(|v|v.to_string()).join("\n");
+    std::fs::write(&path, &source).unwrap();
+    let expected = digest::digest(
+        &gitterm_core::chat::history::parse_claude_transcript(&source)
+            .into_iter()
+            .map(gitterm_core::chat::state::AgentEvent::from)
+            .collect::<Vec<_>>(),
+    );
+    let data = load_preview_data(&path, ChatBackend::Claude).unwrap();
+    assert_eq!(data.summary, Summary::from_digest(expected));
+    assert_eq!(data.summary.todos.len(), 3);
+    assert_eq!(data.summary.todos[1].text, "Implement");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[gpui::test]
+fn remaining_find_live_and_preview_project_steps_children_cost_plan_and_waiting_like_iced(
+    cx: &mut TestAppContext,
+) {
+    use gitterm_core::chat::{
+        state::AgentEvent,
+        types::{HarnessEvent, ItemKind, RuntimeRequestKind, TurnStatus},
+    };
+    let (root, shell, cx) = crate::h2_tests::fixture_catalog(cx, false);
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.select_workspace_id(crate::WorkspaceId(2), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    let chat_view = cx.read(|cx| {
+        let shell = shell.read(cx);
+        shell
+            .workspaces
+            .iter()
+            .flat_map(|w| w.panes.values())
+            .find_map(|pane| match &pane.read(cx).content {
+                crate::pane::PaneContent::PreviewChat(view)
+                    if view.read(cx).matches_chat("saved-chat") =>
+                {
+                    Some(view.clone())
+                }
+                _ => None,
+            })
+            .unwrap()
+    });
+    let events = vec![
+        HarnessEvent::TurnCompleted {
+            status: TurnStatus::Completed,
+            cost_usd: Some(0.25),
+            usage: serde_json::Value::Null,
+            rate_limit: None,
+        },
+        HarnessEvent::TurnStarted {
+            session_id: Some("saved-chat".into()),
+            model: Some("example-model".into()),
+        },
+        HarnessEvent::ItemStarted {
+            id: "todo".into(),
+            kind: ItemKind::ToolCall {
+                name: "TodoWrite".into(),
+                input: serde_json::json!({"todos":[{"content":"Read","status":"completed"},{"content":"Implement","status":"in_progress"}]}),
+            },
+        },
+        HarnessEvent::ItemStarted {
+            id: "agent".into(),
+            kind: ItemKind::ToolCall {
+                name: "Agent".into(),
+                input: serde_json::json!({"description":"Check example","prompt":"Inspect the fixture"}),
+            },
+        },
+        HarnessEvent::ItemStarted {
+            id: "bash".into(),
+            kind: ItemKind::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command":"cargo test example"}),
+            },
+        },
+    ];
+    for event in &events {
+        chat_view.update(cx, |view, cx| {
+            let stamp = view.runtime_source();
+            view.receive_runtime_event(
+                &stamp,
+                gitterm_core::chat::runtime::RuntimeEvent::Harness(event.clone()),
+                cx,
+            );
+        });
+    }
+    cx.run_until_parked();
+    let facts = cx.read(|cx| shell.read(cx).find_facts(cx));
+    let projected = facts
+        .overview
+        .chats
+        .iter()
+        .find(|c| c.chat.as_ref() == Some(&ChatRef::local("saved-chat")))
+        .unwrap();
+    let input = events
+        .iter()
+        .cloned()
+        .map(AgentEvent::Harness)
+        .collect::<Vec<_>>();
+    let iced = overview::conversation_activity(&input, Some(std::path::Path::new("/fixture/work")));
+    assert_eq!(projected.step, iced.step);
+    assert_eq!(projected.cost_usd, iced.cost_usd);
+    assert_eq!(projected.model, iced.model);
+    assert_eq!(projected.children.len(), iced.subagents.len());
+    assert_eq!(projected.children[0].label, iced.subagents[0].label);
+    assert!(projected.turn_started_at.is_some());
+    let groups = overview_groups(&facts.overview, std::time::SystemTime::now());
+    let working = &groups[1].rows;
+    assert!(
+        working
+            .iter()
+            .any(|r| r.title == "Check example" && r.indent)
+    );
+    let row = working.iter().find(|r| r.title == projected.title).unwrap();
+    assert!(row.right.contains("$0.25"));
+    assert!(row.right.contains('s'));
+    let waiting = HarnessEvent::RuntimeRequest {
+        request_id: "permission".into(),
+        tool_use_id: "bash".into(),
+        kind: RuntimeRequestKind::Permission {
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command":"cargo test example"}),
+            suggestions: vec![],
+            decision_reason: None,
+        },
+    };
+    chat_view.update(cx, |view, cx| {
+        let stamp = view.runtime_source();
+        view.receive_runtime_event(
+            &stamp,
+            gitterm_core::chat::runtime::RuntimeEvent::Harness(waiting.clone()),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let preview_facts = cx.read(|cx| shell.read(cx).find_facts(cx));
+    let summary = &preview_facts
+        .digests
+        .iter()
+        .find(|(id, _)| id.id == "saved-chat")
+        .unwrap()
+        .1;
+    let mut input = input;
+    input.push(AgentEvent::Harness(waiting));
+    assert_eq!(summary, &digest::digest(&input));
+    assert_eq!(summary.todos.len(), 2);
+    assert_eq!(
+        summary.waiting,
+        [digest::WaitingAsk::Permission {
+            tool: "Bash".into(),
+            detail: Some("cargo test example".into())
+        }]
+    );
+    let before = settled_tree_snapshot(root.path());
+    cx.update(|_, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "remaining-find-reads",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap()
+    });
+    let live_facts = cx.read(|cx| shell.read(cx).find_facts(cx));
+    assert_eq!(live_facts.overview, preview_facts.overview);
+    assert_eq!(live_facts.digests, preview_facts.digests);
+    assert_eq!(settled_tree_snapshot(root.path()), before);
+}
+
+#[gpui::test]
+fn find_sidebar_resume_recorded_acp_without_claude_index(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][1]["tabs"][1]["dir"] = serde_json::json!(directory.path());
+        file["workspaces"][1]["tabs"][1]["agent_config"] = serde_json::json!({
+            "backend":"acp", "agent":"gemini", "model":"placeholder-retired-model"
+        });
+        // Live restores background tabs too; keep this unrelated Claude claim
+        // distinct from other parallel fixtures that use `missing-chat`.
+        file["workspaces"][1]["tabs"][2]["chat_session_id"] =
+            serde_json::json!("placeholder-find-acp-background");
+    });
+    cx.update(|window, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "find-acp-resume-test",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap();
+        shell.update(cx, |shell, cx| {
+            // Keep the recorded DTO while simulating a tab that is not mounted.
+            let state = shell
+                .workspaces
+                .iter_mut()
+                .find(|state| state.workspace.id == crate::WorkspaceId(2))
+                .unwrap();
+            let session = state.sessions.remove(1);
+            state.panes.remove(&crate::session_pane_id(session.id));
+            let owner = shell.find_owner(cx);
+            shell.find_outcome(
+                &owner,
+                &FindOutcome::Resume {
+                    id: ChatRef::local("saved-chat"),
+                    mode: ResumeMode::Chat,
+                },
+                window,
+                cx,
+            );
+            assert!(
+                shell.owner.read(cx).error.is_none(),
+                "{:?}",
+                shell.owner.read(cx).error
+            );
+            let state = shell.active(cx);
+            assert_eq!(state.workspace.id, crate::WorkspaceId(2));
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx);
+            let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+                panic!("recorded ACP chat did not reach the native pane")
+            };
+            assert!(chat.read(cx).matches_chat("saved-chat"));
+            assert_eq!(
+                chat.read(cx).config().backend(),
+                gitterm_core::chat::types::AgentBackend::Acp(
+                    gitterm_core::chat::types::AcpAgent::Gemini
+                )
+            );
+        });
+    });
 }

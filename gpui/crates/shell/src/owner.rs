@@ -36,6 +36,9 @@ pub struct WorkspaceOwner {
     review_workers: Arc<std::sync::Mutex<ReviewWorkers>>,
     store: Option<WorkspaceStore>,
     jobs: Arc<StatusRuntime>,
+    status_contexts: std::collections::HashMap<crate::data::WorkspaceId, u64>,
+    status_requests:
+        std::collections::HashMap<gitterm_core::runtime::JobId, (crate::data::WorkspaceId, u64)>,
     executor: Option<Arc<tokio::runtime::Runtime>>,
     _tasks: Vec<Task<()>>,
     _quit: Option<Subscription>,
@@ -89,10 +92,16 @@ impl WorkspaceOwner {
                 while let Some(outcome) = receiver.recv().await {
                     if owner
                         .update(cx, |owner, cx| match outcome {
-                            StatusOutcome::Completed { snapshot, .. } => {
-                                owner.dispatch(Intent::Completed(snapshot), Instant::now(), cx)
+                            StatusOutcome::Completed { job, snapshot } => {
+                                if let Some((workspace, context)) =
+                                    owner.status_requests.remove(&job)
+                                {
+                                    owner.complete_context_status(workspace, context, snapshot, cx);
+                                }
                             }
-                            StatusOutcome::Cancelled { .. } => {}
+                            StatusOutcome::Cancelled { job, .. } => {
+                                owner.status_requests.remove(&job);
+                            }
                         })
                         .is_err()
                     {
@@ -207,6 +216,8 @@ impl WorkspaceOwner {
             _chat_quit: chat_quit,
             store,
             jobs,
+            status_contexts: Default::default(),
+            status_requests: Default::default(),
             executor,
             _tasks: tasks,
             _quit: quit,
@@ -592,7 +603,28 @@ impl WorkspaceOwner {
             .as_ref()
             .and_then(|s| s.guard.as_ref().map(|g| g.preview().clone()))
     }
+    fn complete_context_status(
+        &mut self,
+        workspace: crate::data::WorkspaceId,
+        context: u64,
+        snapshot: gitterm_core::status::GitStatusSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .status_contexts
+            .get(&workspace)
+            .copied()
+            .unwrap_or_default()
+            == context
+        {
+            self.dispatch(Intent::Completed(snapshot), Instant::now(), cx);
+        }
+    }
+
     pub fn dispatch(&mut self, intent: Intent, now: Instant, cx: &mut Context<Self>) {
+        if let Intent::ContextChanged { workspace, .. } = &intent {
+            *self.status_contexts.entry(*workspace).or_default() += 1;
+        }
         let completed = match &intent {
             Intent::Completed(snapshot) => Some(crate::data::WorkspaceId(snapshot.tab_id as u64)),
             _ => None,
@@ -616,12 +648,16 @@ impl WorkspaceOwner {
                 ) {
                     self.error = Some(error.to_string());
                 } else {
-                    self.jobs.execute_with(
+                    if let Some(job) = self.jobs.execute_with(
                         executor.handle(),
                         owner,
                         command,
                         gitterm_core::git_status::StatusReadOptions { fsmonitor: false },
-                    );
+                    ) {
+                        let workspace = crate::data::WorkspaceId(owner as u64);
+                        let context = *self.status_contexts.entry(workspace).or_default();
+                        self.status_requests.insert(job, (workspace, context));
+                    }
                 }
             }
         }
@@ -938,5 +974,66 @@ impl WorkspaceOwner {
         self.error = None;
         cx.notify();
         id
+    }
+}
+
+#[cfg(test)]
+mod task_panel_status_tests {
+    use super::*;
+    use ::core::prelude::v1::test;
+    #[gpui::test]
+    fn task_panel_context_rejects_late_main_status_and_keeps_toplevel_discovery(
+        cx: &mut TestAppContext,
+    ) {
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add("/tmp/placeholder-main".into(), Instant::now());
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let snapshot = |path: &str| gitterm_core::status::GitStatusSnapshot {
+            tab_id: workspace.0 as usize,
+            repo_path: path.into(),
+            repo_name: "Placeholder".into(),
+            branch_name: "placeholder".into(),
+            is_git_repo: true,
+            staged: vec![],
+            unstaged: vec![],
+            untracked: vec![],
+            error: None,
+        };
+        owner.update(cx, |o, cx| {
+            o.dispatch(
+                Intent::ContextChanged {
+                    workspace,
+                    root: "/tmp/placeholder-task".into(),
+                },
+                Instant::now(),
+                cx,
+            );
+            o.complete_context_status(workspace, 0, snapshot("/tmp/placeholder-main"), cx);
+            assert_eq!(
+                o.model.workspaces[0].root,
+                PathBuf::from("/tmp/placeholder-task")
+            );
+            o.complete_context_status(workspace, 1, snapshot("/tmp/placeholder-task"), cx);
+            // Toplevel discovery uses a new checkout: a previously visited root
+            // is deliberately rejected by the per-tab stale-context guard.
+            o.dispatch(
+                Intent::ContextChanged {
+                    workspace,
+                    root: "/tmp/placeholder-other/subdir".into(),
+                },
+                Instant::now(),
+                cx,
+            );
+            o.complete_context_status(workspace, 1, snapshot("/tmp/placeholder-task"), cx);
+            assert_eq!(
+                o.model.workspaces[0].root,
+                PathBuf::from("/tmp/placeholder-other/subdir")
+            );
+            o.complete_context_status(workspace, 2, snapshot("/tmp/placeholder-other"), cx);
+            assert_eq!(
+                o.model.workspaces[0].root,
+                PathBuf::from("/tmp/placeholder-other")
+            );
+        });
     }
 }

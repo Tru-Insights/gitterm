@@ -1,12 +1,12 @@
-//! Standalone Iced Find sidebar and centre preview. No discovery or launch I/O.
+//! Iced Find sidebar and centre preview; discovery and launches belong to the shell.
 //!
 //! Host hookup: retain `Rc<RefCell<State>>`, with one selection owner (the tab's
 //! stable session UID). Mount `FindSidebar` in the left content region and
 //! `FindPreview` in the centre while that owner has a selection. Subscribe to
 //! `FindOutcome` on both. Reduce `outcome.intent(state, owner)` and execute core
 //! effects asynchronously, returning their exact index/preview stamps. Open
-//! focuses an existing conversation. Process/workspace controls emit Unavailable
-//! and the host shows its existing notice without performing the operation. On
+//! focuses an existing conversation. Live resume, ownership and indexing controls
+//! reach the shared shell paths; Preview emits Unavailable. On
 //! workspace changes update Filter.machine/workspace_root; refresh both entities
 //! after reductions or host-fact changes. Closing returns to the host's overview.
 
@@ -24,10 +24,11 @@ use gpui_component::{
 };
 
 use crate::theme::{self, Palette};
+use gitterm_core::{chat_overview as overview, chat_summary as digest};
 
 #[cfg(test)]
 #[path = "find_sidebar_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeMode {
@@ -43,10 +44,15 @@ pub enum FindOutcome {
     SetBackend(Option<ChatBackend>),
     Select { id: ChatRef },
     ClosePreview,
+    GoToChatOwner { id: ChatRef },
+    IndexOlderChats,
     Open { id: ChatRef },
     Resume { id: ChatRef, mode: ResumeMode },
     Unavailable(String),
     OpenFile(PathBuf),
+    MakeWorkspace { id: ChatRef },
+    AddToWorkspace { id: ChatRef, workspace: u64 },
+    OverviewGo(Box<overview::NavTarget>),
 }
 
 impl FindOutcome {
@@ -68,7 +74,15 @@ impl FindOutcome {
                 });
             }
             Self::ClosePreview => return Some(Intent::ClosePreview(owner.into())),
-            Self::Open { .. } | Self::Resume { .. } | Self::Unavailable(_) | Self::OpenFile(_) => {
+            Self::GoToChatOwner { .. }
+            | Self::IndexOlderChats
+            | Self::Open { .. }
+            | Self::Resume { .. }
+            | Self::Unavailable(_)
+            | Self::OpenFile(_)
+            | Self::MakeWorkspace { .. }
+            | Self::AddToWorkspace { .. }
+            | Self::OverviewGo(_) => {
                 return None;
             }
         }
@@ -105,126 +119,40 @@ struct Summary {
     ask: Option<String>,
     reply: Option<String>,
     files: Vec<String>,
+    todos: Vec<digest::TodoItem>,
+    waiting: Vec<digest::WaitingAsk>,
 }
-
 impl Summary {
     fn from_messages(messages: &[chats::ChatPreviewMessage]) -> Self {
+        Self::from_digest(digest::digest_messages(messages))
+    }
+    fn from_digest(d: digest::ChatDigest) -> Self {
         Self {
-            ask: messages
-                .iter()
-                .rev()
-                .find(|m| m.is_user && human_request(&m.text))
-                .map(|m| m.text.trim().to_string()),
-            reply: messages
-                .iter()
-                .rev()
-                .find(|m| !m.is_user)
-                .map(|m| m.text.clone()),
-            files: vec![],
+            ask: d.latest_ask,
+            reply: d.latest_reply,
+            files: d.files_touched,
+            todos: d.todos,
+            waiting: d.waiting,
         }
     }
 }
 
-fn human_request(text: &str) -> bool {
-    let text = text.trim();
-    !text.is_empty()
-        && !text.starts_with('<')
-        && !text.starts_with("[Request interrupted")
-        && !text.starts_with("This session is being continued from a previous conversation")
-        && !gitterm_core::delegations::is_delivery_message(text)
-}
-
-// Same clipping limits as Iced's chat_summary::clip_lines.
 fn clip_lines(text: &str, limit: usize) -> (String, bool) {
-    let mut cut = false;
-    let mut shown = vec![];
-    for (i, line) in text.lines().enumerate() {
-        if i == limit {
-            cut = true;
-            break;
-        }
-        if line.chars().count() > 200 {
-            cut = true;
-            shown.push(format!("{}…", line.chars().take(199).collect::<String>()));
-        } else {
-            shown.push(line.to_string());
-        }
-    }
-    (shown.join("\n"), cut)
+    digest::clip_lines(text, limit)
 }
 
 fn load_preview_data(path: &std::path::Path, backend: ChatBackend) -> Result<PreviewData, String> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path).map_err(|e| format!("Read {}: {e}", path.display()))?;
+    let _file = std::fs::File::open(path).map_err(|e| format!("Read {}: {e}", path.display()))?;
     let mut data = PreviewData::from(gitterm_core::find::load_preview(path, backend));
-    if backend != ChatBackend::Claude {
-        return Ok(data);
+    if backend == ChatBackend::Claude {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("Read {}: {e}", path.display()))?;
+        let events = gitterm_core::chat::history::parse_claude_transcript(&text)
+            .into_iter()
+            .map(gitterm_core::chat::state::AgentEvent::from)
+            .collect::<Vec<_>>();
+        data.summary = Summary::from_digest(digest::digest(&events));
     }
-    let lines = BufReader::new(file).lines();
-    let mut calls = vec![];
-    let mut failed = HashSet::new();
-    for line in lines {
-        let line = line.map_err(|e| format!("Read {}: {e}", path.display()))?;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let content = value.pointer("/message/content");
-        if value["isMeta"] != true && value["isSidechain"] != true {
-            let text = content
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    content
-                        .and_then(|v| v.as_array())
-                        .into_iter()
-                        .flatten()
-                        .filter(|b| b["type"] == "text")
-                        .filter_map(|b| b["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                });
-            if !text.trim().is_empty() {
-                if value["type"] == "user" && human_request(&text) {
-                    data.summary.ask = Some(text.trim().to_string());
-                }
-                if value["type"] == "assistant" {
-                    data.summary.reply = Some(text.trim().to_string());
-                }
-            }
-        }
-        if let Some(blocks) = content.and_then(|v| v.as_array()) {
-            for block in blocks {
-                if block["type"] == "tool_result"
-                    && block["is_error"] == true
-                    && let Some(id) = block["tool_use_id"].as_str()
-                {
-                    failed.insert(id.to_string());
-                }
-                if block["type"] == "tool_use"
-                    && matches!(
-                        block["name"].as_str(),
-                        Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit")
-                    )
-                    && let Some(path) = block
-                        .pointer("/input/file_path")
-                        .or_else(|| block.pointer("/input/notebook_path"))
-                        .and_then(|v| v.as_str())
-                {
-                    calls.push((
-                        block["id"].as_str().unwrap_or_default().to_string(),
-                        path.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-    let mut seen = HashSet::new();
-    data.summary.files = calls
-        .into_iter()
-        .rev()
-        .filter(|(id, path)| !failed.contains(id) && seen.insert(path.clone()))
-        .map(|(_, path)| path)
-        .collect();
     Ok(data)
 }
 
@@ -250,8 +178,10 @@ pub struct OpenSession {
     pub selected: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FindFacts {
+    pub overview: overview::OverviewSnapshot,
+    pub digests: Vec<(ChatRef, digest::ChatDigest)>,
     pub machines: Vec<MachineFacts>,
     /// Iced's open-tab order: needs-you, working, idle. Independent of filters.
     pub open_sessions: Vec<OpenSession>,
@@ -266,6 +196,7 @@ pub struct FindFacts {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceFacts {
+    pub id: u64,
     pub name: String,
     pub chats: Vec<String>,
     pub open: bool,
@@ -287,7 +218,7 @@ impl FindFacts {
     }
 }
 
-fn entry<'a>(state: &'a State, id: &ChatRef) -> Option<&'a ChatIndexEntry> {
+pub(crate) fn entry<'a>(state: &'a State, id: &ChatRef) -> Option<&'a ChatIndexEntry> {
     state
         .index(&id.remote_id)?
         .entries
@@ -328,7 +259,7 @@ enum Row {
         label: String,
         count: usize,
     },
-    Chat(ChatRow),
+    Chat(Box<ChatRow>),
     Note(String),
 }
 
@@ -513,7 +444,7 @@ fn rows_ordered(
                                     root.query_match(&filter.query.to_lowercase()),
                                     Some(chats::QueryMatch::Child(_))
                                 )));
-                rows.push(Row::Chat(chat_row(
+                rows.push(Row::Chat(Box::new(chat_row(
                     root,
                     &machine,
                     state,
@@ -521,7 +452,7 @@ fn rows_ordered(
                     facts,
                     false,
                     has_children.then_some(expanded),
-                )));
+                ))));
                 if !expanded {
                     continue;
                 }
@@ -533,9 +464,9 @@ fn rows_ordered(
                         .collect()
                 };
                 for child in children {
-                    rows.push(Row::Chat(chat_row(
+                    rows.push(Row::Chat(Box::new(chat_row(
                         child, &machine, state, owner, facts, true, None,
-                    )));
+                    ))));
                 }
                 if let Some(facts) = &root.facts {
                     let others: Vec<_> = facts
@@ -1035,11 +966,19 @@ impl FindSidebar {
                             let selector = selector.clone();
                             move || format!("{selector}-label")
                         })
-                        .child(control.label),
+                        .child(control.label.clone()),
                 )
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(control.outcome.clone());
+                    cx.emit(
+                        if matches!(control.outcome, FindOutcome::IndexOlderChats)
+                            && !crate::chat::policy::is_live(cx)
+                        {
+                            FindOutcome::Unavailable(control.label.clone())
+                        } else {
+                            control.outcome.clone()
+                        },
+                    );
                 }))
                 .into_any_element();
         }
@@ -1073,7 +1012,7 @@ impl FindSidebar {
                 }))
             })
             .accessibility_label(control.label.clone())
-            .child(content.child(control.label))
+            .child(content.child(control.label.clone()))
             .when(active, |b| b.bg(rgb(p.surface)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
@@ -1356,7 +1295,7 @@ impl Render for FindSidebar {
                                     div()
                                         .text_size(px(secondary))
                                         .text_color(rgb(p.green))
-                                        .child(control.label),
+                                        .child(control.label.clone()),
                                 )
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.stop_propagation();
@@ -1450,7 +1389,7 @@ impl Render for FindSidebar {
                 "find-backfill".into(),
                 Control {
                     label: "Index older chats".into(),
-                    outcome: FindOutcome::Unavailable("Index older chats".into()),
+                    outcome: FindOutcome::IndexOlderChats,
                 },
                 false,
                 cx,
@@ -1620,6 +1559,7 @@ pub struct FindPreview {
     ask_expanded: bool,
     reply_expanded: bool,
     file_overlay: bool,
+    workspace_picker: bool,
 }
 
 impl EventEmitter<FindOutcome> for FindPreview {}
@@ -1635,6 +1575,7 @@ impl FindPreview {
             ask_expanded: false,
             reply_expanded: false,
             file_overlay: false,
+            workspace_picker: false,
         }
     }
 
@@ -1666,19 +1607,202 @@ fn overview_place(
         .join(" · ")
 }
 
-impl FindPreview {
-    fn unavailable_button(&self, id: String, label: String, cx: &Context<Self>) -> Button {
-        let selector = id.clone();
-        Button::new(id)
-            .debug_selector(move || selector.clone())
-            .label(label.clone())
-            .outline()
-            .xsmall()
-            .on_click(
-                cx.listener(move |_, _, _, cx| cx.emit(FindOutcome::Unavailable(label.clone()))),
-            )
+fn child_time(child: &overview::ChildActivity, now: std::time::SystemTime) -> String {
+    if child.status.is_active() {
+        child
+            .started_at
+            .and_then(|at| now.duration_since(at).ok())
+            .map(overview::format_elapsed)
+            .unwrap_or_default()
+    } else {
+        child
+            .finished_at
+            .map(|at| overview::format_ago(at, now))
+            .unwrap_or_default()
     }
+}
 
+struct OverviewRow {
+    icon: &'static str,
+    title: String,
+    meta: String,
+    detail: Option<String>,
+    gist: Option<String>,
+    right: String,
+    target: overview::NavTarget,
+    indent: bool,
+}
+struct OverviewGroup {
+    label: &'static str,
+    rows: Vec<OverviewRow>,
+}
+fn overview_groups(
+    snapshot: &overview::OverviewSnapshot,
+    now: std::time::SystemTime,
+) -> Vec<OverviewGroup> {
+    let sections = overview::sections(snapshot, now);
+    let elapsed = |at: Option<std::time::SystemTime>| {
+        at.and_then(|at| now.duration_since(at).ok())
+            .map(overview::format_elapsed)
+            .unwrap_or_default()
+    };
+    let ago = |at: Option<std::time::SystemTime>| {
+        at.map(|at| overview::format_ago(at, now))
+            .unwrap_or_default()
+    };
+    let with_cost = |time: String, cost: Option<f64>| match (time.is_empty(), cost) {
+        (_, None) => time,
+        (true, Some(c)) => overview::format_cost(c),
+        (false, Some(c)) => format!("{time} · {}", overview::format_cost(c)),
+    };
+    let place = |machine: &str, repo: &str, branch: Option<&str>| {
+        [
+            Some(machine.to_string()),
+            (!repo.is_empty()).then(|| match branch {
+                Some(b) => format!("{repo} · {b}"),
+                None => repo.to_string(),
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+    };
+    let chat_place = |chat: &overview::ChatSnapshot| {
+        let mut parts = vec![
+            place(&chat.machine, &chat.repo, chat.branch.as_deref()),
+            chat.harness.label().into(),
+        ];
+        if let Some(model) = &chat.model {
+            parts.push(model.clone());
+        }
+        parts.join(" · ")
+    };
+    let mut groups = vec![];
+    groups.push(OverviewGroup {
+        label: "NEEDS YOU",
+        rows: sections
+            .needs_you
+            .iter()
+            .map(|r| OverviewRow {
+                icon: "●",
+                title: r
+                    .parent
+                    .map(|p| format!("{} · for {p}", r.title))
+                    .unwrap_or_else(|| r.title.into()),
+                meta: match r.harness {
+                    Some(h) => format!("{} · {}", place(r.machine, r.repo, r.branch), h.label()),
+                    None => place(r.machine, r.repo, r.branch),
+                },
+                detail: Some(r.what.into()),
+                gist: r.gist.and_then(overview::gist_line),
+                right: ago(r.last_activity),
+                target: r.target.clone(),
+                indent: false,
+            })
+            .collect(),
+    });
+    let mut working = vec![];
+    for row in sections.working {
+        match row {
+            overview::WorkingRow::Chat(chat) => {
+                working.push(OverviewRow {
+                    icon: "▶",
+                    title: chat.title.clone(),
+                    meta: chat_place(chat),
+                    detail: Some(chat.step.clone().unwrap_or_else(|| "Working".into())),
+                    gist: chat.gist.as_ref().and_then(overview::gist_line),
+                    right: with_cost(elapsed(chat.turn_started_at), chat.cost_usd),
+                    target: chat.target.clone(),
+                    indent: false,
+                });
+                for child in chat.children.iter().filter(|c| c.status.is_active()) {
+                    working.push(OverviewRow {
+                        icon: "↳",
+                        title: child.label.clone(),
+                        meta: String::new(),
+                        detail: Some(
+                            child
+                                .step
+                                .clone()
+                                .unwrap_or_else(|| child.status.label().into()),
+                        ),
+                        gist: None,
+                        right: elapsed(child.started_at),
+                        target: child.target.clone(),
+                        indent: true,
+                    });
+                }
+            }
+            overview::WorkingRow::Detached(d) => working.push(OverviewRow {
+                icon: "▶",
+                title: d.child.label.clone(),
+                meta: format!("for {} · {}", d.parent, d.machine),
+                detail: Some(
+                    d.child
+                        .step
+                        .clone()
+                        .unwrap_or_else(|| d.child.status.label().into()),
+                ),
+                gist: None,
+                right: elapsed(d.child.started_at),
+                target: d.child.target.clone(),
+                indent: false,
+            }),
+        }
+    }
+    groups.push(OverviewGroup {
+        label: "WORKING NOW",
+        rows: working,
+    });
+    groups.push(OverviewGroup {
+        label: "RECENTLY FINISHED · LAST 4 HOURS",
+        rows: sections
+            .finished
+            .iter()
+            .map(|r| OverviewRow {
+                icon: if r.failed { "!" } else { "✓" },
+                title: r
+                    .parent
+                    .map(|p| format!("{} · for {p}", r.title))
+                    .unwrap_or_else(|| r.title.into()),
+                meta: place(r.machine, r.repo, r.branch),
+                detail: Some(r.result.into()),
+                gist: r.gist.and_then(overview::gist_line),
+                right: with_cost(overview::format_ago(r.at, now), r.cost_usd),
+                target: r.target.clone(),
+                indent: false,
+            })
+            .collect(),
+    });
+    groups.push(OverviewGroup {
+        label: "IDLE BUT OPEN",
+        rows: sections
+            .idle
+            .iter()
+            .map(|chat| OverviewRow {
+                icon: "✦",
+                title: chat.title.clone(),
+                meta: chat_place(chat),
+                detail: if chat.state == overview::ChatState::Exited {
+                    Some("Exited".into())
+                } else {
+                    chat.last_finished
+                        .as_ref()
+                        .map(|t| t.result.clone())
+                        .or_else(|| chat.gist.as_ref().and_then(|g| g.reply.clone()))
+                },
+                gist: chat.gist.as_ref().and_then(overview::gist_line),
+                right: with_cost(ago(chat.last_activity), chat.cost_usd),
+                target: chat.target.clone(),
+                indent: false,
+            })
+            .collect(),
+    });
+    groups
+}
+
+impl FindPreview {
     fn workspace_actions(&self, entry: &ChatIndexEntry, cx: &Context<Self>) -> gpui::Div {
         let root = entry.root_id.as_ref().unwrap_or(&entry.id);
         let owner = self
@@ -1688,48 +1812,255 @@ impl FindPreview {
             .find(|w| w.chats.contains(root));
         let mut line = div().flex().flex_wrap().gap_2();
         if let Some(owner) = owner {
-            let name = if owner.name.chars().count() > 30 {
-                format!("{}…", owner.name.chars().take(29).collect::<String>())
-            } else {
-                owner.name.clone()
-            };
-            line =
-                line.child(format!("in workspace {}", owner.name))
-                    .child(self.unavailable_button(
-                        "find-workspace-owner".into(),
-                        format!("Go to {name}"),
-                        cx,
-                    ));
+            let id = ChatRef::local(&entry.id);
+            let label = format!(
+                "Go to {}",
+                gitterm_core::work::summary::shorten(&owner.name, 30)
+            );
+            line = line.child(format!("in workspace {}", owner.name)).child(
+                Button::new("find-workspace-owner")
+                    .debug_selector(|| "find-workspace-owner".into())
+                    .label(label.clone())
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(if crate::chat::policy::is_live(cx) {
+                            FindOutcome::GoToChatOwner { id: id.clone() }
+                        } else {
+                            FindOutcome::Unavailable(label.clone())
+                        });
+                    })),
+            );
         } else if entry.root_id.is_none() {
-            line = line.child(self.unavailable_button(
-                "find-workspace-make".into(),
-                "Make workspace".into(),
-                cx,
-            ));
+            let id = ChatRef::local(&entry.id);
+            line = line.child(
+                Button::new("find-workspace-make")
+                    .debug_selector(|| "find-workspace-make".into())
+                    .label("Make workspace")
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(if crate::chat::policy::is_live(cx) {
+                            FindOutcome::MakeWorkspace { id: id.clone() }
+                        } else {
+                            FindOutcome::Unavailable("Make workspace".into())
+                        });
+                    })),
+            );
         }
-        if self
+        let targets: Vec<_> = self
             .facts
             .workspaces
             .iter()
-            .any(|w| w.open && !w.chats.contains(root))
-        {
+            .filter(|w| w.open && !w.chats.contains(root))
+            .collect();
+        if !targets.is_empty() {
+            let label = if entry.root_id.is_some() {
+                "Add its coordinator to workspace…"
+            } else {
+                "Add to workspace…"
+            };
             line = line.child(
-                self.unavailable_button(
-                    "find-workspace-add".into(),
-                    if entry.root_id.is_some() {
-                        "Add its coordinator to workspace…"
-                    } else {
-                        "Add to workspace…"
-                    }
-                    .into(),
-                    cx,
-                ),
+                Button::new("find-workspace-add")
+                    .debug_selector(|| "find-workspace-add".into())
+                    .label(label)
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if crate::chat::policy::is_live(cx) {
+                            this.workspace_picker = !this.workspace_picker;
+                            cx.notify();
+                        } else {
+                            cx.emit(FindOutcome::Unavailable(label.into()));
+                        }
+                    })),
             );
         }
-        line
+        let mut block = div().flex().flex_col().gap_2().child(line);
+        if self.workspace_picker {
+            let mut picker = div().flex().flex_wrap().gap_2();
+            for target in targets {
+                let workspace = target.id;
+                let id = ChatRef::local(&entry.id);
+                picker = picker.child(
+                    Button::new(format!("find-workspace-target-{workspace}"))
+                        .debug_selector(move || format!("find-workspace-target-{workspace}"))
+                        .label(target.name.clone())
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.workspace_picker = false;
+                            cx.emit(FindOutcome::AddToWorkspace {
+                                id: id.clone(),
+                                workspace,
+                            });
+                        })),
+                );
+            }
+            block = block.child(picker);
+        }
+        block
+    }
+
+    fn projected_overview(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = Palette::current(cx);
+        let small = theme::font_sizes(cx).ui - 1.;
+        let snapshot = &self.facts.overview;
+        let sections = overview::sections(snapshot, std::time::SystemTime::now());
+        let mut summary = vec![];
+        if !sections.needs_you.is_empty() {
+            summary.push(format!("{} need you", sections.needs_you.len()));
+        }
+        if !sections.working.is_empty() {
+            summary.push(format!("{} working", sections.working.len()));
+        }
+        summary.push(format!("{} open", snapshot.chats.len()));
+        let mut body = div()
+            .id("find-overview")
+            .debug_selector(|| "find-overview".into())
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(18.))
+            .py(px(14.))
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(div().text_size(px(small + 3.)).child("Overview"))
+            .child(div().text_color(rgb(p.subtext0)).child(summary.join(" · ")));
+        for machine in &self.facts.machines {
+            body = body.child(
+                div()
+                    .text_color(rgb(p.muted))
+                    .child(format!("{} {}", machine.name, machine.status)),
+            );
+        }
+        let groups = overview_groups(snapshot, std::time::SystemTime::now());
+        for (group_index, group) in groups
+            .into_iter()
+            .enumerate()
+            .filter(|(_, g)| !g.rows.is_empty())
+        {
+            if group.label == "IDLE BUT OPEN" {
+                body = body.child(
+                    header(
+                        "find-overview-idle".into(),
+                        vec![
+                            if self.idle_expanded { "▾" } else { "▸" }.into(),
+                            group.label.into(),
+                            group.rows.len().to_string(),
+                        ],
+                        cx,
+                    )
+                    .debug_selector(|| "find-overview-idle".into())
+                    .aria_expanded(self.idle_expanded)
+                    .pt(px(10.))
+                    .pb(px(4.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.idle_expanded = !this.idle_expanded;
+                        cx.notify();
+                    })),
+                );
+                if !self.idle_expanded {
+                    continue;
+                }
+            } else {
+                let count = if group_index == 1 {
+                    sections.working.len()
+                } else {
+                    group.rows.len()
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .pt(px(14.))
+                        .pb(px(4.))
+                        .px(px(6.))
+                        .text_size(px(10.))
+                        .text_color(rgb(p.subtext0))
+                        .child(group.label)
+                        .child(count.to_string()),
+                );
+            }
+            for (row_index, row) in group.rows.into_iter().enumerate() {
+                let key = format!("find-activity-{group_index}-{row_index}");
+                let selector = key.clone();
+                let detail_selector = format!("{key}-detail");
+                let right_selector = format!("{key}-right");
+                let mut lines = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .child(row.title.clone());
+                if !row.meta.is_empty() {
+                    lines = lines.child(
+                        div()
+                            .text_size(px(small - 1.))
+                            .text_color(rgb(p.muted))
+                            .child(row.meta),
+                    );
+                }
+                if let Some(detail) = row.detail {
+                    lines = lines.child(
+                        div()
+                            .debug_selector(move || detail_selector.clone())
+                            .text_color(rgb(if group_index == 0 {
+                                p.peach
+                            } else {
+                                p.subtext0
+                            }))
+                            .child(detail),
+                    );
+                }
+                if let Some(gist) = row.gist {
+                    lines = lines.child(div().text_color(rgb(p.muted)).child(gist));
+                }
+                let target = row.target;
+                body = body.child(
+                    row_button(key, cx)
+                        .debug_selector(move || selector.clone())
+                        .aria_label(row.title)
+                        .px(px(10.))
+                        .py(px(5.))
+                        .pl(px(if row.indent { 32. } else { 10. }))
+                        .gap(px(8.))
+                        .text_size(px(small))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(rgb(if group_index == 0 {
+                                    p.peach
+                                } else if group_index == 3 {
+                                    p.muted
+                                } else {
+                                    p.green
+                                }))
+                                .child(row.icon),
+                        )
+                        .child(lines)
+                        .child(
+                            div()
+                                .debug_selector(move || right_selector.clone())
+                                .flex_shrink_0()
+                                .text_size(px(small - 1.))
+                                .text_color(rgb(p.subtext0))
+                                .child(row.right),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(FindOutcome::OverviewGo(Box::new(target.clone())))
+                        })),
+                );
+            }
+        }
+        body
     }
 
     fn overview(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        if !self.facts.overview.is_empty() {
+            return self.projected_overview(cx);
+        }
         let p = Palette::current(cx);
         let font = theme::font_sizes(cx).ui;
         let small = font - 1.;
@@ -1964,16 +2295,41 @@ impl FindPreview {
         preview: Option<&PreviewData>,
         cx: &Context<Self>,
     ) -> gpui::Div {
+        let p = Palette::current(cx);
+        let small = theme::font_sizes(cx).ui - 1.;
+        let section = |label: &str, count: Option<String>| {
+            div()
+                .flex()
+                .gap(px(8.))
+                .text_size(px(10.))
+                .text_color(rgb(p.subtext0))
+                .child(label.to_string())
+                .children(count.map(|n| div().text_color(rgb(p.muted)).child(n)))
+        };
         let mut out = div().flex().flex_col().gap_3();
-        let Some(preview) = preview else {
+        let live = self
+            .facts
+            .digests
+            .iter()
+            .find(|(chat, _)| chat == id)
+            .map(|(_, d)| Summary::from_digest(d.clone()));
+        let Some(summary) = live.as_ref().or(preview.map(|p| &p.summary)) else {
             return out.child("reading the conversation…");
         };
         if let Some(session) = self.facts.open(id)
             && session.marker == "▶"
         {
-            out = out.child("DOING NOW").child(session.detail.clone());
+            let step = self
+                .facts
+                .overview
+                .chats
+                .iter()
+                .find(|c| c.chat.as_ref() == Some(id))
+                .and_then(|c| c.step.clone())
+                .unwrap_or_else(|| session.detail.clone());
+            out = out.child("DOING NOW").child(step);
         }
-        if let Some(full) = &preview.summary.ask {
+        if let Some(full) = &summary.ask {
             let (clipped, cut) = clip_lines(full, 4);
             out = out.child("ASKED FOR").child(
                 div()
@@ -2003,9 +2359,89 @@ impl FindPreview {
                 );
             }
         }
-        if !preview.summary.files.is_empty() {
-            out = out.child(format!("FILES TOUCHED {}", preview.summary.files.len()));
-            for (i, path) in preview.summary.files.iter().take(8).enumerate() {
+        if !summary.todos.is_empty() {
+            let done = summary
+                .todos
+                .iter()
+                .filter(|i| i.status == digest::TodoStatus::Completed)
+                .count();
+            out = out.child(section(
+                "PROGRESS",
+                Some(format!("{done}/{}", summary.todos.len())),
+            ));
+            for (i, item) in summary.todos.iter().enumerate() {
+                let (glyph, color, text) = match item.status {
+                    digest::TodoStatus::Completed => ("✓", p.green, p.subtext0),
+                    digest::TodoStatus::InProgress => ("▶", p.lavender, p.text),
+                    digest::TodoStatus::Pending => ("○", p.muted, p.subtext0),
+                    digest::TodoStatus::Cancelled => ("–", p.muted, p.muted),
+                };
+                out = out.child(
+                    div()
+                        .debug_selector(move || format!("find-summary-todo-{i}"))
+                        .flex()
+                        .gap(px(8.))
+                        .child(div().text_color(rgb(color)).child(glyph))
+                        .child(div().text_color(rgb(text)).child(item.text.clone())),
+                );
+            }
+        }
+        let (_, agents) = digest::chat_in_overview(&self.facts.overview, id);
+        if !agents.is_empty() {
+            out = out.child(section("AGENTS", Some(agents.len().to_string())));
+            for (i, child) in agents.iter().enumerate() {
+                let target = child.target.clone();
+                let detail = child
+                    .step
+                    .as_ref()
+                    .or(child.result.as_ref())
+                    .map(|s| format!("{} · {s}", child.status.label()))
+                    .unwrap_or_else(|| child.status.label().into());
+                let right = child_time(child, std::time::SystemTime::now());
+                out = out.child(
+                    row_button(format!("find-summary-agent-{i}"), cx)
+                        .debug_selector(move || format!("find-summary-agent-{i}"))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .gap(px(8.))
+                        .text_size(px(small))
+                        .child({
+                            let (icon, color) = match child.status {
+                                overview::ChildStatus::Running => ("▶", p.green),
+                                overview::ChildStatus::Queued => ("…", p.muted),
+                                overview::ChildStatus::Blocked => ("●", p.yellow),
+                                overview::ChildStatus::Done => ("✓", p.green),
+                                overview::ChildStatus::Failed => ("!", p.red),
+                                overview::ChildStatus::Stopped => ("○", p.muted),
+                            };
+                            div().flex_shrink_0().text_color(rgb(color)).child(icon)
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .child(child.label.clone())
+                                .child(div().text_color(rgb(p.subtext0)).child(detail)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(small - 1.))
+                                .text_color(rgb(p.subtext0))
+                                .child(right),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(FindOutcome::OverviewGo(Box::new(target.clone())))
+                        })),
+                );
+            }
+        }
+        if !summary.files.is_empty() {
+            out = out.child(format!("FILES TOUCHED {}", summary.files.len()));
+            for (i, path) in summary.files.iter().take(8).enumerate() {
                 let full = entry.cwd.join(path);
                 let shown = full
                     .strip_prefix(&entry.cwd)
@@ -2033,15 +2469,58 @@ impl FindPreview {
                     out = out.child(shown);
                 }
             }
-            if preview.summary.files.len() > 8 {
-                out = out.child(format!("+{} more", preview.summary.files.len() - 8));
+            if summary.files.len() > 8 {
+                out = out.child(format!("+{} more", summary.files.len() - 8));
             }
         }
         if self.facts.open(id).is_some_and(|s| s.marker == "●") {
             // Iced's ChatOverviewGo jumps to the waiting session's tab; this
             // button shows only while that session is open here.
             let target = id.clone();
-            out = out.child("WAITING ON YOU").child("waiting for you").child(
+            out = out.child("WAITING ON YOU");
+            if summary.waiting.is_empty() {
+                let what = self
+                    .facts
+                    .overview
+                    .chats
+                    .iter()
+                    .find(|c| c.chat.as_ref() == Some(id))
+                    .and_then(|c| match &c.state {
+                        overview::ChatState::NeedsYou { what } => Some(what.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "waiting for you".into());
+                out = out.child(what);
+            }
+            for (i, ask) in summary.waiting.iter().enumerate() {
+                let mut line = div()
+                    .flex()
+                    .flex_col()
+                    .debug_selector(move || format!("find-summary-wait-{i}"));
+                match ask {
+                    digest::WaitingAsk::Permission { tool, detail } => {
+                        line = line.child(
+                            div()
+                                .text_color(rgb(p.yellow))
+                                .child(format!("Permission · {tool}")),
+                        );
+                        if let Some(detail) = detail {
+                            line =
+                                line.child(div().font_family("monospace").child(
+                                    digest::clip_lines(detail, digest::ASK_PREVIEW_LINES).0,
+                                ));
+                        }
+                    }
+                    digest::WaitingAsk::Question { questions } => {
+                        line = line.child(div().text_color(rgb(p.yellow)).child("Question"));
+                        for q in questions {
+                            line = line.child(q.clone());
+                        }
+                    }
+                }
+                out = out.child(line);
+            }
+            out = out.child(
                 Button::new("find-summary-prompt")
                     .debug_selector(|| "find-summary-prompt".into())
                     .label("Go to prompt")
@@ -2052,7 +2531,7 @@ impl FindPreview {
                     })),
             );
         }
-        if let Some(full) = &preview.summary.reply {
+        if let Some(full) = &summary.reply {
             let (clipped, cut) = clip_lines(full, 16);
             out = out.child("LATEST REPLY").child(
                 div()
@@ -2126,11 +2605,15 @@ impl Render for FindPreview {
                     .outline()
                     .small()
                     .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.emit(if matches!(control.outcome, FindOutcome::Resume { .. }) {
-                            FindOutcome::Unavailable(control.label.clone())
-                        } else {
-                            control.outcome.clone()
-                        });
+                        cx.emit(
+                            if matches!(control.outcome, FindOutcome::Resume { .. })
+                                && !crate::chat::policy::is_live(cx)
+                            {
+                                FindOutcome::Unavailable(control.label.clone())
+                            } else {
+                                control.outcome.clone()
+                            },
+                        );
                     })),
             );
         }
@@ -2296,6 +2779,15 @@ impl crate::Shell {
             if let Some(target) = &pane.read(cx).session {
                 return target.session_uid.clone();
             }
+            if let Some(uid) = pane
+                .read(cx)
+                .imported_tab
+                .as_ref()
+                .and_then(|t| t.session_uid.as_ref())
+            {
+                return uid.clone();
+            }
+
             if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
                 && let Some(index) = self
                     .owner
@@ -2322,7 +2814,7 @@ impl crate::Shell {
         self.find_owner_for(workspace, workspace.active_session, cx)
     }
 
-    fn find_conversation(
+    pub(crate) fn find_conversation(
         &self,
         workspace: &crate::WorkspaceDock,
         session: &crate::data::Session,
@@ -2357,6 +2849,9 @@ impl crate::Shell {
             .panes
             .get(&crate::session_pane_id(session.id))?
             .read(cx);
+        if let Some(id) = &pane.chat_session_id {
+            return Some(ChatRef::local(id));
+        }
         let crate::pane::PaneContent::PreviewChat(view) = &pane.content else {
             return None;
         };
@@ -2374,6 +2869,36 @@ impl crate::Shell {
 
     fn find_facts(&self, cx: &gpui::App) -> FindFacts {
         let mut sessions = vec![];
+        let mut snapshot = overview::OverviewSnapshot::default();
+        let mut digests = vec![];
+        let now = std::time::SystemTime::now();
+        let tasks = crate::task_panel::host(cx).and_then(|h| h.store().as_ref());
+        let mut delegations: Vec<_> = tasks
+            .map(|s| s.delegations().iter().collect())
+            .unwrap_or_else(|| {
+                self.roster_facts
+                    .as_ref()
+                    .map(|f| f.workers.iter().collect())
+                    .unwrap_or_default()
+            });
+        if tasks.is_none() {
+            delegations.reverse();
+        }
+        let task_title = |d: &gitterm_core::tasks::Delegation| match &d.child {
+            gitterm_core::tasks::DelegationChild::TaskSession { task_id, .. } => tasks
+                .and_then(|s| s.get(task_id))
+                .or_else(|| {
+                    self.roster_facts
+                        .as_ref()
+                        .and_then(|f| f.tasks.iter().find(|t| t.task_id == *task_id))
+                })
+                .map(|t| match &t.issue {
+                    Some(i) => format!("{} {}", i.key, t.title),
+                    None => t.title.clone(),
+                }),
+            _ => None,
+        };
+        let mut open_uids = HashSet::new();
         for workspace in &self.workspaces {
             for session in &workspace.sessions {
                 let Some(id) = self.find_conversation(workspace, session, cx) else {
@@ -2384,17 +2909,125 @@ impl crate::Shell {
                 };
                 let pane = pane.read(cx);
                 let title = pane.tab_title();
-                // shortcut: native request priority/wait facts are private to
-                // ChatPane; use exposed title/streaming facts until shared
-                // attention accessors are available to this host.
-                let needs_you = title.starts_with('✳');
-                let working = match &pane.content {
-                    crate::pane::PaneContent::PreviewChat(view) => view.read(cx).is_working(),
-                    _ => title.trim_start().chars().next().is_some_and(|ch| {
-                        matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
-                            || ('\u{2800}'..='\u{28ff}').contains(&ch)
-                    }),
+                let uid = self.find_owner_for(workspace, Some(session.id), cx);
+                open_uids.insert(uid.clone());
+                let indexed = entry(&self.find_state.borrow(), &id).cloned();
+                let status = self.data.status(workspace.workspace.id, cx);
+                let child_delegations = delegations
+                    .iter()
+                    .filter(|d| d.parent.session_uid == uid)
+                    .map(|d| (*d, task_title(d)))
+                    .collect();
+                let cwd = self
+                    .data
+                    .terminal_cwd(workspace.workspace.id, cx)
+                    .unwrap_or_default();
+                let projected = match &pane.content {
+                    crate::pane::PaneContent::PreviewChat(view) => {
+                        let view = view.read(cx);
+                        let (state, records) = view.find_source();
+                        let restored = records
+                            .iter()
+                            .filter_map(|r| match &r.entry {
+                                gitterm_gpui_chat::events::Entry::Harness(h) => {
+                                    Some(gitterm_core::chat::state::AgentEvent::Harness(h.clone()))
+                                }
+                                gitterm_gpui_chat::events::Entry::UserPrompt(t) => {
+                                    Some(gitterm_core::chat::state::AgentEvent::user_prompt(t))
+                                }
+                                gitterm_gpui_chat::events::Entry::SubmittedPrompt(t) => Some(
+                                    gitterm_core::chat::state::AgentEvent::user_prompt(&t.text),
+                                ),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let conversation = if !restored.is_empty() {
+                            &restored
+                        } else {
+                            &state.conversation
+                        };
+                        let summary = digest::digest(conversation);
+                        let gist = digest::gist(&summary);
+                        digests.push((id.clone(), summary));
+                        overview::tab_snapshot(
+                            overview::TabInput {
+                                tab_id: session.id.0 as usize,
+                                chat: Some(id.clone()),
+                                index_title: indexed.as_ref().map(|e| e.title.as_str()),
+                                display_title: &title,
+                                machine: "This Mac",
+                                repo: &workspace.workspace.name,
+                                branch: Some(&status.branch),
+                                cwd: Some(view.cwd()),
+                                runs: overview::TabRuns::Chat(overview::SessionInput {
+                                    harness: overview::Harness::Claude,
+                                    conversation,
+                                    pending_requests: state.pending_requests.len(),
+                                    streaming: view.is_working(),
+                                    stopped: matches!(
+                                        state.state,
+                                        gitterm_core::chat::types::AgentSessionState::Stopped
+                                    ),
+                                    configured_model: self
+                                        .owner
+                                        .read(cx)
+                                        .iced_workspace(workspace.workspace.id)
+                                        .and_then(|w| {
+                                            w.tabs.iter().find(|t| {
+                                                t.chat_session_id.as_deref() == Some(&id.id)
+                                            })
+                                        })
+                                        .and_then(|t| t.agent_config.as_ref())
+                                        .and_then(|c| c.chat_model()),
+                                    live_times: &state.live_times,
+                                }),
+                                delegations: child_delegations,
+                                gist: Some(gist),
+                                last_activity: state
+                                    .live_times
+                                    .last_activity
+                                    .or(indexed.as_ref().map(|e| e.mtime)),
+                            },
+                            now,
+                        )
+                    }
+                    _ => {
+                        let needs_you = title.starts_with('✳');
+                        let running = title.trim_start().chars().next().is_some_and(|ch| {
+                            matches!(ch, '◐' | '◑' | '◒' | '◓' | '✢' | '✶' | '✻' | '✽' | '·')
+                                || ('\u{2800}'..='\u{28ff}').contains(&ch)
+                        });
+                        overview::tab_snapshot(
+                            overview::TabInput {
+                                tab_id: session.id.0 as usize,
+                                chat: Some(id.clone()),
+                                index_title: indexed.as_ref().map(|e| e.title.as_str()),
+                                display_title: &title,
+                                machine: "This Mac",
+                                repo: &workspace.workspace.name,
+                                branch: Some(&status.branch),
+                                cwd: Some(&cwd),
+                                runs: overview::TabRuns::Terminal(overview::TerminalInput {
+                                    harness: overview::terminal_harness(
+                                        indexed.as_ref().map(|e| e.backend),
+                                        pane.startup_command.as_deref(),
+                                        Some(&title),
+                                    ),
+                                    needs_you: needs_you.then_some("Input or approval needed"),
+                                    pending_ask: None,
+                                    running,
+                                }),
+                                delegations: child_delegations,
+                                gist: None,
+                                last_activity: indexed.as_ref().map(|e| e.mtime),
+                            },
+                            now,
+                        )
+                    }
                 };
+                let needs_you = matches!(projected.state, overview::ChatState::NeedsYou { .. });
+                let working = projected.state == overview::ChatState::Working;
+                snapshot.chats.push(projected);
                 sessions.push((
                     if needs_you {
                         0
@@ -2422,9 +3055,36 @@ impl crate::Shell {
                 ));
             }
         }
+        for delegation in delegations
+            .iter()
+            .filter(|d| !open_uids.contains(&d.parent.session_uid))
+        {
+            let state = self.find_state.borrow();
+            let parent = delegation
+                .parent
+                .chat_session_id
+                .as_ref()
+                .and_then(|id| {
+                    state
+                        .index(&None)
+                        .and_then(|i| i.entries.iter().find(|e| e.id == *id))
+                })
+                .map(|e| (ChatRef::local(&e.id), e.title.as_str()));
+            if let Some(detached) = overview::detached_activity(
+                delegation,
+                task_title(delegation).as_deref(),
+                parent,
+                "This Mac",
+                now,
+            ) {
+                snapshot.detached.push(detached);
+            }
+        }
         // Stable sort preserves workspace/tab order among equal attention classes.
         sessions.sort_by_key(|(class, _)| *class);
         FindFacts {
+            overview: snapshot,
+            digests,
             machines: std::iter::once(MachineFacts {
                 id: None,
                 name: "This Mac".into(),
@@ -2450,7 +3110,7 @@ impl crate::Shell {
             .collect(),
             open_sessions: sessions.into_iter().map(|(_, session)| session).collect(),
             running_remote: vec![],
-            workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().filter(|w| w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|w| WorkspaceFacts { name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
+            workspaces: self.owner.read(cx).iced_catalog().map(|catalog| catalog.workspaces.iter().chain(&catalog.closed).enumerate().filter(|(_, w)| w.remote_session.is_none() && w.location.as_ref().is_none_or(|l| matches!(l, gitterm_core::remote::config::WorkspaceLocationConfig::Local { .. }))).map(|(index,w)| WorkspaceFacts { id: index as u64 + 1, name: w.name.clone(), chats: w.chats.clone(), open: w.active }).collect()).unwrap_or_else(|| self.workspaces.iter().map(|w| WorkspaceFacts { id: w.workspace.id.0, name: w.workspace.name.clone(), chats: vec![], open: true }).collect()),
             relevance_available: ranking_key().is_some(),
             relevance_down: false,
             local_files_openable: self.active_agent_tab(cx),
@@ -2567,7 +3227,7 @@ impl crate::Shell {
         }
     }
 
-    fn refresh_find(&self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn refresh_find(&self, window: &mut Window, cx: &mut gpui::Context<Self>) {
         // No workspace (the empty content's Open Folder) has no Find views.
         if self.active_workspace(cx).is_none() {
             return;
@@ -2618,14 +3278,40 @@ impl crate::Shell {
                     let home = self.find_home.clone();
                     #[cfg(not(test))]
                     let home = dirs::home_dir();
+                    let source = cx
+                        .try_global::<crate::work_sidebar::IcedWorkSource>()
+                        .cloned();
+                    let tasks = source
+                        .as_ref()
+                        .map(|source| crate::data::TaskSource::resolve(&source.config, cx));
                     cx.spawn_in(window, async move |shell, cx| {
                         let result = cx
                             .background_executor()
                             .spawn(async move {
-                                home.map(|home| gitterm_core::find::build_local_index(&home))
-                                    .ok_or_else(|| {
-                                        "Local transcript source not available in preview".into()
-                                    })
+                                let home = home.ok_or_else(|| {
+                                    "Local transcript source not available in preview".to_string()
+                                })?;
+                                let mut entries = gitterm_core::find::build_local_index(&home);
+                                if let Some(source) = source {
+                                    gitterm_core::chat_facts::attach_facts(
+                                        &mut entries,
+                                        &gitterm_core::chat_facts::facts_dir(&source.config),
+                                    );
+                                    if let Some(tasks) = tasks {
+                                        let tasks = tasks.load().map_err(|error| {
+                                            format!("Read task links for chat index: {error}")
+                                        })?;
+                                        let links = crate::data::iced_chat_links(
+                                            &source.workspaces,
+                                            &tasks,
+                                        );
+                                        gitterm_core::chat_facts::resolve_tree(
+                                            &mut entries,
+                                            &links,
+                                        );
+                                    }
+                                }
+                                Ok(entries)
                             })
                             .await;
                         _ = shell.update_in(cx, |shell, window, cx| {
@@ -2695,11 +3381,89 @@ impl crate::Shell {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if matches!(outcome, FindOutcome::Resume { .. }) && !self.live_chat_enabled(cx) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Conversation resume not available in preview".into());
+                cx.notify();
+            });
+            return;
+        }
         if let FindOutcome::Unavailable(label) = outcome {
             self.owner.update(cx, |owner, cx| {
                 owner.error = Some(format!("{label} · not available in preview"));
                 cx.notify();
             });
+            return;
+        }
+        if let FindOutcome::OverviewGo(target) = outcome {
+            match target.as_ref() {
+                overview::NavTarget::Tab(tab_id) | overview::NavTarget::Roster { tab_id, .. } => {
+                    let session = crate::SessionId(*tab_id as u64);
+                    if let Some(workspace) = self
+                        .workspaces
+                        .iter()
+                        .find(|w| w.sessions.iter().any(|s| s.id == session))
+                        .map(|w| w.workspace.id)
+                    {
+                        self.select_workspace_id(workspace, window, cx);
+                        self.select_session_id(session, window, cx);
+                    }
+                }
+                overview::NavTarget::Task(id) => self.activate_task(id, window, cx),
+                overview::NavTarget::OpenChat(id) => {
+                    self.find_outcome(owner, &FindOutcome::Open { id: id.clone() }, window, cx)
+                }
+                overview::NavTarget::Nowhere => {}
+            }
+            return;
+        }
+        if let FindOutcome::MakeWorkspace { id } = outcome {
+            if id.remote_id.is_none() {
+                self.make_chat_workspace(&id.id, window, cx);
+            }
+            return;
+        }
+        if let FindOutcome::AddToWorkspace { id, workspace } = outcome {
+            let selected = entry(&self.find_state.borrow(), id).cloned();
+            if let Some(entry) = selected.filter(|_| id.remote_id.is_none())
+                && let Some(target) = self
+                    .owner
+                    .read(cx)
+                    .iced_workspace(crate::WorkspaceId(*workspace))
+                    .cloned()
+            {
+                self.save_chat_workspace(
+                    gitterm_core::workspace_config::ChatWorkspaceEdit::Add {
+                        root: entry.root_id.unwrap_or(entry.id.clone()),
+                        chat: entry.id.clone(),
+                        target: gitterm_core::workspace_config::WorkspaceTarget::of(&target),
+                    },
+                    entry.id,
+                    false,
+                    window,
+                    cx,
+                );
+            }
+            return;
+        }
+        if let FindOutcome::IndexOlderChats = outcome {
+            self.index_older_chats(window, cx);
+            return;
+        }
+        if let FindOutcome::GoToChatOwner { id } = outcome {
+            if self.live_chat_enabled(cx) {
+                self.find_state
+                    .borrow_mut()
+                    .reduce(Intent::ClosePreview(owner.into()));
+            }
+            self.go_to_chat_owner(id, window, cx);
+            if self.live_chat_enabled(cx) {
+                let target_owner = self.find_owner(cx);
+                self.find_state
+                    .borrow_mut()
+                    .reduce(Intent::ClosePreview(target_owner));
+                self.refresh_find(window, cx);
+            }
             return;
         }
         if let FindOutcome::OpenFile(path) = outcome {
@@ -2762,45 +3526,20 @@ impl crate::Shell {
             cx.notify();
         } else if self.live_chat_enabled(cx) {
             let indexed = entry(&self.find_state.borrow(), id).cloned();
-            let workspace = self
-                .active_workspace(cx)
-                .filter(|&workspace| {
-                    self.owner
-                        .read(cx)
-                        .iced_workspace(workspace)
-                        .and_then(crate::workspace_config::workspace_remote_id)
-                        == id.remote_id
-                })
-                .or_else(|| {
-                    self.workspaces
-                        .iter()
-                        .find(|state| {
-                            self.owner
-                                .read(cx)
-                                .iced_workspace(state.workspace.id)
-                                .and_then(crate::workspace_config::workspace_remote_id)
-                                == id.remote_id
-                        })
-                        .map(|state| state.workspace.id)
-                });
-            if let Some(workspace) = workspace {
-                match self.open_saved_live_chat(workspace, &id.id, indexed, window, cx) {
-                    Ok(()) => {
-                        self.find_state
-                            .borrow_mut()
-                            .reduce(Intent::ClosePreview(owner.into()));
-                    }
-                    Err(error) => self.owner.update(cx, |owner, cx| {
-                        owner.error = Some(format!("Resume chat: {error:#}"));
-                        cx.notify();
-                    }),
+            let mode = match outcome {
+                FindOutcome::Resume { mode, .. } => *mode,
+                _ => ResumeMode::Chat,
+            };
+            match self.resume_indexed_chat(id, indexed, mode, None, window, cx) {
+                Ok(()) => {
+                    self.find_state
+                        .borrow_mut()
+                        .reduce(Intent::ClosePreview(owner.into()));
                 }
-            } else {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error =
-                        Some("Open a workspace on this remote machine to resume its chat.".into());
+                Err(error) => self.owner.update(cx, |owner, cx| {
+                    owner.error = Some(format!("Resume chat: {error:#}"));
                     cx.notify();
-                });
+                }),
             }
         } else {
             self.owner.update(cx, |owner, cx| {

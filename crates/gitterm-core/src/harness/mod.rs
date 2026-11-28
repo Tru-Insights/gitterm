@@ -14,4 +14,7 @@ pub mod acp;
 pub mod pi;
 
 #[cfg(feature = "runtime")]
+pub mod acp_launch;
+
+#[cfg(feature = "runtime")]
 pub mod remote_chat;

@@ -117,6 +117,16 @@ impl GitView {
         }
         self.data.terminal_cwd(self.workspace, cx)
     }
+    pub(crate) fn show_changes(&mut self, cx: &mut Context<Self>) {
+        self.sync_session(cx);
+        self.set_mode(Mode::Changes, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changes_selected(&self) -> bool {
+        self.mode == Mode::Changes
+    }
+
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;
@@ -2175,5 +2185,48 @@ mod tab_context_tests {
                 );
             });
         }
+    }
+    #[gpui::test]
+    fn tab_context_task_changes_selects_the_new_tab_before_owner_notification(
+        cx: &mut TestAppContext,
+    ) {
+        let _app = crate::test_app::Cleanup::new(cx);
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let mut model = WorkspaceStatus::default();
+        let workspace = model.add(root.path().into(), std::time::Instant::now());
+        let first = SessionId(41);
+        let second = SessionId(42);
+        model.active_sessions.insert(workspace, first);
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let view = cx.new(|cx| GitView::new(workspace, Rc::new(LocalData(owner.clone())), cx));
+        view.update(cx, |view, cx| {
+            view.sync_session(cx);
+            view.mode = Mode::Worktrees;
+        });
+        owner.update(cx, |owner, cx| {
+            owner.model.active_sessions.insert(workspace, second);
+            owner.model.workspaces[0].root = checkout.path().into();
+            cx.notify();
+        });
+        // Task navigation opens Changes synchronously; the owner observer runs later.
+        view.update(cx, |view, cx| view.show_changes(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.changes_selected());
+            assert_eq!(view.root(cx).as_deref(), Some(checkout.path()));
+        });
+        owner.update(cx, |owner, cx| {
+            owner.model.active_sessions.insert(workspace, first);
+            owner.model.workspaces[0].root = root.path().into();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.mode, Mode::Worktrees);
+            assert_eq!(view.root(cx).as_deref(), Some(root.path()));
+        });
     }
 }

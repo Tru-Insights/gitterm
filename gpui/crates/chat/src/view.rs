@@ -570,6 +570,18 @@ impl ChatView {
         }
         cx.notify();
     }
+    /// Live hosts may answer with the provider's offered persistent permission.
+    /// This flag controls permission cards only, not delegation/review actions.
+    pub fn set_live_permissions(&mut self, cx: &mut Context<Self>) {
+        self.preview = false;
+        for card in self.cards.values() {
+            card.update(cx, |card, cx| {
+                card.preview = false;
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
     /// Remote Live permissions are applied by the agent on its own machine.
     pub fn enable_live_permissions(&mut self, cx: &mut Context<Self>) {
         self.preview = false;
