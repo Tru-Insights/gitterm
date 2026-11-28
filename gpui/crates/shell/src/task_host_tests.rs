@@ -3653,7 +3653,7 @@ fn live_pr_mcp_set_get_preserves_full_response_and_uses_live_root(cx: &mut TestA
     );
     let (config, sender) = fixture.config();
     let owner = cx
-        .update(|cx| TaskHostOwner::start_live(config, lock, services, cx))
+        .update(|cx| TaskHostOwner::start_live_for_test(config, lock, services, cx))
         .unwrap();
     let set = dispatch_as(
         cx,
