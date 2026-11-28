@@ -1,6 +1,8 @@
 //! Native chat composition. The shared workspace owner retains these entities;
 //! docking/hiding never installs another runtime receiver.
+mod acp;
 mod auth;
+pub(crate) use acp::live_acp_catalog;
 mod checkout;
 mod fence;
 mod lease;
@@ -109,11 +111,21 @@ impl Controller {
         }
     }
     fn seed_launch(&mut self, settings: &gitterm_gpui_chat::composer::LaunchSettings) {
-        self.config = gitterm_core::chat::types::AgentBackendConfig::Claude {
-            model: settings.model.clone(),
-            permission_mode: Some(settings.permission_mode.clone()),
-            effort: settings.effort.clone(),
-        };
+        self.config =
+            if let gitterm_core::chat::types::AgentBackendConfig::Acp { agent, .. } = self.config {
+                gitterm_core::chat::types::AgentBackendConfig::Acp {
+                    agent,
+                    model: settings.model.clone(),
+                    mode: Some(settings.permission_mode.clone()),
+                    effort: settings.effort.clone(),
+                }
+            } else {
+                gitterm_core::chat::types::AgentBackendConfig::Claude {
+                    model: settings.model.clone(),
+                    permission_mode: Some(settings.permission_mode.clone()),
+                    effort: settings.effort.clone(),
+                }
+            };
         for event in [
             HarnessEvent::ModelChanged(settings.model.clone()),
             HarnessEvent::PermissionModeChanged(settings.permission_mode.clone()),
@@ -137,6 +149,11 @@ impl Controller {
             intent => intent,
         };
         if !self.remote
+            && !(self.live
+                && matches!(
+                    self.config.backend(),
+                    gitterm_core::chat::types::AgentBackend::Acp(_)
+                ))
             && matches!(
                 answer,
                 ChatIntent::Permission {
@@ -176,21 +193,31 @@ impl Controller {
             self.correlations.insert(correlation, prepared.id());
         }
         let runtime = self.runtime.as_ref();
-        let remote = self.remote;
+        let uncorrelated = self.remote
+            || (self.live
+                && matches!(
+                    self.config.backend(),
+                    gitterm_core::chat::types::AgentBackend::Acp(_)
+                ));
         let result = self
             .adapter
             .execute(prepared, &self.target, now_ms(), |command| {
                 let runtime = runtime.ok_or_else(|| "No preview runtime".to_string())?;
-                if remote {
+                if uncorrelated {
                     runtime.send(command)
                 } else {
                     runtime.send_correlated(command, correlation)
                 }
             });
-        if !matches!(
-            result.0.state,
-            gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
-        ) {
+        if !self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.supports_correlation())
+            || !matches!(
+                result.0.state,
+                gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted
+            )
+        {
             self.correlations.remove(&correlation);
         }
         result
@@ -228,6 +255,9 @@ impl Controller {
                 });
             }
         };
+        if let HarnessEvent::HistoryReplayed { entries } = event {
+            return self.apply_acp_history(source, entries);
+        }
         let config = &mut self.config;
         let mut observe = |_: &AgentEvent, effects: &gitterm_core::chat::state::EventEffects| {
             use gitterm_core::chat::types::{AgentBackendConfig, SettingChange};
@@ -235,6 +265,12 @@ impl Controller {
                 model,
                 permission_mode,
                 effort,
+            }
+            | AgentBackendConfig::Acp {
+                model,
+                mode: permission_mode,
+                effort,
+                ..
             } = config
             {
                 match &effects.settings_changed {
@@ -654,7 +690,14 @@ impl ChatPane {
             }
             if let Err(error) = self.launch_live(cx) {
                 self.shutdown_runtime(cx);
-                let error = format!("Claude unavailable: {error:#}");
+                let error = if matches!(
+                    self.controller.config.backend(),
+                    gitterm_core::chat::types::AgentBackend::Acp(_)
+                ) {
+                    format!("{error:#}")
+                } else {
+                    format!("Claude unavailable: {error:#}")
+                };
                 let view = self.view.clone();
                 let status = error.clone();
                 let missing_cwd = self.remote.is_none()
@@ -685,6 +728,12 @@ impl ChatPane {
         receipt
     }
     fn launch_live(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        if matches!(
+            self.controller.config.backend(),
+            gitterm_core::chat::types::AgentBackend::Acp(_)
+        ) {
+            return self.launch_acp(cx);
+        }
         if self.remote.is_some() {
             return self.launch_remote(None, cx);
         }
@@ -1106,6 +1155,9 @@ impl ChatPane {
                 .update(cx, |view, cx| view.set_guidelines_status(applied, cx));
         }
         if self.controller.live {
+            if self.receive_acp_event(&event, cx) {
+                return;
+            }
             if matches!(
                 &event,
                 RuntimeEvent::Harness(HarnessEvent::TurnStarted { .. })
@@ -1195,6 +1247,16 @@ impl ChatPane {
         }
         if exited {
             self.shutdown_runtime(cx);
+            if matches!(
+                self.controller.config.backend(),
+                gitterm_core::chat::types::AgentBackend::Acp(_)
+            ) {
+                self.history_loading = false;
+                if let Some(error) = self.resume_error.clone() {
+                    self.resume_failed(error, cx);
+                }
+                return;
+            }
             if self.awaiting_resume && self.remote.is_none() {
                 self.resume_failed(
                     "Cannot resume saved Claude session: process exited before the turn started"

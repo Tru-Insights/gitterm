@@ -43,7 +43,6 @@ use gitterm_core::harness::claude::{Launch, SnapshotFuture, SnapshotRecorder};
 
 #[cfg(test)]
 use gitterm_core::harness::local_launch::child_environment;
-pub(super) use gitterm_core::harness::local_launch::child_path;
 pub use gitterm_core::harness::local_launch::resolve_claude_program;
 
 /// Handle to a running Claude session. Dropping a local one shuts the
@@ -179,6 +178,9 @@ fn local_launch(
 }
 
 impl SnapshotRecorder for crate::turn_snapshots::Recorder {
+    fn end(&mut self) -> SnapshotFuture<'_> {
+        Box::pin(self.end())
+    }
     fn observe(&mut self, event: &HarnessEvent) {
         self.observe(event);
     }

@@ -4119,18 +4119,7 @@ fn new_acp_chat_config(
     chat_config: &config::ChatDefaults,
     agent: gitterm::harness::acp::AcpAgent,
 ) -> AgentBackendConfig {
-    use gitterm::harness::acp::AcpAgent;
-    let model = match agent {
-        AcpAgent::Antigravity => chat_config.antigravity_model.trim().to_string(),
-        AcpAgent::Gemini => String::new(),
-        AcpAgent::OpenCode => chat_config.opencode_model.trim().to_string(),
-    };
-    AgentBackendConfig::Acp {
-        agent,
-        model,
-        mode: Some(agent.default_mode().to_string()),
-        effort: None,
-    }
+    gitterm_core::harness::acp_launch::new_chat_config(chat_config, agent)
 }
 
 /// The session of a chat tab resuming Claude session `session_id`: the new

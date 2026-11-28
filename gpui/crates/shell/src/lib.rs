@@ -178,6 +178,7 @@ pub struct Shell {
     task_panel: Option<Entity<task_panel::TaskPanel>>,
     /// Iced's configured agent presets, read once with the host settings.
     agent_presets: Vec<gitterm_core::settings::AgentPreset>,
+    chat_defaults: gitterm_core::settings::ChatDefaults,
     /// Background actions the modal guard refused, for the guard's tests.
     #[cfg(test)]
     blocked_actions: Vec<&'static str>,
@@ -502,6 +503,7 @@ impl Shell {
             #[cfg(feature = "stt")]
             dictation: dictation::Dictation::new(settings.stt_enabled),
             agent_presets: settings.agent_presets.clone(),
+            chat_defaults: settings.chat.clone(),
             #[cfg(test)]
             blocked_actions: vec![],
             task_switcher_subscription: None,

@@ -1743,3 +1743,20 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "runtime")]
+pub(crate) mod runtime;
+
+#[cfg(feature = "runtime")]
+pub async fn run_session_harness(
+    launch: super::acp_launch::Launch,
+    commands: tokio::sync::mpsc::UnboundedReceiver<crate::chat::types::HarnessCommand>,
+    events: tokio::sync::mpsc::UnboundedSender<HarnessEvent>,
+) {
+    runtime::run_session(
+        launch,
+        commands,
+        crate::chat::runtime::EventSink::Harness(events),
+    )
+    .await;
+}

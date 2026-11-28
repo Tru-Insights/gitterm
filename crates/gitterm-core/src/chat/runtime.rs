@@ -186,6 +186,71 @@ impl Session {
         }
     }
 
+    /// ACP uses the Iced session loop and channel-acceptance semantics. The
+    /// host retains this handle until the process and snapshots have joined.
+    pub fn spawn_acp_runtime(
+        prepare: impl FnOnce(CancellationToken) -> Result<crate::harness::acp_launch::Launch, String>
+            + Send
+            + 'static,
+    ) -> (Self, mpsc::UnboundedReceiver<RuntimeEvent>) {
+        let (commands, cmd_rx) = mpsc::unbounded_channel();
+        let (tx, events) = mpsc::unbounded_channel();
+        let snapshots_closed = CancellationToken::new();
+        let close_token = snapshots_closed.clone();
+        let (done, completion) = oneshot::channel();
+        let thread = std::thread::Builder::new()
+            .name("acp-session".into())
+            .spawn(move || {
+                let sink = EventSink::Runtime(tx);
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                match result {
+                    Ok(rt) => {
+                        rt.block_on(async move {
+                            match prepare(close_token.clone()) {
+                                Ok(launch) => {
+                                    crate::harness::acp::runtime::run_session(launch, cmd_rx, sink)
+                                        .await
+                                }
+                                Err(error) => {
+                                    sink.emit(HarnessEvent::Error(error));
+                                    sink.emit(HarnessEvent::ProcessExited { code: None });
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        sink.emit(HarnessEvent::Error(format!(
+                            "could not start the ACP session runtime: {error}"
+                        )));
+                        sink.emit(HarnessEvent::ProcessExited { code: None });
+                    }
+                }
+                let _ = done.send(());
+            });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                eprintln!("[acp] could not spawn session thread: {error}");
+                None
+            }
+        };
+        (
+            Self {
+                commands: CommandPort::Remote(commands),
+                snapshots_closed,
+                shutdown_on_drop: true,
+                supports_correlation: false,
+                pid: Default::default(),
+                completion: Some(completion),
+                thread,
+                thread_error: "the ACP session thread panicked",
+            },
+            events,
+        )
+    }
+
     /// Host-owned transport port. No local process or executor is owned.
     pub fn from_port(
         commands: mpsc::UnboundedSender<HarnessCommand>,

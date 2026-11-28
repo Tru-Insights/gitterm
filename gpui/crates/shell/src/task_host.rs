@@ -729,6 +729,19 @@ impl TaskHostOwner {
         })
     }
 
+    pub(crate) fn acp_mcp_servers(
+        &self,
+        caller: &str,
+    ) -> Vec<gitterm_core::harness::acp::AcpMcpServer> {
+        self.servers.as_ref().map_or_else(Vec::new, |servers| {
+            self.host.issue_caller(caller);
+            vec![
+                servers.task_mcp.acp_mcp_server(Some(caller)),
+                servers.browser.acp_mcp_server(Some(caller)),
+            ]
+        })
+    }
+
     /// The chrome uses exactly the MCP host's context, engine and runtime.
     pub(crate) fn browser_host(&self) -> Option<crate::browser::Host> {
         let servers = self.servers.as_ref()?;

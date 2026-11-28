@@ -373,12 +373,16 @@ impl crate::Shell {
     pub(crate) fn picker_inputs(
         &self,
         task: Option<crate::session_picker::TaskContext>,
+        cx: &gpui::App,
     ) -> crate::session_picker::PickerInputs {
         crate::session_picker::PickerInputs {
             chat: gitterm_core::settings::ChatDefaults::default().new_chat_selection(),
             local_workspace: self.local,
-            // TODO(TRU-274 P-src): project the ACP catalog here.
-            acp_chats: vec![],
+            acp_chats: if self.live_chat_enabled(cx) {
+                crate::chat::live_acp_catalog(&self.chat_defaults)
+            } else {
+                vec![]
+            },
             presets: self.agent_presets.clone(),
             task,
         }
@@ -405,7 +409,7 @@ impl crate::Shell {
         {
             return;
         }
-        let inputs = self.picker_inputs(task);
+        let inputs = self.picker_inputs(task, cx);
         let previous_focus = window.focused(cx).unwrap_or_else(|| self.focus.clone());
         let opening_workspace = self.active_workspace(cx);
         let picker = cx.new(|cx| crate::session_picker::SessionPicker::new(inputs.clone(), cx));
@@ -453,6 +457,9 @@ impl crate::Shell {
         use crate::session_picker::SessionPickerOutcome as O;
         match outcome {
             O::NewChat if self.local => self.new_claude_chat(None, window, cx),
+            O::AcpChat { id } if self.local && self.live_chat_enabled(cx) => {
+                self.new_acp_chat(*id, window, cx)
+            }
             O::Terminal if self.local => self.new_terminal(window, cx),
             O::Cli { preset } if self.live_chat_enabled(cx) => {
                 self.launch_agent_preset(*preset, window, cx)
@@ -1034,7 +1041,7 @@ impl crate::Shell {
         if self.live_chat_enabled(cx) {
             // Iced restores every open agent tab. Register background panes too,
             // so delivery can reach them before they are ever selected. Resume
-            // defers the provider process until a prompt is actually submitted.
+            // loads ACP history only for the selected tab.
             let selected = self.active_workspace(cx).and_then(|workspace| {
                 let state = self
                     .workspaces
@@ -1076,6 +1083,16 @@ impl crate::Shell {
                         cx.notify();
                     });
                 }
+            }
+            if let Some((workspace, id)) = selected
+                && let Some(pane) = self
+                    .workspace(workspace)
+                    .panes
+                    .get(&crate::session_pane_id(id))
+                && let crate::pane::PaneContent::PreviewChat(chat) = &pane.read(cx).content
+            {
+                chat.clone()
+                    .update(cx, |chat, cx| chat.load_acp_history(cx));
             }
             return;
         }
@@ -1528,6 +1545,7 @@ impl crate::Shell {
     ) {
         use gpui::AppContext as _;
         let target = view.read(cx).target();
+        let title = view.read(cx).backend_label();
         self._subscriptions
             .push(crate::task_host::forward_turn_ends(&view, cx));
         self.owner.update(cx, |owner, _| {
@@ -1555,7 +1573,7 @@ impl crate::Shell {
             let pane = cx.new(|cx| {
                 crate::pane::Pane::new(
                     pane_id.clone(),
-                    "Claude".into(),
+                    title.clone(),
                     crate::pane::PaneKind::PreviewChat(view),
                     workspace,
                     self.data.clone(),
@@ -1575,7 +1593,7 @@ impl crate::Shell {
             state.panes.insert(pane_id.clone(), pane);
             state.sessions.push(crate::data::Session {
                 id,
-                title: "Claude".into(),
+                title,
                 kind: crate::data::SessionKind::Chat,
             });
         }
@@ -2497,6 +2515,30 @@ impl crate::Shell {
                 })?;
             return self.open_saved_live_chat(workspace, &id.id, indexed, window, cx);
         }
+        // ACP sessions have recorded tab configuration, not Claude index metadata.
+        let acp_workspace = self.owner.read(cx).iced_catalog().and_then(|catalog| {
+            catalog
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(index, workspace)| {
+                    (crate::workspace_config::workspace_remote_id(workspace).is_none()
+                        && !workspace.is_legacy_remote()
+                        && workspace.tabs.iter().any(|tab| {
+                            tab.chat_session_id.as_deref() == Some(&id.id)
+                                && tab.agent_config.as_ref().is_some_and(|config| {
+                                    matches!(
+                                        config.backend(),
+                                        gitterm_core::chat::types::AgentBackend::Acp(_)
+                                    )
+                                })
+                        }))
+                    .then_some(crate::WorkspaceId(index as u64 + 1))
+                })
+        });
+        if let Some(workspace) = acp_workspace {
+            return self.open_saved_live_chat(workspace, &id.id, indexed, window, cx);
+        }
         let entry = indexed
             .or_else(|| self.indexed_chat(id, cx))
             .ok_or_else(|| anyhow::anyhow!("Saved conversation metadata unavailable: {}", id.id))?;
@@ -2874,6 +2916,38 @@ impl crate::Shell {
     }
 }
 
+impl crate::Shell {
+    fn new_acp_chat(
+        &mut self,
+        agent: gitterm_core::chat::types::AcpAgent,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.owner.read(cx).workspace_save_pending
+            || !gitterm_core::chat::types::AcpAgent::ALL.contains(&agent)
+        {
+            return;
+        }
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let Some(cwd) = self.data.terminal_cwd(workspace, cx) else {
+            return;
+        };
+        let mut tab = crate::chat::resume::tab(&cwd, fresh_target().session_uid, None);
+        tab.agent_config = Some(gitterm_core::harness::acp_launch::new_chat_config(
+            &self.chat_defaults,
+            agent,
+        ));
+        if let Err(error) = self.mount_live_chat(workspace, tab, None, true, window, cx) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some(format!("New {} chat: {error:#}", agent.label()));
+                cx.notify();
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2885,12 +2959,22 @@ mod tests {
         });
         let before = shell.read_with(cx, |shell, cx| shell.active(cx).sessions.len());
         shell.update_in(cx, |shell, window, cx| {
-            for kind in [
-                gitterm_core::remote::launch::SessionKind::Shell,
-                gitterm_core::remote::launch::SessionKind::Codex,
-                gitterm_core::remote::launch::SessionKind::Claude,
+            for (kind, expected) in [
+                (
+                    gitterm_core::remote::launch::SessionKind::Shell,
+                    "Shell · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Codex,
+                    "Codex · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Claude,
+                    "Claude · not available in preview",
+                ),
             ] {
                 shell.open_remote_session_terminal(kind, window, cx);
+                assert_eq!(shell.owner.read(cx).error.as_deref(), Some(expected));
             }
             shell.new_terminal(window, cx);
         });

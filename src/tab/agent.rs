@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
 use gitterm::harness::acp::AcpAgent;
-use gitterm::harness::acp::{AcpMcpServer, AcpSessionConfig, ACP_WIRE_LOG_ENV};
+use gitterm::harness::acp::{AcpMcpServer, AcpSessionConfig};
 use gitterm::harness::claude::{ClaudeMcpServer, ClaudeSessionConfig};
 #[cfg(test)]
 use gitterm::harness::transcript::TranscriptEntry;
@@ -198,37 +198,17 @@ impl AgentSession {
         mcp_servers: Vec<AcpMcpServer>,
         guidelines: Option<gitterm::guidelines::Guidelines>,
     ) -> Option<AcpSessionConfig> {
-        let AgentBackendConfig::Acp {
-            agent,
-            model,
-            mode,
-            effort,
-        } = &self.config
-        else {
-            return None;
-        };
-        if self.config.read_only_note().is_some() {
-            return None;
-        }
-        let model = model.trim();
-        Some(AcpSessionConfig {
-            snapshot_facts_dir: Some(gitterm::chat_facts::facts_dir(
-                &crate::config::global_config_dir(),
-            )),
-            agent: *agent,
+        let mut config = gitterm_core::harness::acp_launch::session_config(
+            &self.config,
             cwd,
-            resume: self.session_id.clone(),
-            model: (!model.is_empty()).then(|| model.to_string()),
-            mode: Some(
-                mode.clone()
-                    .unwrap_or_else(|| agent.default_mode().to_string()),
-            ),
-            effort: effort.clone(),
+            self.session_id.clone(),
             mcp_servers,
-            env: Vec::new(),
-            wire_log_dir: std::env::var_os(ACP_WIRE_LOG_ENV).map(PathBuf::from),
             guidelines,
-        })
+        )?;
+        config.snapshot_facts_dir = Some(gitterm::chat_facts::facts_dir(
+            &crate::config::global_config_dir(),
+        ));
+        Some(config)
     }
 
     pub(crate) fn backend(&self) -> AgentBackend {
@@ -677,6 +657,47 @@ mod tests {
             .is_none());
         assert_eq!(session.backend(), AgentBackend::Acp(AcpAgent::Gemini));
         assert!(!AcpAgent::ALL.contains(&AcpAgent::Gemini));
+    }
+
+    #[test]
+    fn iced_acp_launch_contract_pin() {
+        let mut session = AgentSession::new(AgentBackendConfig::Acp {
+            agent: AcpAgent::Antigravity,
+            model: " placeholder-retired-model ".into(),
+            mode: None,
+            effort: Some("high".into()),
+        });
+        session.bind_session(Some("placeholder-recorded-session".into()));
+        let config = session
+            .acp_session_config(PathBuf::from("/placeholder/repo"), vec![], None)
+            .unwrap();
+        assert_eq!(config.args(), ["acp"]);
+        assert_eq!(config.cwd, PathBuf::from("/placeholder/repo"));
+        assert_eq!(
+            config.resume.as_deref(),
+            Some("placeholder-recorded-session")
+        );
+        assert_eq!(config.model.as_deref(), Some("placeholder-retired-model"));
+        assert_eq!(config.mode.as_deref(), Some("default"));
+        assert_eq!(config.effort.as_deref(), Some("high"));
+        assert!(config.env.is_empty());
+        assert_eq!(config.agent.program(), "agy");
+        let opencode = AgentSession::new(AgentBackendConfig::Acp {
+            agent: AcpAgent::OpenCode,
+            model: String::new(),
+            mode: None,
+            effort: None,
+        })
+        .acp_session_config(PathBuf::from("/placeholder/repo"), vec![], None)
+        .unwrap();
+        assert_eq!(opencode.mode.as_deref(), Some("build"));
+        assert_eq!(
+            gitterm::harness::acp::prepare_agent_env(&opencode),
+            vec![(
+                "OPENCODE_CONFIG_CONTENT".into(),
+                serde_json::json!({"permission":{"edit":"ask","bash":"ask"}}).to_string()
+            )]
+        );
     }
 
     #[test]

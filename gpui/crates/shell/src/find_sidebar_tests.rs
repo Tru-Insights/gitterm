@@ -2162,3 +2162,60 @@ fn remaining_find_live_and_preview_project_steps_children_cost_plan_and_waiting_
     assert_eq!(live_facts.digests, preview_facts.digests);
     assert_eq!(settled_tree_snapshot(root.path()), before);
 }
+
+#[gpui::test]
+fn find_sidebar_resume_recorded_acp_without_claude_index(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let (root, shell, cx) = crate::h2_tests::fixture_with(cx, false, |file| {
+        file["workspaces"][1]["tabs"][1]["dir"] = serde_json::json!(directory.path());
+        file["workspaces"][1]["tabs"][1]["agent_config"] = serde_json::json!({
+            "backend":"acp", "agent":"gemini", "model":"placeholder-retired-model"
+        });
+    });
+    cx.update(|window, cx| {
+        crate::chat::policy::install_live(
+            gitterm_core::preview::service::ServiceContext::production(
+                &root.path().join("iced"),
+                "find-acp-resume-test",
+            )
+            .unwrap(),
+            cx,
+        )
+        .unwrap();
+        shell.update(cx, |shell, cx| {
+            // Keep the recorded DTO while simulating a tab that is not mounted.
+            let state = shell.workspace_mut(crate::WorkspaceId(2));
+            let session = state.sessions.remove(1);
+            state.panes.remove(&crate::session_pane_id(session.id));
+            let owner = shell.find_owner(cx);
+            shell.find_outcome(
+                &owner,
+                &FindOutcome::Resume {
+                    id: ChatRef::local("saved-chat"),
+                    mode: ResumeMode::Chat,
+                },
+                window,
+                cx,
+            );
+            assert!(
+                shell.owner.read(cx).error.is_none(),
+                "{:?}",
+                shell.owner.read(cx).error
+            );
+            let state = shell.active(cx);
+            assert_eq!(state.workspace.id, crate::WorkspaceId(2));
+            let pane = state.panes[&crate::session_pane_id(state.active_session.unwrap())].read(cx);
+            let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+                panic!("recorded ACP chat did not reach the native pane")
+            };
+            assert!(chat.read(cx).matches_chat("saved-chat"));
+            assert_eq!(
+                chat.read(cx).config().backend(),
+                gitterm_core::chat::types::AgentBackend::Acp(
+                    gitterm_core::chat::types::AcpAgent::Gemini
+                )
+            );
+        });
+    });
+}
