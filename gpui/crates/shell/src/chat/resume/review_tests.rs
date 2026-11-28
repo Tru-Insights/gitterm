@@ -153,6 +153,7 @@ fn saved(root: &Path) -> WorkspacesFile {
 
 #[gpui::test]
 fn finding_f1_launch_directory_matches_iced(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "cwd") else {
         return;
     };
@@ -224,6 +225,7 @@ fn finding_f1_launch_directory_matches_iced(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn finding_f2_new_and_fresh_tabs_store_provider_directory(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "fresh") else {
         return;
     };
@@ -317,6 +319,7 @@ fn finding_f3_nested_unknown_settings_follow_iced_typed_save() {
 
 #[gpui::test]
 fn finding_f4_acknowledged_settings_survive_restart(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "settings") else {
         return;
     };
@@ -407,6 +410,7 @@ fn finding_f4_acknowledged_settings_survive_restart(cx: &mut gpui::TestAppContex
 
 #[gpui::test]
 fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "errors") else {
         return;
     };
@@ -475,6 +479,7 @@ fn finding_f5_recoverable_error_and_exit_before_turn(cx: &mut gpui::TestAppConte
 
 #[gpui::test]
 fn finding_f6_turn_started_clears_resume_before_exit(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "started") else {
         return;
     };
@@ -546,6 +551,7 @@ fn unsent_tab(cwd: &Path, uid: &str) -> WorkspaceTabConfig {
 fn finding_saved_unsent_claude_is_editable_deferred_and_keeps_launch_settings(
     cx: &mut gpui::TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, _services, workspace)) = prepare(cx, "unsent-mount") else {
         return;
     };
@@ -644,6 +650,7 @@ fn confirm_unsent(pane: &mut ChatPane, services: &ServiceContext, cx: &mut Conte
 
 #[gpui::test]
 fn finding_saved_unsent_turn_updates_the_same_tab(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, mut workspace)) = prepare(cx, "unsent-persist") else {
         return;
     };
@@ -707,6 +714,7 @@ fn finding_saved_unsent_turn_updates_the_same_tab(cx: &mut gpui::TestAppContext)
 
 #[gpui::test]
 fn finding_saved_unsent_after_confirmation_still_resumes_history(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let Some((root, preview, services, workspace)) = prepare(cx, "unsent-resume") else {
         return;
     };

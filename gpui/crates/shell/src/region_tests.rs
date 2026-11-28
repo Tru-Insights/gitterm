@@ -31,6 +31,7 @@ fn draw(cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -148,6 +149,7 @@ fn region_order_sizes_and_explicit_bottom_terminal(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn workspace_bar_lists_names_and_click_selects(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let config = tempfile::tempdir().unwrap();
@@ -190,6 +192,7 @@ fn workspace_bar_lists_names_and_click_selects(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn sidebar_collapse_and_files_mode_keep_content_in_left_region(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -244,6 +247,7 @@ fn sidebar_collapse_and_files_mode_keep_content_in_left_region(cx: &mut TestAppC
 
 #[gpui::test]
 fn legacy_split_renders_only_the_active_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -325,6 +329,7 @@ fn sidebar_widths(shell: &Entity<Shell>, cx: &VisualTestContext) -> Vec<f32> {
 
 #[gpui::test]
 fn sidebar_width_comes_from_iced_settings_for_every_workspace(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let iced = tempfile::tempdir().unwrap();
     std::fs::write(
         iced.path().join("settings.json"),
@@ -364,6 +369,7 @@ fn sidebar_width_comes_from_iced_settings_for_every_workspace(cx: &mut TestAppCo
 
 #[gpui::test]
 fn sidebar_width_clamps_like_iced_and_defaults_when_settings_missing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let iced = tempfile::tempdir().unwrap();
     std::fs::write(
         iced.path().join("settings.json"),

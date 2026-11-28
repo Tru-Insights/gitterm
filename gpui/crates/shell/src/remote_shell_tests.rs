@@ -257,6 +257,7 @@ pub(crate) fn bar(f: &Fixture, outcome: workspace_bar::Outcome, cx: &mut VisualT
 
 #[gpui::test]
 fn picker_browses_a_remote_and_use_this_folder_is_a_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let before = snapshot(&f.iced());
     bar(&f, workspace_bar::Outcome::OpenFolder, cx);
@@ -329,6 +330,7 @@ fn picker_browses_a_remote_and_use_this_folder_is_a_notice(cx: &mut TestAppConte
 
 #[gpui::test]
 fn typed_remote_path_lists_only_a_folder_and_home_tilde_expands(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     bar(
         &f,
@@ -363,6 +365,7 @@ fn typed_remote_path_lists_only_a_folder_and_home_tilde_expands(cx: &mut TestApp
 
 #[gpui::test]
 fn use_macos_dialog_opens_the_os_picker(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     bar(&f, workspace_bar::Outcome::AddWorkspace("local".into()), cx);
     assert!(!cx.did_prompt_for_paths());
@@ -376,6 +379,7 @@ fn use_macos_dialog_opens_the_os_picker(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn new_work_add_repo_has_no_machine_chips_and_returns_the_folder(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     f.shell.update_in(cx, |shell, window, cx| {
         shell.open_new_work_sheet(window, cx)
@@ -401,6 +405,7 @@ fn new_work_add_repo_has_no_machine_chips_and_returns_the_folder(cx: &mut TestAp
 
 #[gpui::test]
 fn connect_form_drafts_locally_and_connect_saves_nothing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let before = snapshot(&f.iced());
     bar(&f, workspace_bar::Outcome::OpenFolder, cx);
@@ -429,6 +434,7 @@ fn connect_form_drafts_locally_and_connect_saves_nothing(cx: &mut TestAppContext
 
 #[gpui::test]
 fn refresh_lists_remote_sessions_through_the_client(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let id = cx.read(|cx| {
         f.shell
@@ -464,6 +470,7 @@ fn refresh_lists_remote_sessions_through_the_client(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn show_machine_chats_scopes_find_to_that_machine(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     bar(
         &f,

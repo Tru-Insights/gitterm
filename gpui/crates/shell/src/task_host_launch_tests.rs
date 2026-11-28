@@ -246,6 +246,7 @@ fn wait_for_start(dir: &Path, run: usize) {
 
 #[gpui::test]
 fn launch_publishes_only_after_save(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let (_subscription, seen) = launches.observe(cx);
@@ -284,6 +285,7 @@ fn launch_publishes_only_after_save(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn launch_origin_mcp_vs_ui_preserved(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::plan_limits::{LimitWindow, PlanLimits, PlanLimitsFile, Provider};
     let launches = Launches::start(cx);
     let held = launches.create(cx);
@@ -341,6 +343,7 @@ fn launch_origin_mcp_vs_ui_preserved(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn save_failure_on_queued_launch_gives_no_success_reply(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::plan_limits::{LimitWindow, PlanLimits, PlanLimitsFile, Provider};
     let launches = Launches::start(cx);
     let task = launches.create(cx);
@@ -381,6 +384,7 @@ fn save_failure_on_queued_launch_gives_no_success_reply(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn launch_save_then_attach_failure_leaves_no_child(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let other = launches.create(cx);
@@ -428,6 +432,7 @@ fn launch_save_then_attach_failure_leaves_no_child(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn fixture_worker_checked_trust_equals_effective_config(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.launch(&task, Some("Codex"), cx).unwrap();
@@ -463,6 +468,7 @@ fn fixture_worker_checked_trust_equals_effective_config(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn fixture_add_dir_outside_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let mut worker = worker_delegation("worker", &task, "gone");
@@ -502,6 +508,7 @@ fn fixture_git(dir: &Path, args: &[&str]) -> String {
 
 #[gpui::test]
 fn launch_refused_when_git_names_a_work_tree_outside(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -536,6 +543,7 @@ fn launch_refused_when_git_names_a_work_tree_outside(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn launched_terminal_env_has_only_the_fixture_env(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let reply = launches.launch(&task, Some("Codex"), cx).unwrap();
@@ -583,6 +591,7 @@ fn launched_terminal_env_has_only_the_fixture_env(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn brief_written_under_preview_root(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let iced_before = tree(&launches.runs.fixture.iced);
     let task = launches.create(cx);
@@ -628,6 +637,7 @@ fn brief_written_under_preview_root(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn imported_records_never_launched(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start_with(
         |runs0| {
             runs0.fixture.write_iced(
@@ -688,6 +698,7 @@ fn imported_records_never_launched(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn unadopted_terminal_killed_at_shutdown(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.launch(&task, Some("Codex"), cx).unwrap();
@@ -701,6 +712,7 @@ fn unadopted_terminal_killed_at_shutdown(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn shell_adopts_launched_terminal_into_a_pane(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let owner = launches.runs.owner.clone();
@@ -752,6 +764,7 @@ fn shell_adopts_launched_terminal_into_a_pane(cx: &mut TestAppContext) {
 /// entry holds the same, in memory and in the saved file.
 #[gpui::test]
 fn adopted_terminal_saves_its_startup_command_on_its_layout_pane(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let repo = launches.runs.git.repo.clone();
     pin_claude_trust(&launches, &repo, true);
@@ -905,6 +918,7 @@ fn session_holding(
 /// shape, with the tab's label and workspace. Another task lists none.
 #[gpui::test]
 fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let other = launches.create(cx);
@@ -988,6 +1002,7 @@ fn open_sessions_lists_panes_holding_the_task(cx: &mut TestAppContext) {
 /// session's pane again gives it back.
 #[gpui::test]
 fn is_active_follows_the_active_pane(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let config = tempfile::tempdir().unwrap();
@@ -1022,6 +1037,7 @@ fn is_active_follows_the_active_pane(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn preview_still_answers_notice_for_launch_and_delegate(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::preview::service::preview_notice;
     let fixture = Fixture::new();
     fixture.write_iced(
@@ -1080,6 +1096,7 @@ fn pin_claude_trust(launches: &Launches, repo: &Path, trusted: bool) -> PathBuf 
 /// child's HOME gets a trust file.
 #[gpui::test]
 fn fixture_claude_trust_written_to_pinned_config(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let repo = launches.runs.git.repo.clone();
     let root = launches.runs.fixture.roots.root().to_path_buf();
@@ -1144,6 +1161,7 @@ fn tick_until(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext)
 /// session's child exits, its task then running.
 #[gpui::test]
 fn queued_launch_promoted_when_a_slot_frees(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start_with(
         |runs0| {
             std::fs::write(
@@ -1193,6 +1211,7 @@ fn queued_launch_promoted_when_a_slot_frees(cx: &mut TestAppContext) {
 /// completes its delegation; another caller cannot.
 #[gpui::test]
 fn launched_terminal_handoff_routes_to_its_task_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     launches.runs.owner.update(cx, |owner, _| {
@@ -1235,6 +1254,7 @@ fn launched_terminal_handoff_routes_to_its_task_session(cx: &mut TestAppContext)
 /// pane shows the exit or the tick closed it as a final worker first.
 #[gpui::test]
 fn adopted_terminal_exit_updates_its_task(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let plain = launches.create(cx);
     let worker = launches.create(cx);
@@ -1298,6 +1318,7 @@ fn adopted_terminal_exit_updates_its_task(cx: &mut TestAppContext) {
 /// the workspaces the fixture host was given.
 #[gpui::test]
 fn launch_adds_documents_note_and_workspace_chrome(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let name = stored_task(&launches.runs.owner, &task, cx).workspace.name;
@@ -1356,6 +1377,7 @@ fn preassigned_claude_session_id_follows_iced() {
 /// start_delegation_run gives them, from the preview root.
 #[gpui::test]
 fn fixture_codex_run_gets_guidelines(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let runs = Runs::start(2, cx);
     let id = runs.consult(cx);
     wait_until(cx, |cx| runs.status(&id, cx) == "completed");
@@ -1430,6 +1452,7 @@ fn only_pane(shell: &Entity<crate::Shell>, cx: &gpui::App) -> Entity<crate::pane
 /// the host started and the pane adopted; the layout keeps its fields.
 #[gpui::test]
 fn fixture_restore_runs_the_saved_command_in_the_saved_folder(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1475,6 +1498,7 @@ fn fixture_restore_runs_the_saved_command_in_the_saved_folder(cx: &mut TestAppCo
 /// worktree; with that gone too, a plain shell that keeps the saved fields.
 #[gpui::test]
 fn restore_falls_back_to_the_worktree_then_a_plain_shell(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1529,6 +1553,7 @@ fn restore_falls_back_to_the_worktree_then_a_plain_shell(cx: &mut TestAppContext
 /// starts; the layout file still holds the saved fields after a save.
 #[gpui::test]
 fn preview_restore_starts_a_plain_shell_and_keeps_the_saved_fields(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let git = GitFixture::new(&fixture);
@@ -1571,6 +1596,7 @@ fn preview_restore_starts_a_plain_shell_and_keeps_the_saved_fields(cx: &mut Test
 /// `--session-id` whose transcript exists is resumed.
 #[gpui::test]
 fn fixture_restore_rewrites_claude_against_the_fixture_transcripts(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1660,6 +1686,7 @@ fn plain_shell_answers(shell: &Entity<crate::Shell>, vcx: &mut gpui::VisualTestC
 /// nothing and keeps the saved fields.
 #[gpui::test]
 fn restore_refuses_a_saved_add_dir_outside_the_fixture(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1699,6 +1726,7 @@ fn restore_refuses_a_saved_add_dir_outside_the_fixture(cx: &mut TestAppContext) 
 /// command runs with it.
 #[gpui::test]
 fn restore_runs_a_saved_add_dir_inside_the_fixture(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1735,6 +1763,7 @@ fn restore_runs_a_saved_add_dir_inside_the_fixture(cx: &mut TestAppContext) {
 /// restore starts a fresh `claude`, never `--resume` of a missing id.
 #[gpui::test]
 fn restore_of_an_unmessaged_claude_launch_starts_fresh(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1785,6 +1814,7 @@ mod close_tests;
 /// fields.
 #[gpui::test]
 fn restore_runs_only_a_command_in_gpuis_saved_form(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1826,6 +1856,7 @@ fn restore_runs_only_a_command_in_gpuis_saved_form(cx: &mut TestAppContext) {
 /// `claude` with its options (issue 88).
 #[gpui::test]
 fn restore_runs_gpuis_own_saved_forms(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1940,6 +1971,7 @@ fn restores_a_plain_shell(
 /// `/bin/sh -c` script never runs.
 #[gpui::test]
 fn restore_refuses_a_saved_session_id_gpui_never_makes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);
@@ -1961,6 +1993,7 @@ fn restore_refuses_a_saved_session_id_gpui_never_makes(cx: &mut TestAppContext) 
 /// rewrite to plain `claude`, but restores a plain shell.
 #[gpui::test]
 fn restore_checks_the_saved_form_before_the_rewrite(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let launches = Launches::start(cx);
     let task = launches.create(cx);
     let worktree = launches.worktree(&task, cx);

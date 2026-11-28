@@ -64,6 +64,7 @@ fn process_exists(pid: &str) -> bool {
 
 #[gpui::test]
 fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -206,6 +207,7 @@ fn ordered_sessions_restore_fresh_shells_and_prune_stale_ids(cx: &mut TestAppCon
 
 #[gpui::test]
 fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();
@@ -233,6 +235,7 @@ fn fresh_local_workspace_creates_no_terminal(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn explicit_terminal_close_reaps_and_hidden_exit_updates_title(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir().unwrap();

@@ -406,6 +406,7 @@ fn the_agent_pane_reads_the_active_tabs_repo_like_iced() {
 #[cfg(test)]
 #[gpui::test]
 fn a_long_plugin_name_never_overlaps_the_scope_tag(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::agent_config::{AgentConfigItem, ConfigScope};
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);

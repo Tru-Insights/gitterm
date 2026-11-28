@@ -28,3 +28,7 @@ mod launch_tests;
 
 #[cfg(test)]
 mod tool_tests;
+
+#[cfg(test)]
+#[path = "../../../test_app.rs"]
+mod test_app;

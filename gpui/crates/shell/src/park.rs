@@ -984,6 +984,7 @@ mod live_tests {
 
     #[gpui::test]
     fn live_stop_and_keep_running_apply_only_after_save(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let fixture = tempfile::tempdir().unwrap();
@@ -1145,6 +1146,7 @@ mod live_tests {
     }
     #[gpui::test]
     fn done_on_a_saved_park_does_not_add_a_runtime_workspace(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         let root = tempfile::tempdir().unwrap();
         let file = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[
@@ -1177,6 +1179,7 @@ mod live_tests {
     fn confirmed_tab_publishes_only_after_save_and_failed_save_keeps_catalog(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use std::os::unix::fs::PermissionsExt;
         cx.background_executor.allow_parking();
         let root = tempfile::tempdir().unwrap();

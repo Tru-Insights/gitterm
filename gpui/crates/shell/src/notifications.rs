@@ -336,6 +336,7 @@ mod tests {
     fn attention_notifications_live_owner_uses_hidden_chat_events_and_never_posts(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let start = Instant::now();
         let at = |s| start + Duration::from_secs(s);
