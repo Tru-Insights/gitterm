@@ -924,7 +924,7 @@ mod ui {
                             .child(div().font_family("Menlo").text_size(px(appearance.size(12.))).child(label))
                             .disabled(match id {
                                 "review" => !matches!(self.backend, Some(gitterm_core::chat::types::AgentBackend::Claude)),
-                                "checkout" => disabled,
+                                "checkout" => false,
                                 _ => disabled || crate::pickers::Picker::from_chip(id).is_none_or(|picker| self.catalog.options(picker).is_empty()),
                             })
                             .on_click(cx.listener(move |view, _, window, cx| {
@@ -948,13 +948,13 @@ mod ui {
                         chip.into_any_element()
                     }))
                     .children(review.open.then(|| review.render(self.streaming || self.pending_request, appearance, cx))))
-                .children(self.picker.filter(|picker| !disabled && *picker == crate::pickers::Picker::Checkout).map(|_| {
+                .children(self.picker.filter(|picker| *picker == crate::pickers::Picker::Checkout).map(|_| {
                     div().id("checkout-picker").debug_selector(|| "checkout-picker".into())
                         .absolute().bottom(gpui::relative(1.)).left_0().w(px(380.)).max_h(px(360.)).overflow_y_scroll()
                         .flex().flex_col().p(px(6.)).bg(rgb(palette.block)).border_1().border_color(rgb(palette.strong)).rounded(px(6.))
                         .on_click(|_, _, cx| cx.stop_propagation())
-                        .children(self.checkout_locked.is_none().then(|| div().text_color(rgb(palette.muted)).child("Run this chat in")))
-                        .children(self.checkout_choices.iter().filter(|_| self.checkout_locked.is_none()).enumerate().map(|(index, choice)| {
+                        .children((!disabled && self.checkout_locked.is_none()).then(|| div().text_color(rgb(palette.muted)).child("Run this chat in")))
+                        .children(self.checkout_choices.iter().filter(|_| !disabled && self.checkout_locked.is_none()).enumerate().map(|(index, choice)| {
                             let (path, label) = (choice.path.clone(), choice.label.clone());
                             let current = self.checkout_path.as_deref() == Some(choice.path.as_str());
                             Button::new(gpui::SharedString::from(format!("checkout-option-{index}")))

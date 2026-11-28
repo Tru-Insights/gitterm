@@ -15,6 +15,7 @@ pub(super) const DIFF_HINT: &str = "j/k: navigate Esc: back";
 pub(super) struct ViewerVisit {
     pub(super) pane: String,
     session: Option<SessionId>,
+    line: Option<usize>,
 }
 
 fn page_pane_id(workspace: WorkspaceId) -> String {
@@ -92,6 +93,7 @@ impl Shell {
                 ViewerVisit {
                     pane: id.clone(),
                     session,
+                    line: None,
                 },
             );
             cx.notify();
@@ -233,6 +235,7 @@ impl Shell {
                 ViewerVisit {
                     pane: id.clone(),
                     session,
+                    line: None,
                 },
             );
             cx.notify();
@@ -301,6 +304,26 @@ impl Shell {
         }
     }
 
+    pub(crate) fn open_file_viewer_at_line(
+        &mut self,
+        event: &FileOpen,
+        line: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_viewer(event, window, cx);
+        self.content.update(cx, |content, cx| {
+            if let Some(visit) = content
+                .visits
+                .get_mut(&event.workspace)
+                .filter(|visit| visit.pane == crate::content_pane_id(event.workspace, &event.path))
+            {
+                visit.line = line;
+            }
+            cx.notify();
+        });
+    }
+
     pub fn open_file_viewer(
         &mut self,
         event: &FileOpen,
@@ -341,9 +364,14 @@ impl Shell {
         };
         if state.panes.contains_key(&id) {
             self.content.update(cx, |content, cx| {
-                content
-                    .visits
-                    .insert(event.workspace, ViewerVisit { pane: id, session });
+                content.visits.insert(
+                    event.workspace,
+                    ViewerVisit {
+                        pane: id,
+                        session,
+                        line: None,
+                    },
+                );
                 cx.notify();
             });
             cx.notify();
@@ -501,6 +529,7 @@ impl Shell {
             return self.session_content(cx);
         };
         let workspace = state.workspace.id;
+        let editor_line = visit.and_then(|visit| visit.line);
         let review = if let pane::PaneContent::Review(view) = &pane.read(cx).content {
             Some(view.clone())
         } else {
@@ -556,7 +585,7 @@ impl Shell {
                                     cx,
                                 )
                             }),
-                            "e" => this.editor_preview_notice(cx),
+                            "e" => this.edit_selected_file(window, cx),
                             _ => {
                                 if key != "escape" {
                                     return;
@@ -588,18 +617,28 @@ impl Shell {
                     .when(is_review, |header| header.child(DIFF_HINT))
                     .when_some(source, |header, (root, relative)| {
                         let (browser_root, browser_relative) = (root.clone(), relative.clone());
+                        let editor_path = root.join(&relative);
                         header
                             .child(
                                 Button::new("viewer-open-editor")
                                     .debug_selector(|| "viewer-open-editor".into())
                                     .ghost()
                                     .label("Open in editor")
+                                    .tooltip(format!(
+                                        "Open in {}",
+                                        gitterm_core::editor::display_name(&self.editor)
+                                    ))
                                     .disabled(!local_source)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| {
-                                            this.editor_preview_notice(cx)
-                                        }),
-                                    ),
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_editor(
+                                            super::actions::OpenEditor::configured(
+                                                editor_path.clone(),
+                                                editor_line,
+                                            ),
+                                            window,
+                                            cx,
+                                        )
+                                    })),
                             )
                             .when(!rendered, |header| {
                                 header.child(

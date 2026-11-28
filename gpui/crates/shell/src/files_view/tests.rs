@@ -175,7 +175,7 @@ fn clicking_file_opens_it_and_selects_only_that_file(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn edit_click_reports_preview_notice_without_open_or_launch(cx: &mut TestAppContext) {
+fn edit_click_requests_terminal_editor_without_launching_in_tests(cx: &mut TestAppContext) {
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("folder")).unwrap();
@@ -196,12 +196,25 @@ fn edit_click_reports_preview_notice_without_open_or_launch(cx: &mut TestAppCont
         cx.debug_bounds("files-edit-0").is_none(),
         "folders have no edit action"
     );
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let received = requests.clone();
+    let _editor_subscription = cx.update(|_, cx| {
+        cx.subscribe(
+            &view,
+            move |_, request: &crate::content::actions::OpenEditor, _| {
+                received.borrow_mut().push(request.clone())
+            },
+        )
+    });
     click(cx, "files-edit-1");
+    assert_eq!(
+        *requests.borrow(),
+        [crate::content::actions::OpenEditor::terminal(
+            root.path().join("file.txt")
+        )]
+    );
     owner.read_with(cx, |owner, _| {
-        assert_eq!(
-            owner.error.as_deref(),
-            Some("Edit file · not available in preview")
-        );
+        assert!(owner.error.is_none());
         assert_eq!(
             owner.model.workspaces.len(),
             before.0,
@@ -352,7 +365,7 @@ fn edit_click_never_runs_configured_editor() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "files_view::tests::edit_click_reports_preview_notice_without_open_or_launch",
+            "files_view::tests::edit_click_requests_terminal_editor_without_launching_in_tests",
             "--test-threads=1",
         ])
         .env(

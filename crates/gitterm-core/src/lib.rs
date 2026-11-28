@@ -108,3 +108,5 @@ pub mod dictation;
 
 #[cfg(feature = "runtime")]
 pub mod desktop_store;
+
+pub mod editor;

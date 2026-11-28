@@ -11,6 +11,18 @@ fn fixture(
     Entity<Shell>,
     &mut VisualTestContext,
 ) {
+    fixture_with_preview(cx, false)
+}
+
+fn fixture_with_preview(
+    cx: &mut TestAppContext,
+    preview: bool,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Entity<Shell>,
+    &mut VisualTestContext,
+) {
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir_in("/private/tmp").unwrap();
@@ -20,7 +32,8 @@ fn fixture(
     let (shell, cx) = cx.add_window_view(|window, cx| {
         let mut model = WorkspaceStatus::default();
         model.add(root, Instant::now());
-        let owner = cx.new(|cx| WorkspaceOwner::new(model, None, cx));
+        let store = preview.then(|| crate::preview::tests::guarded_store(&config_root));
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, store, cx));
         Shell::with_owner(
             Rc::new(data::LocalData(owner.clone())),
             owner,
@@ -140,7 +153,7 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn editor_controls_only_notice_and_nonlocal_header_is_disabled(cx: &mut TestAppContext) {
+fn editor_controls_request_each_route_and_nonlocal_header_is_disabled(cx: &mut TestAppContext) {
     let (folder, config, shell, cx) = fixture(cx);
     let path = folder.path().join("source.rs");
     let edit_path = folder.path().join("other.rs");
@@ -153,9 +166,13 @@ fn editor_controls_only_notice_and_nonlocal_header_is_disabled(cx: &mut TestAppC
     let assert_notice = |cx: &mut VisualTestContext| {
         cx.read(|cx| {
             let shell = shell.read(cx);
+            assert!(shell.owner.read(cx).error.is_none());
             assert_eq!(
-                shell.owner.read(cx).error.as_deref(),
-                Some("Open in editor · not available in preview")
+                shell.editor_requests.first(),
+                Some(&content::actions::OpenEditor::configured(
+                    path.clone(),
+                    None
+                ))
             );
             assert_eq!(shell.active(cx).panes.len(), panes);
             assert!(shell.active(cx).sessions.is_empty());
@@ -174,6 +191,12 @@ fn editor_controls_only_notice_and_nonlocal_header_is_disabled(cx: &mut TestAppC
         })
     });
     assert_notice(cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).editor_requests.last(),
+            Some(&content::actions::OpenEditor::terminal(edit_path.clone()))
+        )
+    });
     cx.update(|_, cx| {
         shell.update(cx, |shell, cx| {
             shell.owner.update(cx, |owner, _| owner.error = None);
@@ -237,10 +260,13 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("e");
     draw(cx);
     cx.read(|cx| {
+        assert!(shell.read(cx).owner.read(cx).error.is_none());
         assert_eq!(
-            shell.read(cx).owner.read(cx).error.as_deref(),
-            Some("Open in editor · not available in preview")
-        )
+            shell.read(cx).editor_requests.last(),
+            Some(&content::actions::OpenEditor::terminal(
+                "/fixture/a.txt".into()
+            ))
+        );
     });
     assert!(cx.debug_bounds("viewer-open-browser").is_none());
     click(cx, "close-file-viewer");
@@ -477,4 +503,109 @@ fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
         *opened.borrow(),
         [(WorkspaceId(1), PathBuf::from("/fixture/a.rs"), true)]
     );
+}
+
+#[gpui::test]
+fn work_sidebar_and_chat_navigation_reach_the_shared_editor_request(cx: &mut TestAppContext) {
+    let (folder, _config, shell, cx) = fixture_with_preview(cx, true);
+    let path = folder.path().join("file with 'quotes'.rs");
+    std::fs::write(&path, "unchanged").unwrap();
+    draw(cx);
+    let sidebar = cx.read(|cx| {
+        let shell = shell.read(cx);
+        shell.work_sidebars[&shell.active(cx).workspace.id].clone()
+    });
+    cx.update(|_, cx| {
+        sidebar.update(cx, |_, cx| {
+            cx.emit(work_sidebar::WorkSidebarOutcome::OpenEditor {
+                dir: folder.path().to_path_buf(),
+            });
+        });
+    });
+    draw(cx);
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).editor_requests,
+            [content::actions::OpenEditor::configured(
+                folder.path().to_path_buf(),
+                None
+            )]
+        )
+    });
+    let chat = cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.new_claude_chat(None, window, cx);
+            let state = shell.active(cx);
+            let pane::PaneContent::PreviewChat(chat) = &state.panes
+                [&session_pane_id(state.active_session.unwrap())]
+                .read(cx)
+                .content
+            else {
+                panic!("chat pane")
+            };
+            chat.clone()
+        })
+    });
+    draw(cx);
+    // The checkout menu uses the configured editor, including in Preview.
+    click(cx, "composer-checkout");
+    click(cx, "checkout-open-editor");
+    cx.read(|cx| {
+        let requests = &shell.read(cx).editor_requests;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.last(),
+            Some(&content::actions::OpenEditor::configured(
+                folder.path().to_path_buf(),
+                None
+            ))
+        );
+    });
+    // A file link retains Iced's viewer route; its header opens that file.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open_chat_file(
+                &chat,
+                Path::new("file with 'quotes'.rs"),
+                (false, Some(27)),
+                window,
+                cx,
+            )
+        })
+    });
+    draw(cx);
+    click(cx, "viewer-open-editor");
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).editor_requests.last(),
+            Some(&content::actions::OpenEditor::configured(
+                path.clone(),
+                Some(27)
+            ))
+        )
+    });
+    // A refused link cannot replace the current document's editor line.
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.open_chat_file(
+                &chat,
+                Path::new("/outside-checkout.rs"),
+                (false, Some(99)),
+                window,
+                cx,
+            );
+        })
+    });
+    draw(cx);
+    click(cx, "viewer-open-editor");
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).editor_requests.last(),
+            Some(&content::actions::OpenEditor::configured(
+                path.clone(),
+                Some(27)
+            ))
+        )
+    });
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "unchanged");
 }
