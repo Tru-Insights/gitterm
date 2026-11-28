@@ -84,6 +84,7 @@ pub(super) fn fixture(
 
 #[gpui::test]
 fn usage_toggle_preserves_previous_content_and_escape_returns(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
@@ -118,6 +119,7 @@ fn usage_toggle_preserves_previous_content_and_escape_returns(cx: &mut TestAppCo
 
 #[gpui::test]
 fn run_spawns_focuses_restarts_and_quick_command_uses_plain_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let repo = RepoKey::local(&root.path().join("work"));
     emit(
@@ -209,6 +211,7 @@ fn run_spawns_focuses_restarts_and_quick_command_uses_plain_terminal(cx: &mut Te
 
 #[gpui::test]
 fn chat_font_clamps_and_writes_only_preview(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let source = root.path().join("iced");
     let before =
@@ -283,6 +286,7 @@ fn run_output_url_matches_iced_patterns() {
 
 #[gpui::test]
 fn usage_limits_filters_and_pin_are_read_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::plan_limits::{PlanLimitsFile, Provider, RoutingPin};
     let (root, shell, cx) = fixture(cx);
     let path = root.path().join("iced/plan-limits.json");
@@ -333,6 +337,7 @@ fn usage_limits_filters_and_pin_are_read_only(cx: &mut TestAppContext) {
 fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_selection(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture(cx);
     let nested = root.path().join("work/nested");
     std::fs::create_dir(&nested).unwrap();
@@ -510,6 +515,7 @@ fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_sele
 
 #[gpui::test]
 fn work_repo_row_run_launches_like_iced_without_a_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     // Owner decision 2026-11-20: the sidebar ▶ runs, exactly like Iced's RunRepoCommand.
     let (root, shell, cx) = fixture(cx);
     let sidebar = cx.read(|cx| shell.read(cx).work_sidebars[&WorkspaceId(1)].clone());
@@ -538,6 +544,7 @@ fn work_repo_row_run_launches_like_iced_without_a_notice(cx: &mut TestAppContext
 
 #[gpui::test]
 fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture(cx);
     for selector in ["Files", "Find", "Work"] {
         let bounds = cx.debug_bounds(selector).unwrap();

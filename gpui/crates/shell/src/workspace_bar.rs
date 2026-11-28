@@ -1827,6 +1827,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn browser_more_entries_emit_host_actions(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let mut input = input();
@@ -1869,6 +1870,7 @@ pub(crate) mod tests {
     fn overflowing_chips_scroll_without_shrinking_and_right_controls_stay_pinned(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let mut input = input();
@@ -1919,6 +1921,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn every_bar_control_emits_typed_outcome(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let events = Rc::new(RefCell::new(vec![]));

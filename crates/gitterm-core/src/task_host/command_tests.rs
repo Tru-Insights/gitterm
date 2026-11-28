@@ -162,6 +162,7 @@ fi
 #[cfg(unix)]
 fn iced_before_after_fake_child_argv_env_cwd() {
     use std::{
+        io::Read,
         os::unix::fs::PermissionsExt,
         process::{Command, Stdio},
     };
@@ -207,8 +208,8 @@ fn iced_before_after_fake_child_argv_env_cwd() {
 printf '%s\0' "$@" > "$TRACE/argv"
 /usr/bin/env | /usr/bin/sort > "$TRACE/env"
 pwd -P > "$TRACE/cwd"
-printf ready > "$TRACE/ready"
-exec /bin/sleep 60
+printf ready
+read _fixture_release
 "##,
     )
     .unwrap();
@@ -238,23 +239,23 @@ exec /bin/sleep 60
         std::fs::create_dir_all(&trace).unwrap();
         let mut records = Vec::new();
         for spec in [old, new] {
-            let _ = std::fs::remove_file(trace.join("ready"));
             let mut child = Command::new(spec.program)
                 .args(spec.args)
                 .env_clear()
                 .envs(spec.env)
                 .env("TRACE", &trace)
                 .current_dir(spec.cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
-            let started = std::time::Instant::now();
-            while !trace.join("ready").exists() {
-                assert!(started.elapsed() < std::time::Duration::from_secs(5));
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            // The pipe is the readiness event: scheduling the fake child may
+            // take arbitrarily long on a busy host. It writes only after all
+            // three trace files are complete, and EOF reports an early exit.
+            let mut ready = [0; 5];
+            child.stdout.take().unwrap().read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
             records
                 .push(["argv", "env", "cwd"].map(|file| std::fs::read(trace.join(file)).unwrap()));
             child.kill().unwrap();

@@ -163,7 +163,10 @@ fn focus_terminal(view: &Entity<gitterm_terminal::TerminalView>, cx: &mut Visual
 /// terminal behind either sheet does not focus it.
 #[gpui::test]
 fn no_key_reaches_a_terminal_behind_iceds_capture_layers(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     for blocker in Blocker::ALL {
+        // Each capture-layer case owns a separate window and its PTYs.
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
         dispatch(TabSelect { index: 1 }, cx);
         let view = terminal(&shell, cx);
@@ -192,6 +195,7 @@ fn no_key_reaches_a_terminal_behind_iceds_capture_layers(cx: &mut TestAppContext
 /// must tell them from the Park sheet itself.
 #[gpui::test]
 fn escape_only_surfaces_neither_guard_commands_nor_block_the_terminal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     type Open = fn(&mut Shell, &mut gpui::Window, &mut gpui::Context<Shell>);
     let surfaces: [(&str, Open); 5] = [
         ("parked list", |s, w, cx| s.open_parked_list(w, cx)),
@@ -210,6 +214,7 @@ fn escape_only_surfaces_neither_guard_commands_nor_block_the_terminal(cx: &mut T
         ("connect form", |s, w, cx| s.open_connect_form(w, cx)),
     ];
     for (name, open) in surfaces {
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
         dispatch(TabSelect { index: 1 }, cx);
         let view = terminal(&shell, cx);
@@ -232,7 +237,9 @@ fn escape_only_surfaces_neither_guard_commands_nor_block_the_terminal(cx: &mut T
 /// worktree delete, publish) is a `task_panel::Modal`, which is `Modal::Task`.
 #[gpui::test]
 fn task_prompts_are_the_task_modal(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     for blocker in [Blocker::TaskStopAndClose, Blocker::TaskPublish] {
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
         blocker.open(&shell, cx);
         cx.update(|window, cx| {
@@ -249,7 +256,9 @@ fn task_prompts_are_the_task_modal(cx: &mut TestAppContext) {
 /// without closing anything.
 #[gpui::test]
 fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     for blocker in Blocker::ALL {
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
         dispatch(TabSelect { index: 1 }, cx);
         let view = terminal(&shell, cx);
@@ -277,6 +286,7 @@ fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext)
         wait_until(cx, |cx| screen(&view, cx).contains("klm"));
     }
     for sheet in Sheet::ALL {
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h7_tests::fixture(cx);
         dispatch(NewTerminal, cx);
         let view = terminal(&shell, cx);
@@ -313,7 +323,9 @@ fn escape_closes_a_surface_while_a_terminal_holds_focus(cx: &mut TestAppContext)
 /// checks the gate the shell refreshes each frame.
 #[gpui::test]
 fn paste_is_dropped_behind_iceds_capture_layers(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     for blocker in Blocker::ALL {
+        let _fixture_app = crate::test_app::Cleanup::new(cx);
         let (_root, shell, cx) = h6_tests::sample(cx);
         dispatch(TabSelect { index: 1 }, cx);
         let view = terminal(&shell, cx);

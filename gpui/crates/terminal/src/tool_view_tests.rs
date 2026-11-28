@@ -15,6 +15,7 @@ use std::{
 
 #[gpui::test]
 fn real_tools_osc8_label_reaches_link_callback(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let dir = tempfile::tempdir().unwrap();
     let mut backend = ready_shell(dir.path());
@@ -93,6 +94,7 @@ fn real_tools_osc8_label_reaches_link_callback(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn real_tools_osc0_osc2_and_osc7_callbacks(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let dir = tempfile::tempdir().unwrap();
     let backend = ready_shell(dir.path());
@@ -145,6 +147,7 @@ fn real_tools_osc0_osc2_and_osc7_callbacks(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn real_tools_ctrl_d_and_exit_callback_reap_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     for input in [b"\x04".as_slice(), b"exit\r".as_slice()] {
         let dir = tempfile::tempdir().unwrap();

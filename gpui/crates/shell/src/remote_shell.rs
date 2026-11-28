@@ -1592,6 +1592,7 @@ mod connect_tests {
 
     #[gpui::test]
     fn closed_form_delivers_save_success_and_failure_to_the_shell(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (f, cx) = fixture(cx);
         let source = f.iced();
         cx.update(|window, cx| {
@@ -1666,6 +1667,7 @@ mod connect_tests {
     fn live_form_save_reloads_remotes_and_closes_only_after_matching_handshake(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let (f, cx) = fixture(cx);
         let source = f.iced();
         cx.update(|window, cx| {

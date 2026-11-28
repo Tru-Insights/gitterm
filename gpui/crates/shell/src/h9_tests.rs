@@ -28,6 +28,7 @@ fn dispatch(action: impl gpui::Action, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn width_and_navigation_dispatch_and_only_persist_in_preview(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h7_tests::fixture(cx);
     let iced = root.path().join("iced");
     let before =
@@ -85,6 +86,7 @@ fn width_and_navigation_dispatch_and_only_persist_in_preview(cx: &mut TestAppCon
 
 #[gpui::test]
 fn launch_adapters_report_preview_error_without_creating_sessions(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h7_tests::fixture(cx);
     let count = cx.read(|cx| shell.read(cx).active(cx).sessions.len());
     for action in [
@@ -114,6 +116,7 @@ fn launch_adapters_report_preview_error_without_creating_sessions(cx: &mut TestA
 
 #[gpui::test]
 fn composer_and_slash_actions_dispatch_once_through_native_input(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_gpui_chat::{
         ChatIntent, ChatView,
         adapter::Receipt,
@@ -213,6 +216,7 @@ fn composer_and_slash_actions_dispatch_once_through_native_input(cx: &mut TestAp
 
 #[gpui::test]
 fn park_submit_uses_sheet_once_and_preserves_its_note(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h6_tests::sample(cx);
     let outcomes = Rc::new(RefCell::new(Vec::new()));
     let captured = outcomes.clone();
@@ -257,6 +261,7 @@ fn park_submit_uses_sheet_once_and_preserves_its_note(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn plans_document_uses_existing_read_only_file_viewer(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::work::{
         documents::{CopySource, Document, DocumentCopy, ScanResult},
         state::{Effect, Intent},
@@ -317,6 +322,7 @@ fn plans_document_uses_existing_read_only_file_viewer(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h6_tests::sample(cx);
     dispatch(TabSelect { index: 0 }, cx);
     let preview = cx.update(|window, cx| {
@@ -372,6 +378,7 @@ fn retained_preview_history_changes_width_without_rebuilding(cx: &mut TestAppCon
 /// note in the transcript, not a line above the composer.
 #[gpui::test]
 fn e07_a_pane_notice_is_a_warning_note_in_the_transcript(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h6_tests::sample(cx);
     dispatch(TabSelect { index: 0 }, cx);
     let preview = cx.update(|window, cx| {
@@ -532,6 +539,7 @@ fn open(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<Modal> {
 /// the key context, and Escape closes the surface.
 #[gpui::test]
 fn sheets_plans_and_phone_let_background_commands_through(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h7_tests::fixture(cx);
     let collapsed = |shell: &Entity<Shell>, cx: &mut VisualTestContext| {
         cx.read(|cx| shell.read(cx).active(cx).store.regions.sidebar_collapsed)
@@ -566,6 +574,7 @@ fn sheets_plans_and_phone_let_background_commands_through(cx: &mut TestAppContex
 /// menu bar and the modal's own keys is consumed before its handler runs.
 #[gpui::test]
 fn every_modal_consumes_background_actions(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     // The workspace fixture opens every sheet; dialogs need the sample's Root.
     let (root, shell, cx) = h7_tests::fixture(cx);
     shell.update(cx, |shell, _| {
@@ -579,6 +588,7 @@ fn every_modal_consumes_background_actions(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_dialog_consumes_background_actions(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = h6_tests::sample(cx);
     consume_behind(&shell, [Modal::Dialog], cx);
 }
@@ -657,6 +667,7 @@ fn consume_behind(
 /// sees it, and the shell takes focus back.
 #[gpui::test]
 fn escape_closes_task_modal_over_an_open_slash_menu(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_gpui_chat::{
         ChatView,
         events::{Entry, HarnessEvent, Record},
