@@ -2444,10 +2444,8 @@ fn chat_event_wake(event: &tab::AgentEvent) -> Option<WakeReason> {
 
 /// A running parked workspace as `workspaces.json` stores it (TRU-186):
 /// an ordinary parked entry, since quitting GitTerm stops its processes.
-fn running_parked_config(mut cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
-    cfg.active = false;
-    cfg.parked = Some(info.clone());
-    cfg
+fn running_parked_config(cfg: WorkspaceConfig, info: &ParkedInfo) -> WorkspaceConfig {
+    gitterm_core::park::parked_config(cfg, info.clone())
 }
 
 /// The open workspace a Parked list row names when it is parked running
@@ -2580,32 +2578,11 @@ fn park_note_chats<'a>(
 /// list. Close (TRU-190) parks, then ends here.
 #[cfg(test)]
 fn finish_parked(configs: &mut [WorkspaceConfig], key: &ParkedKey, stamp: String) -> bool {
-    match configs
-        .iter_mut()
-        .find(|cfg| cfg.is_parked() && key.matches(cfg))
-    {
-        Some(cfg) => {
-            cfg.done_at = Some(stamp);
-            true
-        }
-        None => false,
-    }
+    gitterm_core::park::finish_parked(configs, &App::park_key(key), stamp)
 }
 
-/// Reopen (TRU-205): clears the done state of the closed entry matching
-/// `key`, which puts it back on the Parked list. False when no done entry
-/// matches.
 fn reopen_done(configs: &mut [WorkspaceConfig], key: &ParkedKey) -> bool {
-    match configs
-        .iter_mut()
-        .find(|cfg| !cfg.active && cfg.done_at.is_some() && key.matches(cfg))
-    {
-        Some(cfg) => {
-            cfg.done_at = None;
-            true
-        }
-        None => false,
-    }
+    gitterm_core::park::reopen_done(configs, &App::park_key(key))
 }
 
 fn park_note_input_id() -> iced::widget::Id {
@@ -10574,6 +10551,7 @@ impl App {
     fn workspace_config(&self, ws: &Workspace) -> WorkspaceConfig {
         let home = self.repo(ws.home);
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: ws.collapsed_issue_groups.clone(),
             name: ws.name.clone(),
             abbrev: ws.abbrev.clone(),
@@ -10588,6 +10566,7 @@ impl App {
                 .tabs
                 .iter()
                 .map(|tab| WorkspaceTabConfig {
+                    extra: Default::default(),
                     // Terminal-style tabs persist their tracked local
                     // cwd; source-browsing tabs persist the browser dir
                     // so remote workspaces restore where they left off.
@@ -10856,10 +10835,10 @@ impl App {
             .get(self.active_workspace_index())
             .map(|ws| &ws.dir);
         if let Ok(mut p) = self.log_server_state.plans_dir.write() {
-            *p = workspace_dir.map(|dir| dir.join(".plans"));
+            *p = workspace_dir.map(|dir| gitterm_core::workspace_config::document_roots(dir).0);
         }
         if let Ok(mut p) = self.log_server_state.docs_dir.write() {
-            *p = workspace_dir.map(|dir| dir.join("docs"));
+            *p = workspace_dir.map(|dir| gitterm_core::workspace_config::document_roots(dir).1);
         }
     }
 
@@ -15376,9 +15355,8 @@ impl App {
     fn park_stopping(&mut self, idx: usize, info: ParkedInfo) -> Task<Event> {
         self.dismiss_viewer_surface();
         let uid = self.workspaces[idx].uid;
-        let mut cfg = self.workspace_config(&self.workspaces[idx]);
-        cfg.active = false;
-        cfg.parked = Some(info);
+        let cfg =
+            gitterm_core::park::parked_config(self.workspace_config(&self.workspaces[idx]), info);
         eprintln!(
             "[workspace] parked {:?} with {} tab(s)",
             cfg.name,
@@ -15664,7 +15642,11 @@ impl App {
             .get_mut(finish)
             .filter(|cfg| cfg.is_parked() && key.matches(cfg));
         let cleanup = if let Some(cfg) = cfg {
-            cfg.done_at = Some(chrono::Utc::now().to_rfc3339());
+            gitterm_core::park::finish_parked(
+                std::slice::from_mut(cfg),
+                &Self::park_key(key),
+                chrono::Utc::now().to_rfc3339(),
+            );
             eprintln!("[workspace] {:?} marked done", key.name);
             self.mark_workspaces_dirty();
             self.maintain_turn_snapshots(Some(chats))
@@ -21025,9 +21007,7 @@ fn load_task_store_for_startup(
     path: PathBuf,
     timestamp: &str,
 ) -> Result<(TaskStore, usize), TaskStoreError> {
-    let mut store = TaskStore::load(path)?;
-    let reconciled = store.reconcile_after_restart(timestamp)?;
-    Ok((store, reconciled))
+    gitterm_core::task_host::load_task_store_for_startup(path, timestamp)
 }
 
 impl App {
@@ -26855,20 +26835,10 @@ impl App {
             Event::DelegationOpenWorkerRequested(tab_id, delegation_id) => {
                 let target = self
                     .tab_delegation(tab_id, &delegation_id)
-                    .and_then(|delegation| match &delegation.child {
-                        gitterm::tasks::DelegationChild::TaskSession {
-                            task_session_id: Some(session),
-                            ..
-                        } => find_task_session_tab(&self.workspaces, session).ok_or_else(|| {
-                            "The worker's tab is closed. Open its task from the Tasks rail to \
-                             resume it."
-                                .to_string()
-                        }),
-                        gitterm::tasks::DelegationChild::TaskSession { .. } => Err(
-                            "The worker has not started yet (it is queued behind other tasks)."
-                                .to_string(),
-                        ),
-                        _ => Err(format!("delegation {delegation_id} has no worker tab")),
+                    .and_then(|delegation| {
+                        gitterm::delegations::worker_tab_target(delegation, |session| {
+                            find_task_session_tab(&self.workspaces, session)
+                        })
                     });
                 return match target {
                     Ok((ws_idx, worker_tab_idx)) => {
@@ -27906,8 +27876,7 @@ impl App {
                     return Task::none();
                 };
                 // Open a file in $EDITOR (fallback: vim) in a new tab
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
-                let cmd = format!("{} \"{}\"", editor, path.display());
+                let cmd = editor::terminal_command(std::env::var("EDITOR").ok().as_deref(), &path);
                 if let Some(ws) = self.active_workspace() {
                     let dir = ws
                         .active_tab()
@@ -55513,6 +55482,7 @@ mod tests {
 
     fn closed_config(name: &str, parked_at: Option<&str>) -> WorkspaceConfig {
         WorkspaceConfig {
+            extra: Default::default(),
             collapsed_issue_groups: gitterm::issue_titles::IssueGroup::default_collapsed(),
             name: name.to_string(),
             abbrev: "AC".to_string(),

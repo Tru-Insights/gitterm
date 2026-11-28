@@ -9,6 +9,17 @@
 //! written resumes it.
 use crate::tasks::{HarnessConversationBackend, HarnessConversationRef, HarnessKind, TaskRecord};
 
+/// Load and reconcile the durable store before either frontend restores its
+/// cards. Finished, undelivered reports survive; saved Codex runs never launch.
+pub fn load_task_store_for_startup(
+    path: std::path::PathBuf,
+    timestamp: &str,
+) -> Result<(crate::tasks::TaskStore, usize), crate::tasks::TaskStoreError> {
+    let mut store = crate::tasks::TaskStore::load(path)?;
+    let reconciled = store.reconcile_after_restart(timestamp)?;
+    Ok((store, reconciled))
+}
+
 /// The command a restored tab starts, and the conversation it is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoredStartup {

@@ -923,7 +923,7 @@ impl IcedWorkData {
             .flat_map(|f| f.documents.iter().cloned())
             .collect();
         let request = documents::ScanRequest {
-            docs_dir: Path::new(&saved.dir).join("docs"),
+            docs_dir: gitterm_core::workspace_config::document_roots(Path::new(&saved.dir)).1,
             written,
             repos: facts.repos.iter().map(|r| r.dir.clone()).collect(),
             task_worktrees,

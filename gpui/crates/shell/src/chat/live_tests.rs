@@ -401,6 +401,7 @@ async fn resume_round_trip(services: &ServiceContext, root: &Path) {
     std::fs::write(&config_file, serde_json::to_vec(&serde_json::json!({
         "active_workspace":0,"workspaces":[{"name":"Roundtrip","abbrev":"R","color":"blue","dir":cwd,"tabs":[]}]
     })).unwrap()).unwrap();
+    let store = gitterm_core::desktop_store::DesktopStore::open(services.state_root()).unwrap();
     // Iced creates a session through core's normal launcher and the fake child.
     let iced_config = config(&cwd);
     let (mut iced, mut events) = Session::spawn_runtime(move |_| {
@@ -440,7 +441,7 @@ async fn resume_round_trip(services: &ServiceContext, root: &Path) {
         effort: Some("high".into()),
     });
     resume::LiveTab::new(services.clone(), &file.workspaces[0], tab)
-        .persist()
+        .persist(&store)
         .unwrap();
     for restart in 0..2 {
         // The same shared DTO is what GPUI restart and Iced's next launch read.
@@ -518,7 +519,7 @@ async fn resume_round_trip(services: &ServiceContext, root: &Path) {
             root.join("provider").to_str().unwrap()
         );
         resume::LiveTab::new(services.clone(), &saved.workspaces[0], tab.clone())
-            .persist()
+            .persist(&store)
             .unwrap();
         runtime.send(HarnessCommand::Shutdown).unwrap();
         runtime.completed().await.unwrap();

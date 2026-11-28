@@ -1,16 +1,18 @@
 //! Read-only chat navigation is separate from roster reveal and preview mutations.
-use gitterm_core::tasks::{Delegation, DelegationChild};
+use gitterm_core::tasks::Delegation;
 use gitterm_gpui_chat::model::roster::RosterOutcome;
 use std::path::Path;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Navigation<'a> {
     Worker(&'a str),
-    File(&'a Path, bool),
+    File(&'a Path, bool, Option<usize>),
 }
 pub(crate) fn navigation(outcome: &RosterOutcome) -> Option<Navigation<'_>> {
     match outcome {
         RosterOutcome::OpenWorker { id } => Some(Navigation::Worker(id)),
-        RosterOutcome::OpenFile { path, review } => Some(Navigation::File(path, *review)),
+        RosterOutcome::OpenFile { path, review, line } => {
+            Some(Navigation::File(path, *review, *line))
+        }
         RosterOutcome::Open { .. } | RosterOutcome::Dismiss { .. } => None,
     }
 }
@@ -18,30 +20,63 @@ pub(crate) fn worker_tab_target<T>(
     delegation: &Delegation,
     find: impl FnOnce(&str) -> Option<T>,
 ) -> Result<T, String> {
-    match &delegation.child {
-        DelegationChild::TaskSession {
-            task_session_id: Some(session),
-            ..
-        } => find(session).ok_or_else(|| {
-            "The worker's tab is closed. Open its task from the Tasks rail to resume it.".into()
-        }),
-        DelegationChild::TaskSession { .. } => {
-            Err("The worker has not started yet (it is queued behind other tasks).".into())
-        }
-        _ => Err(format!(
-            "delegation {} has no worker tab",
-            delegation.delegation_id
-        )),
-    }
+    gitterm_core::delegations::worker_tab_target(delegation, find)
 }
 use crate::{FileOpen, Shell, pane};
 use gpui::{Context, Entity, Window};
 impl Shell {
+    pub(crate) fn open_chat_checkout(
+        &mut self,
+        requested: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focused) = self.focused_chat(window, cx) else {
+            return;
+        };
+        let source = self
+            .workspaces
+            .iter()
+            .flat_map(|w| w.panes.values())
+            .find_map(|pane| {
+                if pane.entity_id() != focused {
+                    return None;
+                }
+                match &pane.read(cx).content {
+                    pane::PaneContent::PreviewChat(view) => Some(view.clone()),
+                    _ => None,
+                }
+            });
+        let Some(source) = source else {
+            return;
+        };
+        let current = source.read(cx).cwd();
+        if let Some(path) = gitterm_core::editor::known_checkout_path(
+            &[],
+            current,
+            requested.unwrap_or(current),
+            self.local,
+        ) {
+            self.open_editor(
+                crate::content::actions::OpenEditor::configured(path, None),
+                window,
+                cx,
+            );
+        } else {
+            source.update(cx, |source, cx| {
+                source.show_notice(
+                    "That checkout is not available in this workspace.".into(),
+                    cx,
+                )
+            });
+        }
+    }
+
     pub(crate) fn open_chat_file(
         &mut self,
         source: &Entity<super::ChatPane>,
         path: &std::path::Path,
-        review: bool,
+        (review, line): (bool, Option<usize>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -81,13 +116,14 @@ impl Shell {
                 return;
             }
         }
-        self.open_file_viewer(&event, window, cx);
+        self.open_file_viewer_at_line(&event, line, window, cx);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitterm_core::tasks::DelegationChild;
     #[test]
     fn h24_roster_reveal_and_hide_never_switch_the_host_session() {
         assert_eq!(
@@ -114,18 +150,20 @@ mod tests {
         let file = RosterOutcome::OpenFile {
             path: "src/lib.rs".into(),
             review: false,
+            line: None,
         };
         let review = RosterOutcome::OpenFile {
             path: "src/lib.rs".into(),
             review: true,
+            line: None,
         };
         assert_eq!(
             navigation(&file),
-            Some(Navigation::File(Path::new("src/lib.rs"), false))
+            Some(Navigation::File(Path::new("src/lib.rs"), false, None))
         );
         assert_eq!(
             navigation(&review),
-            Some(Navigation::File(Path::new("src/lib.rs"), true))
+            Some(Navigation::File(Path::new("src/lib.rs"), true, None))
         );
     }
     #[test]
