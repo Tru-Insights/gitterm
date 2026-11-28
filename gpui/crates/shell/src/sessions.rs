@@ -1,5 +1,4 @@
 //! Runtime identities belong to panes, independently of saved layout IDs.
-use crate::terminal_setup::{self, Placement};
 use gitterm_core::session::{self, SavedIdentity, Target};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
