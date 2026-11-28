@@ -31395,7 +31395,9 @@ impl App {
                                 tab_id,
                                 iced_term::Event::BackendCall(
                                     tab_id as u64,
-                                    iced_term::backend::Command::Write(text.into_bytes()),
+                                    iced_term::backend::Command::Write(
+                                        gitterm_core::dictation::terminal_transcript_bytes(text),
+                                    ),
                                 ),
                             ));
                         } else {

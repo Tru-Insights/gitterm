@@ -748,10 +748,7 @@ impl TaskHostOwner {
         let workspaces = cx
             .try_global::<crate::work_sidebar::IcedWorkSource>()
             .map_or(&[][..], |source| &source.workspaces[..]);
-        let workspace = workspaces
-            .iter()
-            .filter(|workspace| chat.cwd.starts_with(&workspace.dir))
-            .max_by_key(|workspace| workspace.dir.len())
+        let workspace = crate::chat::delegation_workspace(uid, &chat.cwd, workspaces, cx)
             .ok_or_else(|| {
                 format!(
                     "the calling GitTerm tab's folder {} is in no workspace",

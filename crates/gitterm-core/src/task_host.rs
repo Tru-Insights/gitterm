@@ -256,6 +256,11 @@ impl TaskHost {
         self.authority = store.into();
     }
 
+    /// The same ingress used by MCP and native composer delegation requests.
+    pub fn command_sender(&self) -> TaskControlSender {
+        self.commands.clone()
+    }
+
     pub fn reduce(&self, command: TaskReadCommand) -> TaskReadEffect {
         self.authority.reduce(command)
     }

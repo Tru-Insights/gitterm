@@ -186,6 +186,9 @@ fn plans_viewer_work_document_stays_dedicated_and_returns_to_same_pane(cx: &mut 
     cx.update(|window, cx| {
         window.draw(cx).clear(cx);
     });
+    let plans_bounds = cx.debug_bounds("plans-viewer").unwrap();
+    let main_bounds = cx.debug_bounds("workspace-main-1").unwrap();
+    assert_eq!(plans_bounds, main_bounds);
     cx.read(|cx| {
         let shell = shell.read(cx);
         assert!(shell.plans_open);

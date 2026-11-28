@@ -297,7 +297,18 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
                 window,
                 cx,
             );
-            review.focus_handle(cx).focus(window, cx);
+            // Reopening replaces the tab-owned review; focus the mounted entity.
+            let pane = shell
+                .active(cx)
+                .panes
+                .values()
+                .find(|pane| matches!(pane.read(cx).content, pane::PaneContent::Review(_)))
+                .unwrap();
+            let pane::PaneContent::Review(reopened) = &pane.read(cx).content else {
+                unreachable!()
+            };
+            assert_ne!(reopened.entity_id(), review.entity_id());
+            reopened.focus_handle(cx).focus(window, cx);
         })
     });
     draw(cx);

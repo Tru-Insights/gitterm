@@ -12,7 +12,9 @@
 // Step 4 ships.
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
@@ -24,6 +26,7 @@ use gitterm::harness::transcript::TranscriptEntry;
 use gitterm::harness::HarnessSession;
 #[cfg(test)]
 use gitterm::harness::{HarnessEvent, UserPrompt};
+#[cfg(test)]
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 

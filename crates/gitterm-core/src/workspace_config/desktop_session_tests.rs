@@ -335,3 +335,28 @@ fn tru274_f7_failed_runtime_inventory_stays_dirty_and_retries_in_order() {
         );
     }
 }
+
+#[test]
+fn tru274_workspace_save_keeps_typed_environment_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("workspaces.json");
+    let document = file();
+    std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+    let store = DesktopStore::open(temp.path()).unwrap();
+    store
+        .edit_workspaces(|file| {
+            file.workspaces[0].env = (0..32)
+                .map(|index| (format!("PLACEHOLDER_{index}"), "fixture".into()))
+                .collect();
+        })
+        .wait()
+        .unwrap();
+    let LoadState::Valid(saved) = store.snapshot().wait().unwrap().workspaces.loaded else {
+        panic!("valid workspace document")
+    };
+    // A JSON round-trip rebuilds randomized HashMaps, changing Iced's bytes.
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        serde_json::to_vec_pretty(&saved).unwrap()
+    );
+}

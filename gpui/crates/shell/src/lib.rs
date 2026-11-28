@@ -3082,13 +3082,20 @@ impl Shell {
     fn sidebar_chevron(collapsed: bool) -> &'static str {
         if collapsed { "▶" } else { "◀" }
     }
-    fn sidebar(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
+    fn sidebar(&self, state: &WorkspaceDock, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let regions = &state.store.regions;
         let p = Palette::current(cx);
+        let id = state.workspace.id;
+        let active = Some(id) == self.active_workspace(cx);
         let mut sidebar = div()
             .id("sidebar")
-            .debug_selector(|| "sidebar".into())
+            .debug_selector(move || {
+                if active {
+                    "sidebar".into()
+                } else {
+                    format!("workspace-sidebar-{}", id.0)
+                }
+            })
             .w(px(regions.sidebar_size()))
             .h_full()
             .flex_shrink_0()
@@ -3169,10 +3176,10 @@ impl Shell {
             sidebar = sidebar.child(modes.child(collapse));
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Files {
-            sidebar = self.files_sidebar(sidebar, cx);
+            sidebar = self.files_sidebar(sidebar, state);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Git {
-            sidebar = self.git_sidebar(sidebar, cx);
+            sidebar = self.git_sidebar(sidebar, state);
         }
         if !regions.sidebar_collapsed && regions.sidebar_mode == SidebarMode::Tasks {
             sidebar = sidebar.children(
@@ -3196,7 +3203,7 @@ impl Shell {
             sidebar = sidebar.child(
                 div().flex_1().min_h_0().children(
                     self.find_views
-                        .get(&self.find_owner(cx))
+                        .get(&self.find_owner_for(state, state.active_session, cx))
                         .map(|views| views.sidebar.clone()),
                 ),
             );
@@ -3243,11 +3250,23 @@ impl Shell {
             content.sync_covers(window, cx);
         });
     }
-    fn sidebar_divider(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let collapsed = self.active(cx).store.regions.sidebar_collapsed;
+    fn sidebar_divider(
+        &self,
+        state: &WorkspaceDock,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let collapsed = state.store.regions.sidebar_collapsed;
+        let id = state.workspace.id;
+        let active = Some(id) == self.active_workspace(cx);
         div()
             .id("sidebar-divider")
-            .debug_selector(|| "sidebar-divider".into())
+            .debug_selector(move || {
+                if active {
+                    "sidebar-divider".into()
+                } else {
+                    format!("workspace-divider-{}", id.0)
+                }
+            })
             .w(px(if collapsed { 1. } else { 4. }))
             .h_full()
             .flex_shrink_0()
@@ -3262,21 +3281,73 @@ impl Shell {
                 }),
             )
     }
-    fn session_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn workspace_slide(
+        &self,
+        background_work: Vec<(WorkspaceId, Entity<work_sidebar::WorkSidebar>)>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         div()
             .id("workspace-slide-host")
+            .debug_selector(|| "workspace-slide-host".into())
             .flex_1()
             .min_w_0()
-            .h_full()
+            .min_h_0()
             .child(workspace_navigation::WorkspaceSlide {
                 shell: cx.weak_entity(),
-                home: self
-                    .active(cx)
-                    .active_session
-                    .is_none()
-                    .then(|| self.remote_session_home(cx))
-                    .flatten(),
+                background_work,
+                panels: self
+                    .workspaces
+                    .iter()
+                    .map(|state| {
+                        let id = state.workspace.id;
+                        let main = if self.usage_open && Some(id) == self.active_workspace(cx) {
+                            div()
+                                .id("usage-host")
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.usage_page.clone())
+                        } else if self.plans_open && Some(id) == self.active_workspace(cx) {
+                            self.plans_viewer(cx)
+                        } else {
+                            self.find_content(state, cx)
+                        };
+                        (
+                            id,
+                            div()
+                                .id("workspace-panel")
+                                .size_full()
+                                .flex()
+                                .child(self.sidebar(state, cx))
+                                .child(self.sidebar_divider(state, cx))
+                                .child(
+                                    div()
+                                        .id("workspace-main")
+                                        .debug_selector(move || format!("workspace-main-{}", id.0))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h_full()
+                                        .flex()
+                                        .child(main),
+                                ),
+                        )
+                    })
+                    .collect(),
             })
+    }
+    fn session_content(
+        &self,
+        state: &WorkspaceDock,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let active = Some(state.workspace.id) == self.active_workspace(cx);
+        if active
+            && state.active_session.is_none()
+            && let Some(home) = self.remote_session_home(cx)
+        {
+            return home;
+        }
+        self.slide_workspace_content(state, active, cx)
     }
     fn refresh_bottom_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_global_geometry(f32::from(window.viewport_size().height), cx);
@@ -5271,9 +5342,8 @@ impl Render for Shell {
                         || state.store.regions.sidebar_collapsed
                         || state.store.regions.sidebar_mode != SidebarMode::Work)
             })
-            .map(|(_, sidebar)| sidebar.clone())
+            .map(|(id, sidebar)| (*id, sidebar.clone()))
             .collect();
-        let sidebar = self.sidebar(cx);
         let mut content = div()
             .flex_1()
             .min_w_0()
@@ -5331,26 +5401,7 @@ impl Render for Shell {
             .child(self.spine(cx))
             .child(
                 content
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .child(sidebar)
-                            .child(self.sidebar_divider(cx))
-                            .child(if self.usage_open {
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .h_full()
-                                    .child(self.usage_page.clone())
-                                    .into_any_element()
-                            } else if self.plans_open {
-                                self.plans_viewer(cx).into_any_element()
-                            } else {
-                                self.find_content(cx).into_any_element()
-                            }),
-                    )
+                    .child(self.workspace_slide(background_work, cx))
                     .child(self.bottom.clone())
                     .children(self.owner.read(cx).error.clone().map(|error| {
                         div()
@@ -5377,14 +5428,6 @@ impl Render for Shell {
                             )
                     }))
                     .child(self.workspace_bar(cx)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .size(px(0.))
-                    .invisible()
-                    .overflow_hidden()
-                    .children(background_work),
             )
             .children(self.session_picker.clone())
             .children(self.park_sheet.clone())

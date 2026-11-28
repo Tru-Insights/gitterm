@@ -70,7 +70,7 @@ pub fn agent_chat_html() -> String {
 /// for its roster row and card. Live only: never in the conversation
 /// buffer; a rebuilt page gets running runs back on the next poll.
 pub fn codex_exec_payload(run: &crate::codex_exec::RunView) -> Value {
-    serde_json::json!({ "kind": "codex_exec", "run": run })
+    gitterm_core::codex_exec::codex_exec_payload(run)
 }
 
 /// The timestamp at which a queued prompt splits an active turn fold.

@@ -267,6 +267,7 @@ pub struct Row {
     pub images: Vec<gitterm_core::chat::types::ImageAttachment>,
     pub delivery: Option<gitterm_core::chat::types::DeliveryCard>,
     pub delegation: Option<crate::delegation::DelegationCard>,
+    pub external_run: Option<gitterm_core::chat::external::RunView>,
     pub roster_id: Option<String>,
     pub tool: Option<Tool>,
     pub decision: Option<DecisionState>,
@@ -527,6 +528,81 @@ impl ChatModel {
     }
     /// A yellow note the host adds outside the event stream: Iced's
     /// `__reviewNote`, why a review, consult or delegation action was not done.
+    pub(crate) fn upsert_codex_exec(
+        &mut self,
+        run: &gitterm_core::chat::external::RunView,
+    ) -> Vec<usize> {
+        use gitterm_core::chat::external::RunState;
+        let key = format!("cx:{}", run.key);
+        let state = if run.state == RunState::Running {
+            "running"
+        } else {
+            "finished"
+        };
+        let title = codex_exec_title(run, state);
+        let mut body = format!(
+            "Started outside GitTerm's tools (codex exec in a shell). GitTerm only shows it: it cannot stop or adopt this run.\ncwd {}",
+            run.cwd.as_deref().unwrap_or("unknown")
+        );
+        for dir in &run.add_dirs {
+            body.push_str(&format!("\nadd-dir {dir}"));
+        }
+        body.push_str(&format!(
+            "\nPID {}{}{}\n{}",
+            run.pid,
+            run.sandbox
+                .as_ref()
+                .map(|s| format!(" · sandbox {s}"))
+                .unwrap_or_default(),
+            run.cli_version
+                .as_ref()
+                .map(|v| format!(" · codex {v}"))
+                .unwrap_or_default(),
+            run.rollout_path
+                .as_ref()
+                .map(|p| format!("rollout {p}"))
+                .unwrap_or_else(|| "rollout not found yet".into())
+        ));
+        if let Some(activity) = &run.activity {
+            body.push_str(&format!("\nLatest: {}", activity.text));
+        }
+        if !run.subagents.is_empty() {
+            body.push_str("\nSubagents");
+        }
+        for sub in &run.subagents {
+            body.push_str(&format!(
+                "\n↳ {}{} · {}{}",
+                sub.nickname
+                    .as_deref()
+                    .or(sub.agent_path.as_deref())
+                    .unwrap_or("subagent"),
+                if sub.nickname.is_some() {
+                    sub.agent_path
+                        .as_ref()
+                        .map(|p| format!(" ({p})"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
+                sub.state,
+                sub.activity
+                    .as_ref()
+                    .map(|a| format!(" — {}", a.text))
+                    .unwrap_or_default()
+            ));
+        }
+        let body = literal(&body);
+        let index = self
+            .rows
+            .iter()
+            .position(|row| row.roster_id.as_deref() == Some(&key))
+            .unwrap_or_else(|| self.push(RowKind::Delegation, "", title.clone(), body.clone()));
+        self.rows[index].roster_id = Some(key);
+        self.rows[index].external_run = Some(run.clone());
+        self.rows[index].title = title;
+        self.rows[index].body = body;
+        vec![index]
+    }
     pub fn push_warning(&mut self, text: &str) -> Vec<usize> {
         vec![self.note(RowKind::Warning, "", text.into())]
     }
@@ -710,6 +786,7 @@ impl ChatModel {
             images: vec![],
             delivery: None,
             delegation: None,
+            external_run: None,
             roster_id: None,
             tool: None,
             decision: None,
@@ -1750,6 +1827,20 @@ pub fn preformatted(text: &str) -> String {
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("JSON Value serializes")
 }
+pub(crate) fn codex_exec_title(run: &gitterm_core::chat::external::RunView, state: &str) -> String {
+    format!(
+        "Codex (exec){} · {} · {state}",
+        run.model
+            .as_ref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default(),
+        run.checkout
+            .as_ref()
+            .map(|checkout| format!("in {checkout}"))
+            .unwrap_or_else(|| "working folder unknown".into())
+    )
+}
+
 pub fn literal(text: &str) -> String {
     text.chars()
         .flat_map(|ch| {

@@ -100,3 +100,10 @@ pub fn load_fixture(path: &Path) -> Result<Vec<Record>, FixtureError> {
         .map_err(|err| FixtureError(format!("read {}: {err}", path.display())))?;
     parse_fixture(&source).map_err(|err| FixtureError(format!("{}: {err}", path.display())))
 }
+
+/// Composer operations whose effects belong to the shell's Live owner.
+#[derive(Debug, Clone)]
+pub enum ComposerEvent {
+    ChooseCheckout(std::path::PathBuf),
+    SettingConfigured(gitterm_core::chat::types::SettingChange),
+}

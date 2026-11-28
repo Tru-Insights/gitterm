@@ -360,7 +360,7 @@ fn case_preview_keeps_acp_resume_and_persistent_permissions_unavailable(
         let mut pane = ChatPane::history(RuntimeShutdown::new(), SavedChat { uid:"placeholder-preview".into(), cwd:root.clone(), provider:preview.provider(), session_id:None, records:vec![] }, window, cx);
         pane.controller.config = saved(&root, None).agent_config.unwrap();
         let (receipt, _) = pane.controller.dispatch(ChatIntent::Permission { request_id:"placeholder-request".into(), decision:gitterm_gpui_chat::PermissionDecision::AllowAlways { suggestion:serde_json::json!({"type":"acp_option","optionId":"placeholder-always"}) } });
-        assert!(matches!(receipt.state, gitterm_gpui_chat::adapter::ReceiptState::Rejected(error) if error == "Allow and remember · not saved in preview"));
+        assert!(matches!(receipt.state, gitterm_gpui_chat::adapter::ReceiptState::Rejected(error) if error == "Allow and remember · not available in preview"));
         pane
     });
 }

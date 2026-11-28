@@ -20,9 +20,12 @@ pub fn save_to(dir: &std::path::Path, config: &impl Serialize) -> Result<(), Str
 /// Live's owner edits known fields without reformatting other fields or dropping
 /// keys added by another desktop version. No second settings snapshot is cached.
 #[cfg(feature = "runtime")]
-pub(crate) fn save_desktop_to(
+/// Iced's writer; `keep` adds back fields this build does not know inside a
+/// rewritten top-level key (untouched keys keep their bytes anyway).
+pub(crate) fn save_desktop_to_keeping(
     path: &std::path::Path,
     config: &DesktopSettings,
+    keep: &dyn Fn(&str, &mut serde_json::Value),
 ) -> Result<(), String> {
     let original = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -51,7 +54,9 @@ pub(crate) fn save_desktop_to(
         if before.get(key) == Some(value) {
             continue;
         }
-        let value = serde_json::to_string_pretty(value).map_err(encode)?;
+        let mut value = value.clone();
+        keep(key, &mut value);
+        let value = serde_json::to_string_pretty(&value).map_err(encode)?;
         if let Some(raw) = fields.get(key) {
             let start = raw.get().as_ptr() as usize - original.as_ptr() as usize;
             replacements.push((start..start + raw.get().len(), value));

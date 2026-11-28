@@ -888,11 +888,14 @@ impl Shell {
         cx.notify();
     }
 
-    pub fn file_viewer_content(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let state = self.active(cx);
+    pub(crate) fn file_viewer_content(
+        &self,
+        state: &crate::WorkspaceDock,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let visit = self.content.read(cx).visits.get(&state.workspace.id);
         let Some(pane) = visit.and_then(|visit| state.panes.get(&visit.pane)) else {
-            return self.session_content(cx);
+            return self.session_content(state, cx);
         };
         let workspace = state.workspace.id;
         let editor_line = visit.and_then(|visit| visit.line);
