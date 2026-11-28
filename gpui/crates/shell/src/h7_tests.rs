@@ -539,13 +539,13 @@ fn work_repo_row_run_launches_like_iced_without_a_notice(cx: &mut TestAppContext
 #[gpui::test]
 fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut TestAppContext) {
     let (_root, shell, cx) = fixture(cx);
-    for (selector, mode) in [("Files", "Files"), ("Find", "Find"), ("Work", "Work")] {
+    for selector in ["Files", "Find", "Work"] {
         let bounds = cx.debug_bounds(selector).unwrap();
         cx.simulate_click(bounds.center(), gpui::Modifiers::none());
         draw(cx);
         assert_eq!(
-            cx.window_title(),
-            Some(format!("GitTerm V6 Development - H7 - {mode}"))
+            cx.window_title().as_deref(),
+            Some("GitTerm GPUI Preview - H7 - work")
         );
     }
     cx.update(|window, cx| {
@@ -556,7 +556,7 @@ fn title_tracks_workspace_and_sidebar_and_tabs_use_iced_label_alignment(cx: &mut
     draw(cx);
     assert_eq!(
         cx.window_title().as_deref(),
-        Some("GitTerm V6 Development - second - Work")
+        Some("GitTerm GPUI Preview - second - second")
     );
     assert!(cx.debug_bounds("Work").unwrap().origin.x < cx.debug_bounds("Files").unwrap().origin.x);
 }

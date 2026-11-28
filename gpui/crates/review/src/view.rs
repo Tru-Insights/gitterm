@@ -167,6 +167,12 @@ impl ReviewView {
         }
         self.focus.focus(window, cx);
     }
+    /// The selected file in this review's checkout, including after j/k navigation.
+    pub fn selected_path(&self) -> Option<PathBuf> {
+        let file = self.model.files.get(self.model.selected?)?;
+        Some(self.repo_path.as_ref()?.join(&file.key.1))
+    }
+
     pub fn model(&self) -> &ReviewModel {
         &self.model
     }

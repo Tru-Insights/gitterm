@@ -7,8 +7,12 @@ use gitterm_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,7 +140,16 @@ fn validated(store: &DesktopStore) -> Result<Snapshot> {
     }
     Ok(snapshot)
 }
+#[cfg(test)]
 fn admit(root: &Path, prefs: &Path, backup_parent: &Path) -> Result<Admission> {
+    admit_with_progress(root, prefs, backup_parent, None)
+}
+fn admit_with_progress(
+    root: &Path,
+    prefs: &Path,
+    backup_parent: &Path,
+    progress: Option<&Arc<ActivationProgress>>,
+) -> Result<Admission> {
     let checked = crate::lifetime::Lifetime::check_live(root)?;
     let root = checked.lock.root();
     let prefs = gitterm_core::state_lock::resolve_root(prefs)?;
@@ -149,9 +162,10 @@ fn admit(root: &Path, prefs: &Path, backup_parent: &Path) -> Result<Admission> {
     // Validate tasks before backup or services; load has no migration/write step.
     gitterm_core::tasks::TaskStore::load(root.join("tasks.json"))?;
     let old = read_activation(&prefs)?;
-    let backup = if let Some(recorded) = old.filter(|a| a.root == root) {
+    let old = old.filter(|a| a.root == root);
+    let (backup, created) = if let Some(recorded) = old {
         backup::verify(&recorded.backup, root).context("verify recorded Live backup")?;
-        recorded.backup
+        (recorded.backup, None)
     } else {
         if !backup_parent.exists() {
             let mut builder = std::fs::DirBuilder::new();
@@ -164,14 +178,26 @@ fn admit(root: &Path, prefs: &Path, backup_parent: &Path) -> Result<Admission> {
                 .create(backup_parent)
                 .context("create Live backup directory")?;
         }
-        backup::create(root, backup_parent, true).context("create verified Live backup")?
+        let created = backup::create_with_progress(root, backup_parent, true, |a, b, c, d| {
+            if let Some(progress) = progress {
+                *progress.counts.lock().unwrap() = (a, b, c, d);
+                if progress.phase.load(Ordering::SeqCst) == CANCELLED {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        })
+        .context("create verified Live backup")?;
+        (created.path().to_owned(), Some(created))
     };
     let activation = Activation {
         root: root.to_owned(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         backup,
     };
-    record(&prefs, &activation).context("record GPUI activation after verified backup")?;
+    finish_activation(progress, created, || {
+        record(&prefs, &activation).context("record GPUI activation after verified backup")
+    })?;
     Ok(Admission {
         checked,
         store,
@@ -179,67 +205,412 @@ fn admit(root: &Path, prefs: &Path, backup_parent: &Path) -> Result<Admission> {
         activation,
     })
 }
+fn finish_activation(
+    progress: Option<&Arc<ActivationProgress>>,
+    created: Option<backup::CreatedBackup>,
+    record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // Atomically order cancellation and commit without holding a progress lock
+    // across cleanup or the activation record's potentially slow full fsyncs.
+    if progress.is_some_and(|progress| {
+        progress
+            .phase
+            .compare_exchange(COPYING, COMMITTING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    }) {
+        if let Some(created) = created {
+            let path = created.path().to_owned();
+            created
+                .remove()
+                .with_context(|| format!("remove cancelled backup {}", path.display()))?;
+        }
+        anyhow::bail!("V6 backup cancelled");
+    }
+    // A record failure can happen after rename (e.g. directory fsync failure).
+    // Retain a completed backup in that case, so published prefs cannot dangle.
+    record()
+}
 pub(crate) fn prepare() -> Result<Admission> {
+    prepare_with_progress(None)
+}
+fn prepare_with_progress(progress: Option<&Arc<ActivationProgress>>) -> Result<Admission> {
     let root = selected_root()?;
     let backup_parent = root
         .parent()
         .context("V6 root has no parent")?
         .join("gitterm-v6-backups");
-    admit(&root, &prefs_path()?, &backup_parent)
+    admit_with_progress(&root, &prefs_path()?, &backup_parent, progress)
 }
-pub(crate) fn activate() -> Result<()> {
-    drop(prepare()?);
-    Ok(())
+const SUCCESS: &str =
+    "V6 state is backed up and activated. Quit and reopen GitTerm GPUI to use it.";
+const QUIT_BACKUP: &str =
+    "A V6 backup is in progress. Quit anyway? The partial backup will be removed.";
+
+#[derive(Default)]
+struct ActivationProgress {
+    counts: Mutex<(u64, u64, u64, u64)>,
+    phase: AtomicU8,
+}
+const COPYING: u8 = 0;
+const CANCELLED: u8 = 1;
+const COMMITTING: u8 = 2;
+impl ActivationProgress {
+    fn request_cancel(&self) {
+        let _ = self
+            .phase
+            .compare_exchange(COPYING, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    fn text(&self) -> Option<String> {
+        self.counts
+            .try_lock()
+            .ok()
+            .map(|counts| progress_text(*counts))
+    }
+}
+#[derive(Clone)]
+struct RunningActivation {
+    progress: Arc<ActivationProgress>,
+    window: gpui::WindowHandle<ActivationMessage>,
+}
+#[derive(Default)]
+struct ActivationState {
+    running: Option<RunningActivation>,
+    prompt_pending: bool,
+    quit_confirmed: bool,
+}
+impl gpui::Global for ActivationState {}
+
+fn progress_text((done, total, bytes, size): (u64, u64, u64, u64)) -> String {
+    format!(
+        "Backing up V6 state… {done} of {total} files ({:.2} of {:.2} GB)\n\nDon't quit GitTerm GPUI until this finishes.",
+        bytes as f64 / 1_000_000_000.0,
+        size as f64 / 1_000_000_000.0,
+    )
+}
+fn open_progress(cx: &mut gpui::App) -> Result<gpui::WindowHandle<ActivationMessage>> {
+    use gpui::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, size};
+    let window = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(520.), px(180.)),
+                cx,
+            ))),
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Use V6 state".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |window, cx| {
+            window.on_window_should_close(cx, |_, cx| {
+                if cx
+                    .try_global::<ActivationState>()
+                    .is_some_and(|state| state.running.is_some())
+                {
+                    crate::lifetime::quit(cx);
+                    false
+                } else {
+                    true
+                }
+            });
+            cx.new(|_| ActivationMessage(progress_text((0, 0, 0, 0))))
+        },
+    )?;
+    cx.activate(true);
+    Ok(window)
 }
 
 pub(crate) fn install_activation(cx: &mut gpui::App) {
-    use gpui::AppContext as _;
+    cx.set_global(ActivationState::default());
     cx.on_action(|_: &crate::app_menus::UseV6State, cx| {
-        let work = cx.background_executor().spawn(async { activate() });
+        if let Some(running) = cx.global::<ActivationState>().running.clone() {
+            let _ = running
+                .window
+                .update(cx, |_, window, _| window.activate_window());
+            return;
+        }
+        // A failed window must never leave another silent activation running.
+        let window = match open_progress(cx) {
+            Ok(window) => window,
+            Err(error) => {
+                eprintln!("V6 activation failed: show progress window: {error:#}");
+                return;
+            }
+        };
+        let progress = Arc::new(ActivationProgress::default());
+        cx.global_mut::<ActivationState>().running = Some(RunningActivation {
+            progress: progress.clone(),
+            window,
+        });
+        let observed = progress.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let running = cx.update(|cx| {
+                    if !cx
+                        .global::<ActivationState>()
+                        .running
+                        .as_ref()
+                        .is_some_and(|run| Arc::ptr_eq(&run.progress, &observed))
+                    {
+                        return false;
+                    }
+                    let Some(text) = observed.text() else {
+                        return true;
+                    };
+                    let _ = window.update(cx, |view, _, cx| {
+                        view.0 = text;
+                        cx.notify();
+                    });
+                    true
+                });
+                if !running {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let work = cx.background_executor().spawn(async move {
+            drop(prepare_with_progress(Some(&progress))?);
+            Ok::<_, anyhow::Error>(())
+        });
         cx.spawn(async move |cx| {
             let message = match work.await {
-                Ok(()) => "V6 state is backed up and activated. Restart GitTerm GPUI to use it."
-                    .to_string(),
+                Ok(()) => SUCCESS.to_string(),
                 Err(error) => format!("V6 activation failed: {error:#}"),
             };
+            eprintln!("{message}");
+            // Let an already-open quit sheet resolve before showing the outcome.
+            while cx.update(|cx| cx.global::<ActivationState>().prompt_pending) {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            }
             cx.update(|cx| {
-                let opened = cx.open_window(gpui::WindowOptions::default(), |window, cx| {
-                    let answer = window.prompt(
+                let state = cx.global_mut::<ActivationState>();
+                state.running = None; // The worker has dropped the V6 lease.
+                if state.quit_confirmed {
+                    crate::lifetime::quit(cx);
+                    return;
+                }
+                let answer = window.update(cx, |view, window, cx| {
+                    view.0 = message.clone();
+                    cx.notify();
+                    window.prompt(
                         gpui::PromptLevel::Info,
                         "Use V6 state",
                         Some(&message),
                         &["OK"],
                         cx,
-                    );
-                    cx.spawn(async move |_| {
-                        let _ = answer.await;
-                    })
-                    .detach();
-                    cx.new(|_| ActivationMessage(message))
+                    )
                 });
-                if let Err(error) = opened {
-                    eprintln!("show GPUI activation result: {error:#}");
+                match answer {
+                    Ok(answer) => cx
+                        .spawn(async move |cx| {
+                            let _ = answer.await;
+                            let _ = window.update(cx, |_, window, _| window.remove_window());
+                        })
+                        .detach(),
+                    Err(error) => eprintln!("show GPUI activation result: {error:#}"),
                 }
             });
         })
         .detach();
     });
 }
+
+/// Called only from lifetime::quit, before shutdown starts. Keep the event loop
+/// alive until the worker acknowledges cancellation, cleans up and drops its lock.
+pub(crate) fn defer_quit_for_backup(cx: &mut gpui::App) -> bool {
+    let Some(running) = cx
+        .try_global::<ActivationState>()
+        .and_then(|state| state.running.clone())
+    else {
+        return false;
+    };
+    let state = cx.global_mut::<ActivationState>();
+    if state.prompt_pending || state.quit_confirmed {
+        return true;
+    }
+    state.prompt_pending = true;
+    let answer = running.window.update(cx, |_, window, cx| {
+        window.activate_window();
+        window.prompt(
+            gpui::PromptLevel::Warning,
+            QUIT_BACKUP,
+            None,
+            &["Cancel", "Quit Anyway"],
+            cx,
+        )
+    });
+    match answer {
+        Ok(answer) => cx
+            .spawn(async move |cx| {
+                let quit = answer.await == Ok(1);
+                cx.update(|cx| {
+                    let state = cx.global_mut::<ActivationState>();
+                    state.prompt_pending = false;
+                    if quit {
+                        if let Some(running) = &state.running {
+                            running.progress.request_cancel();
+                            state.quit_confirmed = true;
+                        } else {
+                            // Completion raced the native prompt: use normal shutdown.
+                            crate::lifetime::quit(cx);
+                        }
+                    }
+                });
+            })
+            .detach(),
+        Err(error) => {
+            cx.global_mut::<ActivationState>().prompt_pending = false;
+            eprintln!("show V6 backup quit prompt: {error:#}");
+        }
+    }
+    true
+}
 struct ActivationMessage(String);
 impl gpui::Render for ActivationMessage {
     fn render(
         &mut self,
         _: &mut gpui::Window,
-        _: &mut gpui::Context<Self>,
+        cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         use gpui::prelude::*;
-        gpui::div().p_4().child(self.0.clone())
+        let palette = crate::theme::Palette::current(cx);
+        gpui::div()
+            .size_full()
+            .p_4()
+            .bg(gpui::rgb(palette.base))
+            .text_color(gpui::rgb(palette.text))
+            .font_family(crate::theme::LABEL_FONT)
+            .text_size(gpui::px(crate::theme::UI_FONT_SIZE))
+            .child(self.0.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn quit_during_backup_prompts_and_cancel_keeps_running(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let progress = Arc::new(ActivationProgress::default());
+        cx.update(|cx| {
+            let window = open_progress(cx).unwrap();
+            cx.set_global(ActivationState {
+                running: Some(RunningActivation {
+                    progress: progress.clone(),
+                    window,
+                }),
+                ..Default::default()
+            });
+            crate::install_app_menus(cx);
+            cx.dispatch_action(&crate::app_menus::Quit);
+        });
+        assert!(cx.has_pending_prompt());
+        assert_eq!(cx.pending_prompt().unwrap().0, QUIT_BACKUP);
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(progress.phase.load(Ordering::SeqCst), COPYING);
+        cx.update(|cx| {
+            assert!(cx.global::<ActivationState>().running.is_some());
+            assert!(!cx.global::<ActivationState>().prompt_pending);
+            crate::lifetime::quit(cx);
+        });
+        assert!(cx.has_pending_prompt());
+        let _held_counts = progress.counts.lock().unwrap();
+        assert!(progress.text().is_none());
+        cx.simulate_prompt_answer("Quit Anyway");
+        cx.run_until_parked();
+        assert_eq!(progress.phase.load(Ordering::SeqCst), CANCELLED);
+        cx.update(|cx| {
+            // Shutdown waits for the backup worker to acknowledge and clean up.
+            assert!(cx.global::<ActivationState>().running.is_some());
+            assert!(cx.global::<ActivationState>().quit_confirmed);
+        });
+    }
+
+    #[test]
+    fn slow_activation_record_leaves_progress_readable_and_orders_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let prefs = base.join("gpui/live-activation.json");
+        let progress = Arc::new(ActivationProgress::default());
+        let observed = progress.clone();
+        let (began, begun) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            finish_activation(Some(&progress), None, || {
+                // Simulate slow filesystem work at the record's full fsync.
+                assert!(progress.counts.try_lock().is_ok());
+                began.send(()).unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                record(
+                    &prefs,
+                    &Activation {
+                        root: base.join("v6"),
+                        app_version: "fixture".into(),
+                        backup: base.join("backup"),
+                    },
+                )
+            })
+        });
+        begun
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(observed.text().is_some());
+        observed.request_cancel();
+        assert_eq!(observed.phase.load(Ordering::SeqCst), COMMITTING);
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+
+        let root = temp.path().join("v6");
+        let backups = temp.path().join("backups");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&backups).unwrap();
+        let created = backup::create_with_progress(&root, &backups, true, |_, _, _, _| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        let progress = Arc::new(ActivationProgress::default());
+        progress.request_cancel();
+        let error = finish_activation(Some(&progress), Some(created), || {
+            panic!("record after cancellation")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(std::fs::read_dir(backups).unwrap().count(), 0);
+        assert!(progress.text().is_some());
+    }
+
+    #[test]
+    fn cancelled_activation_does_not_record_prefs_and_releases_v6_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("settings.json"), b"{}").unwrap();
+        let prefs = temp.path().join("gpui/live-activation.json");
+        let backups = temp.path().join("backups");
+        let progress = Arc::new(ActivationProgress {
+            phase: AtomicU8::new(CANCELLED),
+            ..Default::default()
+        });
+        let error = admit_with_progress(&root, &prefs, &backups, Some(&progress))
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("cancelled"));
+        assert!(!prefs.exists());
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 0);
+        assert_eq!(std::fs::read(root.join("settings.json")).unwrap(), b"{}");
+        gitterm_core::state_lock::StateLock::acquire(&root).unwrap();
+    }
+
     #[test]
     fn only_a_bundled_executable_uses_remembered_activation() {
         assert!(installed_executable(Path::new(

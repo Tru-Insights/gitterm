@@ -254,6 +254,9 @@ pub(crate) fn quit(cx: &mut gpui::App) {
     // Action dispatch may be borrowing a window or entity. Defer until that
     // borrow ends so shutdown callbacks can update every owner and PTY.
     cx.defer(|cx| {
+        if crate::live::defer_quit_for_backup(cx) {
+            return;
+        }
         if shutdown(cx) {
             cx.quit();
         }

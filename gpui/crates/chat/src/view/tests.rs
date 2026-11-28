@@ -2425,7 +2425,8 @@ fn h13_h13a_card_navigation_emits_only_the_exact_file_or_worker(cx: &mut TestApp
         *events.borrow(),
         [roster::RosterOutcome::OpenFile {
             path: "src/lib.rs".into(),
-            review: false
+            review: false,
+            line: Some(12),
         }]
     );
     install_card(
@@ -2593,7 +2594,8 @@ fn h08_edit_show_all_expands_and_h09_review_routes_without_toggling_card(cx: &mu
         *events.borrow(),
         [roster::RosterOutcome::OpenFile {
             path: "/fixture/src/lib.rs".into(),
-            review: true
+            review: true,
+            line: None,
         }]
     );
     chat.read_with(cx, |view, cx| {
@@ -3269,10 +3271,7 @@ fn c10_checkout_picker_lists_iced_entries_previews_a_choice_and_locks_once_start
     click(cx, "checkout-open-editor");
     draw(cx);
     chat.read_with(cx, |view, _| {
-        assert_eq!(
-            view.composer_state.notice.as_deref(),
-            Some("Open in editor · not available in preview")
-        );
+        assert_eq!(view.composer_state.notice.as_deref(), None);
         assert_eq!(view.composer_state.picker, None);
     });
     assert!(cx.debug_bounds("checkout-picker").is_none());

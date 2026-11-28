@@ -2297,7 +2297,10 @@ impl crate::Shell {
                 return target.session_uid.clone();
             }
             if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
-                && let Some(index) = crate::data::iced_sessions(saved)
+                && let Some(index) = self
+                    .owner
+                    .read(cx)
+                    .iced_sessions(saved)
                     .iter()
                     .position(|s| s.id == session)
                 && let Some(uid) = saved
@@ -2337,7 +2340,10 @@ impl crate::Shell {
                 .map(|id| ChatRef::local(&id));
         }
         if let Some(saved) = self.owner.read(cx).iced_workspace(workspace.workspace.id)
-            && let Some(index) = crate::data::iced_sessions(saved)
+            && let Some(index) = self
+                .owner
+                .read(cx)
+                .iced_sessions(saved)
                 .iter()
                 .position(|s| s.id == session.id)
             && let Some(id) = saved
