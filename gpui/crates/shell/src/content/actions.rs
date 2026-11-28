@@ -1,7 +1,33 @@
 //! Viewer actions: clipboard reads run off-thread; external opens use the platform.
 use crate::Shell;
-use gpui::{App, ClipboardItem, Context};
+use gpui::{App, ClipboardItem, Context, Window};
 use std::path::{Path, PathBuf};
+
+/// Both Iced routes, carried through the normal window action tree.
+#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[action(namespace = gitterm_shell, no_json)]
+pub(crate) struct OpenEditor {
+    pub path: PathBuf,
+    pub line: Option<usize>,
+    pub terminal: bool,
+}
+
+impl OpenEditor {
+    pub(crate) fn configured(path: PathBuf, line: Option<usize>) -> Self {
+        Self {
+            path,
+            line,
+            terminal: false,
+        }
+    }
+    pub(crate) fn terminal(path: PathBuf) -> Self {
+        Self {
+            path,
+            line: None,
+            terminal: true,
+        }
+    }
+}
 
 pub(super) fn is_rendered(path: &Path) -> bool {
     path.extension()
@@ -113,8 +139,96 @@ fn full_text(root: &Path, relative: &Path) -> Result<String, String> {
 }
 
 impl Shell {
-    pub(crate) fn editor_preview_notice(&self, cx: &mut Context<Self>) {
-        self.viewer_error("Open in editor · not available in preview".into(), cx);
+    pub(crate) fn open_editor(
+        &mut self,
+        request: OpenEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        if !self.local || self.data.terminal_cwd(workspace, cx).is_none() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            let _ = window;
+            self.editor_requests.push(request);
+        }
+        #[cfg(not(test))]
+        if request.terminal {
+            let cwd = self
+                .active(cx)
+                .active_session
+                .and_then(|id| self.active(cx).panes.get(&crate::session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).task_folder(cx))
+                .or_else(|| self.data.terminal_cwd(workspace, cx));
+            let command = gitterm_core::editor::terminal_command(
+                std::env::var("EDITOR").ok().as_deref(),
+                &request.path,
+            );
+            self.new_terminal_launch(
+                gpui_component::dock::DockPlacement::Center,
+                cwd.clone(),
+                Some(crate::PaneStart::Launch(gitterm_terminal::TerminalLaunch {
+                    cwd,
+                    startup_command: Some(command),
+                    ..Default::default()
+                })),
+                window,
+                cx,
+            );
+        } else {
+            let setting = self.editor.clone();
+            let built =
+                gitterm_core::editor::build_open_command(&setting, &request.path, request.line);
+            let executor = self.editor_executor.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let result = match built {
+                            Ok(editor) => executor
+                                .block_on(gitterm_core::editor::launch_command(editor.command)),
+                            Err(error) => Err(error),
+                        };
+                        result.map_err(|error| gitterm_core::editor::open_error(&setting, &error))
+                    })
+                    .await;
+                _ = this.update(cx, |this, cx| {
+                    this.owner.update(cx, |owner, cx| {
+                        owner.error = result.err();
+                        cx.notify();
+                    });
+                });
+            })
+            .detach();
+        }
+    }
+
+    pub(crate) fn edit_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        let path = self
+            .content
+            .read(cx)
+            .visits
+            .get(&workspace)
+            .and_then(|visit| self.active(cx).panes.get(&visit.pane))
+            .and_then(|pane| match &pane.read(cx).content {
+                crate::pane::PaneContent::Review(review) => review.read(cx).selected_path(),
+                _ => None,
+            })
+            .or_else(|| {
+                self.selected_files
+                    .get(&workspace)
+                    .map(|file| file.path.clone())
+            });
+        if let Some(path) = path {
+            self.open_editor(OpenEditor::terminal(path), window, cx);
+        }
     }
 
     pub(super) fn viewer_error(&self, error: String, cx: &mut Context<Self>) {

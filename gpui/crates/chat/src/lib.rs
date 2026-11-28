@@ -21,8 +21,8 @@ extern crate gpui_kit as gpui;
 mod view;
 #[cfg(target_os = "macos")]
 pub use view::{
-    ChatView, IntentCallback, TranscriptScrollerState, VisualFactory, VisualHost, VisualMessage,
-    VisualPlacement, VisualSurface, init, run, visual_link,
+    ChatView, IntentCallback, OpenCheckout, TranscriptScrollerState, VisualFactory, VisualHost,
+    VisualMessage, VisualPlacement, VisualSurface, init, run, visual_link,
 };
 
 pub mod pickers;
