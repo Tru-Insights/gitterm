@@ -465,7 +465,7 @@ fn resume_failure_keeps_one_read_only_message_and_fresh_chat_action(cx: &mut gpu
     let (pane, cx) = cx
         .add_window_view(|window, cx| ChatPane::history(RuntimeShutdown::new(), saved, window, cx));
     let error = "Saved Claude session not found: missing-session";
-    pane.update_in(cx, |pane, cx| pane.resume_failed(error.into(), cx));
+    pane.update_in(cx, |pane, _, cx| pane.resume_failed(error.into(), cx));
     crate::workspace_bar::tests::draw(cx);
 
     assert!(cx.debug_bounds("chat-read-only-note").is_some());

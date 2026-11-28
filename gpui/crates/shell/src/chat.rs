@@ -1315,6 +1315,7 @@ impl Render for ChatPane {
                     .p_2()
                     .child(
                         gpui_component::button::Button::new("start-fresh-chat")
+                            .debug_selector(|| "start-fresh-chat".into())
                             .label("Start a fresh chat here")
                             .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
                     )
