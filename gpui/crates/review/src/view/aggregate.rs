@@ -9,22 +9,29 @@ use gitterm_core::{
     },
 };
 use gpui::{
-    Context, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Render,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
-    uniform_list,
+    App, Context, Global, InteractiveElement, IntoElement, ListAlignment, ListState, ParentElement,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, div, list,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable, Selectable, Sizable,
+    ActiveTheme, Disableable, Selectable, Sizable,
     button::Button,
+    checkbox::Checkbox,
     list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
+    text::{TextView, TextViewStyle},
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 /// Only UI selection lives outside the authority.
 pub(super) struct AggregateView {
     pub(super) model: AggregateModel,
     selected: Option<String>,
+    ui: AggregateUi,
     bases: Vec<BaseChoice>,
     error: Option<String>,
     executor: Arc<tokio::runtime::Runtime>,
@@ -57,9 +64,9 @@ impl AggregateView {
                     view.bases = bases;
                     view.dispatch(
                         Intent::Open {
+                            hide_noise: noise_choice(&target.checkout, cx),
                             target,
                             source,
-                            hide_noise: false,
                             focus: None,
                             page: AggregateModel::page(),
                         },
@@ -83,6 +90,7 @@ impl AggregateView {
         Self {
             model,
             selected: None,
+            ui: AggregateUi::default(),
             bases: Vec::new(),
             error: None,
             executor,
@@ -91,7 +99,21 @@ impl AggregateView {
     }
 
     pub(super) fn dispatch(&mut self, intent: Intent, cx: &mut Context<Self>) {
+        let toggle = match &intent {
+            Intent::ToggleViewed { path, viewed } => Some((path.clone(), *viewed)),
+            _ => None,
+        };
         let effects = self.model.dispatch(intent);
+        if let Some((path, viewed)) = toggle
+            && self
+                .model
+                .projection()
+                .files
+                .iter()
+                .any(|row| row.file.path == path && (row.viewed == ViewedState::Viewed) == viewed)
+        {
+            self.ui.collapsed.insert(path, viewed);
+        }
         let mut changed = false;
         for effect in effects {
             match effect {
@@ -151,6 +173,7 @@ impl AggregateView {
                 self.selected = projection.files.first().map(|row| row.file.path.clone());
             }
         }
+        self.sync_rows();
         cx.notify();
     }
 
@@ -172,14 +195,6 @@ impl AggregateView {
 
     fn select_turn(&mut self, number: u64, cx: &mut Context<Self>) {
         if let Some(intent) = self.model.turn_intent(number) {
-            self.dispatch(intent, cx);
-        }
-    }
-
-    fn open_selected_file(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.selected.clone()
-            && let Some(intent) = self.model.open_file_intent(&path)
-        {
             self.dispatch(intent, cx);
         }
     }
@@ -210,6 +225,7 @@ impl AggregateView {
             projection.files.first()
         }
         .map(|row| row.file.path.clone());
+        self.scroll_selected();
         cx.notify();
     }
 
@@ -226,74 +242,227 @@ impl AggregateView {
                 (index + 1).min(projection.files.len() - 1)
             };
             self.selected = Some(projection.files[index].file.path.clone());
+            self.scroll_selected();
             cx.notify();
         }
     }
 
-    fn selected_file(&self) -> Option<&ReviewFile> {
-        self.model
-            .state()
-            .pane()?
-            .loaded
-            .as_ref()?
-            .0
-            .file(self.selected.as_deref()?)
-    }
-
-    fn render_lines(&self, range: std::ops::Range<usize>) -> Vec<gpui::Div> {
-        let Some(file) = self.selected_file() else {
-            return Vec::new();
-        };
+    fn sync_rows(&mut self) {
+        let projection = self.model.projection();
+        let generation = projection.pane.map(|pane| pane.generation);
+        if generation != self.ui.generation {
+            self.ui.collapsed.clear();
+            self.ui.generation = generation;
+        }
         let mut rows = Vec::new();
-        for hunk in &file.hunks {
-            rows.push((None, None, " ", hunk.header.as_str(), 0x89b4fa));
-            for line in &hunk.lines {
-                rows.push((
-                    line.old_no,
-                    line.new_no,
-                    match line.op {
-                        LineOp::Add => "+",
-                        LineOp::Del => "−",
-                        LineOp::Context => " ",
-                    },
-                    line.text.as_str(),
-                    match line.op {
-                        LineOp::Add => 0xa6e3a1,
-                        LineOp::Del => 0xf38ba8,
-                        LineOp::Context => 0xcdd6f4,
-                    },
-                ));
+        for row in projection.files {
+            let file = row.file;
+            rows.push(AggregateRow::Header(file.path.clone()));
+            if self
+                .ui
+                .collapsed
+                .get(&file.path)
+                .copied()
+                .unwrap_or(row.viewed == ViewedState::Viewed || file.omitted)
+            {
+                continue;
+            }
+            for note in file_notes(file) {
+                rows.push(AggregateRow::Note(file.path.clone(), note));
+            }
+            for (hunk, content) in file.hunks.iter().enumerate() {
+                rows.push(AggregateRow::Hunk(file.path.clone(), hunk));
+                for line in 0..content.lines.len() {
+                    rows.push(AggregateRow::Line(file.path.clone(), hunk, line));
+                }
             }
         }
-        rows.into_iter()
-            .skip(range.start)
-            .take(range.len())
-            .map(|(old, new, sign, text, color)| {
+        if rows != self.ui.rows {
+            self.ui.list.reset(rows.len());
+            self.ui.rows = rows;
+        }
+    }
+
+    fn scroll_selected(&self) {
+        if let Some(index) = self.ui.rows.iter().position(
+            |row| matches!(row, AggregateRow::Header(path) if Some(path) == self.selected.as_ref()),
+        ) {
+            self.ui.list.scroll_to_reveal_item(index);
+        }
+    }
+
+    fn select_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.selected = Some(path);
+        self.scroll_selected();
+        cx.notify();
+    }
+
+    fn toggle_noise(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.model.state().pane() else {
+            return;
+        };
+        let path = pane.target.checkout.clone();
+        let hide = !pane.hide_noise;
+        if !cx.has_global::<NoiseChoices>() {
+            cx.set_global(NoiseChoices::default());
+        }
+        cx.global_mut::<NoiseChoices>().0.insert(path, hide);
+        self.dispatch(Intent::SetHideNoise(hide), cx);
+    }
+
+    fn render_row(&self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(row) = self.ui.rows.get(index) else {
+            return div();
+        };
+        let path = row.path();
+        let Some(projected) = self
+            .model
+            .projection()
+            .files
+            .into_iter()
+            .find(|row| row.file.path == path)
+        else {
+            return div();
+        };
+        let file = projected.file;
+        let theme = cx.theme();
+        match row {
+            AggregateRow::Header(_) => {
+                let path = path.to_string();
+                let open_path = path.clone();
+                let collapse_path = path.clone();
+                let collapsed = self
+                    .ui
+                    .collapsed
+                    .get(&path)
+                    .copied()
+                    .unwrap_or(projected.viewed == ViewedState::Viewed || file.omitted);
+                let can_open = !matches!(
+                    self.model.state().pane().map(|pane| &pane.source),
+                    Some(ReviewSource::Commits(_))
+                ) && file.status != FileStatus::Deleted
+                    && self.host.open_file.is_some();
+                let title = file
+                    .old_path
+                    .as_ref()
+                    .map_or_else(|| path.clone(), |old| format!("{old} → {path}"));
                 div()
-                    .h(px(18.))
+                    .debug_selector(move || format!("aggregate-section-{index}"))
+                    .when(projected.viewed == ViewedState::Viewed, |header| {
+                        header.opacity(0.7)
+                    })
+                    .h(px(38.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .bg(theme.muted)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new(("aggregate-collapse", index))
+                            .small()
+                            .label(if collapsed { "▸" } else { "▾" })
+                            .accessibility_label(if collapsed {
+                                "Expand file diff"
+                            } else {
+                                "Collapse file diff"
+                            })
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.ui.collapsed.insert(collapse_path.clone(), !collapsed);
+                                view.sync_rows();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.5))
+                            .child(format!(
+                                "{} {title}  +{} −{}",
+                                file.status.letter(),
+                                file.additions,
+                                file.deletions
+                            )),
+                    )
+                    .when(can_open, |header| {
+                        header.child(
+                            div().debug_selector(|| "aggregate-open".into()).child(
+                                Button::new(("aggregate-open", index))
+                                    .small()
+                                    .label("Open")
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Some(intent) =
+                                            view.model.open_file_intent(&open_path)
+                                        {
+                                            view.dispatch(intent, cx);
+                                        }
+                                    })),
+                            ),
+                        )
+                    })
+                    .child(
+                        Button::new(("aggregate-viewed", index))
+                            .small()
+                            .label(match projected.viewed {
+                                ViewedState::Viewed => "✓ Viewed",
+                                ViewedState::ChangedSinceViewed => {
+                                    "Changed since viewed · Mark viewed"
+                                }
+                                ViewedState::Unviewed => "Mark viewed",
+                            })
+                            .disabled(
+                                file.content_id.is_none()
+                                    || self
+                                        .model
+                                        .state()
+                                        .marks()
+                                        .is_none_or(|marks| marks.is_err()),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.selected = Some(path.clone());
+                                if let Some(intent) = view.model.viewed_intent(&path) {
+                                    view.dispatch(intent, cx);
+                                }
+                            })),
+                    )
+            }
+            AggregateRow::Note(_, note) => div().px_3().py_2().child(note.clone()),
+            AggregateRow::Hunk(_, hunk) => code_row()
+                .text_color(theme.info)
+                .bg(theme.muted)
+                .child(file.hunks[*hunk].header.clone()),
+            AggregateRow::Line(_, hunk, line) => {
+                let line = &file.hunks[*hunk].lines[*line];
+                let (sign, color, background) = match line.op {
+                    LineOp::Add => ("+", theme.success, theme.success.opacity(0.10)),
+                    LineOp::Del => ("−", theme.danger, theme.danger.opacity(0.10)),
+                    LineOp::Context => (" ", theme.muted_foreground, theme.background),
+                };
+                code_row()
                     .flex()
                     .gap_3()
-                    .font_family(MONO_FONT)
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .whitespace_nowrap()
-                    .text_color(rgb(color))
+                    .bg(background)
+                    .text_color(theme.foreground)
                     .child(
                         div()
                             .w(px(48.))
                             .flex_shrink_0()
-                            .child(old.map_or_else(String::new, |n| n.to_string())),
+                            .text_color(theme.muted_foreground)
+                            .child(line.old_no.map_or_else(String::new, |n| n.to_string())),
                     )
                     .child(
                         div()
                             .w(px(48.))
                             .flex_shrink_0()
-                            .child(new.map_or_else(String::new, |n| n.to_string())),
+                            .text_color(theme.muted_foreground)
+                            .child(line.new_no.map_or_else(String::new, |n| n.to_string())),
                     )
-                    .child(sign)
-                    .child(text.to_string())
-            })
-            .collect()
+                    .child(div().text_color(color).child(sign))
+                    .child(syntax_line(index, path, &line.text, cx))
+            }
+        }
     }
 }
 
@@ -335,6 +504,7 @@ mod tests;
 
 impl Render for AggregateView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_rows();
         let projection = self.model.projection();
         let pane = projection.pane;
         let source = pane.map(|pane| &pane.source);
@@ -439,18 +609,28 @@ impl Render for AggregateView {
         if let Some(pane) = pane {
             toolbar = toolbar.child(format!("{} · {}", pane.target.repo, pane.target.branch));
         }
+        toolbar = toolbar.child(
+            Checkbox::new("aggregate-hide-noise")
+                .label("Hide tests & generated")
+                .checked(pane.is_none_or(|pane| pane.hide_noise))
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_noise(cx))),
+        );
         let mut top = div().flex().flex_col().child(toolbar).child(
-            div()
-                .px_3()
-                .text_color(rgb(0x9399b2))
-                .child(if self.host.save_marks.is_some() {
+            div().px_3().text_color(cx.theme().muted_foreground).child(
+                if self.host.save_marks.is_some() {
                     "Aggregate review"
                 } else {
                     "Aggregate review · Viewed marks are kept for this preview session"
-                }),
+                },
+            ),
         );
         for notice in &projection.notices {
-            top = top.child(div().px_3().text_color(rgb(0xf9e2af)).child(notice.clone()));
+            top = top.child(
+                div()
+                    .px_3()
+                    .text_color(cx.theme().warning)
+                    .child(notice.clone()),
+            );
         }
         for error in [
             self.error.as_deref(),
@@ -463,7 +643,7 @@ impl Render for AggregateView {
             top = top.child(
                 div()
                     .px_3()
-                    .text_color(rgb(0xf38ba8))
+                    .text_color(cx.theme().danger)
                     .child(error.to_string()),
             );
         }
@@ -477,7 +657,7 @@ impl Render for AggregateView {
             .h_full()
             .flex_shrink_0()
             .overflow_y_scroll()
-            .bg(rgb(0x181825))
+            .bg(cx.theme().sidebar)
             .p_3();
         if let Some(pane) = pane
             && matches!(pane.source, ReviewSource::Commits(_))
@@ -533,7 +713,7 @@ impl Render for AggregateView {
                                 .flex()
                                 .gap_2()
                                 .child(format!("Turn {number}"))
-                                .child(div().text_color(rgb(0x9399b2)).child(detail)),
+                                .child(div().text_color(cx.theme().muted_foreground).child(detail)),
                         )
                         .selected(*selected == Some(number))
                         .on_click(cx.listener(move |view, _, _, cx| view.select_turn(number, cx))),
@@ -541,129 +721,38 @@ impl Render for AggregateView {
             }
         }
         sidebar = sidebar.child(div().py_2().child("Changed files"));
-        for (index, row) in projection.files.iter().enumerate() {
-            let path = row.file.path.clone();
-            let mark = match row.viewed {
-                ViewedState::Viewed => "✓",
-                ViewedState::ChangedSinceViewed => "Changed",
-                ViewedState::Unviewed => "○",
-            };
-            let label = format!("{mark} {} {}", row.file.status.letter(), row.file.path);
-            let name = file_name(row.file.path.clone(), row.viewed);
-            sidebar = sidebar.child(
-                ListItem::new(("aggregate-file", index))
-                    .accessibility_label(label)
-                    .child(
-                        div()
-                            .debug_selector(move || format!("aggregate-file-name-{index}"))
-                            .font_family(MONO_FONT)
-                            .text_size(px(12.))
-                            .flex()
-                            .gap_1()
-                            .child(format!("{mark} {}", row.file.status.letter()))
-                            .child(name),
-                    )
-                    .selected(self.selected.as_ref() == Some(&row.file.path))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.selected = Some(path.clone());
-                        cx.notify();
-                    })),
-            );
+        let tree = FileTree::from_paths(projection.files.iter().map(|row| row.file.path.as_str()));
+        sidebar = sidebar.child(self.render_tree(&tree, "", 0, cx));
+        if let Some(pane) = pane
+            && pane.hide_noise
+            && let Some((diff, _)) = &pane.loaded
+        {
+            let noise = diff
+                .files
+                .iter()
+                .filter(|file| file.kind.is_noise())
+                .count();
+            if noise > 0 {
+                sidebar = sidebar.child(
+                    div()
+                        .py_2()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{noise} hidden (tests & generated)")),
+                );
+            }
         }
         let mut body = div().flex_1().min_w_0().h_full().flex().flex_col();
-        if let Some(row) = projection
-            .files
-            .iter()
-            .find(|row| Some(&row.file.path) == self.selected.as_ref())
-        {
-            let file = row.file;
-            let path = file.path.clone();
-            let can_open = !matches!(source, Some(ReviewSource::Commits(_)))
-                && file.status != FileStatus::Deleted
-                && self.host.open_file.is_some();
-            let title = file
-                .old_path
-                .as_ref()
-                .map_or_else(|| file.path.clone(), |old| format!("{old} → {}", file.path));
+        if !projection.files.is_empty() {
             body = body.child(
-                div()
-                    .p_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_family(MONO_FONT)
-                            .text_size(px(12.5))
-                            .child(format!("{title}  +{} −{}", file.additions, file.deletions)),
-                    )
-                    // Iced's per-file Open button, before Viewed (review_pane.rs render_file).
-                    .when(can_open, |row| {
-                        row.child(
-                            div().debug_selector(|| "aggregate-open".into()).child(
-                                Button::new("aggregate-open")
-                                    .small()
-                                    .label("Open")
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.open_selected_file(cx)),
-                                    ),
-                            ),
-                        )
-                    })
-                    .child(
-                        Button::new("aggregate-viewed")
-                            .small()
-                            .label(match row.viewed {
-                                ViewedState::Viewed => "✓ Viewed",
-                                ViewedState::ChangedSinceViewed => {
-                                    "Changed since viewed · Mark viewed"
-                                }
-                                ViewedState::Unviewed => "Mark viewed",
-                            })
-                            .disabled(
-                                file.content_id.is_none()
-                                    || self
-                                        .model
-                                        .state()
-                                        .marks()
-                                        .is_none_or(|marks| marks.is_err()),
-                            )
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                if let Some(intent) = view.model.viewed_intent(&path) {
-                                    view.dispatch(intent, cx);
-                                }
-                            })),
-                    ),
+                list(
+                    self.ui.list.clone(),
+                    cx.processor(|view, index, _, cx| {
+                        view.render_row(index, cx).into_any_element()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
             );
-            if file.omitted {
-                body = body.child(div().p_3().child("Diff omitted by the review budget."));
-            }
-            if file.truncated {
-                body = body.child(div().p_3().child(
-                    "Diff truncated at the review text limits; only collected lines are shown.",
-                ));
-            }
-            if let Some(note) = &file.note {
-                body = body.child(div().p_3().child(note.clone()));
-            }
-            if file.status == FileStatus::Binary {
-                body = body.child(div().p_3().child("Binary file — no text diff"));
-            } else if !file.hunks.is_empty() {
-                let count = file.hunks.iter().map(|hunk| 1 + hunk.lines.len()).sum();
-                body = body.child(
-                    uniform_list(
-                        "aggregate-lines",
-                        count,
-                        cx.processor(|view, range, _, _| view.render_lines(range)),
-                    )
-                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                    .flex_1()
-                    .min_h_0(),
-                );
-            } else if !file.omitted && file.note.is_none() {
-                body = body.child(div().p_3().child("No text changes (metadata only)"));
-            }
         } else if !loading {
             body = body.child(div().p_3().child(match source {
                 Some(ReviewSource::Commits(None)) => "Select commits to review",
@@ -676,6 +765,8 @@ impl Render for AggregateView {
         }
         div()
             .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .flex()
             .flex_col()
             .child(top)
@@ -685,9 +776,232 @@ impl Render for AggregateView {
 
 /// A changed file's name as Iced's `.tf.viewed .nm` (muted, struck through)
 /// and `.tf.stale .nm` (warn colour) style it.
-pub(crate) fn file_name(path: String, viewed: ViewedState) -> gpui::Div {
+pub(crate) fn file_name(path: String, viewed: ViewedState, cx: &App) -> gpui::Div {
     match viewed {
-        ViewedState::ChangedSinceViewed => div().text_color(rgb(0xf9e2af)).child(path),
-        viewed => super::file_name(path, matches!(viewed, ViewedState::Viewed)),
+        ViewedState::ChangedSinceViewed => div().text_color(cx.theme().warning).child(path),
+        ViewedState::Viewed => div()
+            .text_color(cx.theme().muted_foreground)
+            .line_through()
+            .child(path),
+        ViewedState::Unviewed => div().child(path),
+    }
+}
+
+#[derive(Default)]
+struct NoiseChoices(HashMap<PathBuf, bool>);
+impl Global for NoiseChoices {}
+
+fn noise_choice(checkout: &std::path::Path, cx: &App) -> bool {
+    cx.try_global::<NoiseChoices>()
+        .and_then(|choices| choices.0.get(checkout).copied())
+        .unwrap_or(true)
+}
+
+struct AggregateUi {
+    collapsed: HashMap<String, bool>,
+    closed_folders: HashSet<String>,
+    generation: Option<u64>,
+    rows: Vec<AggregateRow>,
+    list: ListState,
+}
+
+impl Default for AggregateUi {
+    fn default() -> Self {
+        Self {
+            collapsed: HashMap::new(),
+            closed_folders: HashSet::new(),
+            generation: None,
+            rows: Vec::new(),
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AggregateRow {
+    Header(String),
+    Note(String, String),
+    Hunk(String, usize),
+    Line(String, usize, usize),
+}
+
+impl AggregateRow {
+    fn path(&self) -> &str {
+        match self {
+            Self::Header(path)
+            | Self::Note(path, _)
+            | Self::Hunk(path, _)
+            | Self::Line(path, _, _) => path,
+        }
+    }
+}
+
+fn file_notes(file: &ReviewFile) -> Vec<String> {
+    let mut notes = Vec::new();
+    if file.omitted {
+        notes.push("Diff omitted by the review budget.".into());
+    }
+    if file.truncated {
+        notes.push(
+            "Diff truncated at the review text limits; only collected lines are shown.".into(),
+        );
+    }
+    if let Some(note) = &file.note {
+        notes.push(note.clone());
+    }
+    if file.status == FileStatus::Binary {
+        notes.push("Binary file — no text diff".into());
+    } else if file.hunks.is_empty() && !file.omitted && file.note.is_none() {
+        notes.push("No text changes (metadata only)".into());
+    }
+    notes
+}
+
+fn code_row() -> gpui::Div {
+    div()
+        .h(px(18.))
+        .font_family(MONO_FONT)
+        .text_size(px(12.))
+        .line_height(px(18.))
+        .whitespace_nowrap()
+}
+
+/// TextView and the status Diff use the same installed syntect backend and
+/// highlight theme. A fence longer than any source run keeps source literal.
+fn syntax_line(index: usize, path: &str, text: &str, cx: &App) -> TextView {
+    let language = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or("text"));
+    let fence = "`".repeat(
+        text.split(|c| c != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+            .max(2)
+            + 1,
+    );
+    TextView::markdown(
+        ("aggregate-code", index),
+        format!("{fence}{language}\n{text}\n{fence}"),
+    )
+    .selectable(false)
+    .code_block_actions(|_, _, _| div())
+    .style(TextViewStyle {
+        paragraph_gap: gpui::rems(0.),
+        highlight_theme: cx.theme().highlight_theme.clone(),
+        is_dark: cx.theme().is_dark(),
+        code_block: StyleRefinement::default()
+            .p_0()
+            .border_0()
+            .rounded_none()
+            .bg(gpui::transparent_black())
+            .font_family(MONO_FONT)
+            .text_size(px(12.))
+            .line_height(px(18.)),
+        ..Default::default()
+    })
+}
+
+/// Iced's TreeDir insertion order: directories first, then files, each in
+/// first-seen order. Directory keys include their full path.
+#[derive(Default, Debug)]
+struct FileTree {
+    dirs: Vec<(String, FileTree)>,
+    files: Vec<String>,
+}
+
+impl FileTree {
+    fn from_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Self {
+        let mut tree = Self::default();
+        for path in paths {
+            tree.insert(path, path);
+        }
+        tree
+    }
+
+    fn insert(&mut self, rest: &str, path: &str) {
+        if let Some((name, rest)) = rest.split_once('/') {
+            let index = self
+                .dirs
+                .iter()
+                .position(|(dir, _)| dir == name)
+                .unwrap_or_else(|| {
+                    self.dirs.push((name.into(), Self::default()));
+                    self.dirs.len() - 1
+                });
+            self.dirs[index].1.insert(rest, path);
+        } else {
+            self.files.push(path.into());
+        }
+    }
+}
+
+impl AggregateView {
+    fn render_tree(
+        &self,
+        tree: &FileTree,
+        prefix: &str,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let mut container = div();
+        for (name, children) in &tree.dirs {
+            let path = format!("{prefix}{name}/");
+            let key = path.clone();
+            let closed = self.ui.closed_folders.contains(&path);
+            container = container.child(
+                ListItem::new(gpui::SharedString::from(format!("aggregate-folder-{path}")))
+                    .accessibility_label(format!(
+                        "{} folder {name}",
+                        if closed { "Expand" } else { "Collapse" }
+                    ))
+                    .child(
+                        div()
+                            .debug_selector({
+                                let path = path.clone();
+                                move || format!("aggregate-folder-{path}")
+                            })
+                            .pl(px(depth as f32 * 16.))
+                            .child(format!("{} {name}", if closed { "▸" } else { "▾" })),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !view.ui.closed_folders.remove(&key) {
+                            view.ui.closed_folders.insert(key.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+            if !closed {
+                container = container.child(self.render_tree(children, &path, depth + 1, cx));
+            }
+        }
+        let projection = self.model.projection();
+        for path in &tree.files {
+            let Some(row) = projection.files.iter().find(|row| row.file.path == *path) else {
+                continue;
+            };
+            let selected = self.selected.as_ref() == Some(path);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let label = format!("{} {path}", row.file.status.letter());
+            let key = path.clone();
+            container = container.child(
+                ListItem::new(gpui::SharedString::from(format!("aggregate-file-{path}")))
+                    .accessibility_label(label)
+                    .selected(selected)
+                    .child(
+                        div()
+                            .pl(px(depth as f32 * 16.))
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.))
+                            .flex()
+                            .gap_1()
+                            .child(row.file.status.letter().to_string())
+                            .child(file_name(name.into(), row.viewed, cx)),
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| view.select_file(key.clone(), cx))),
+            );
+        }
+        container
     }
 }
