@@ -1062,7 +1062,8 @@ impl TerminalView {
         false
     }
 
-    fn write_input_bytes(&self, bytes: &[u8]) -> bool {
+    /// Write raw input without clipboard normalization or bracketed-paste wrapping.
+    pub fn write_input_bytes(&self, bytes: &[u8]) -> bool {
         self.wrote_input(self.backend.input_bytes(bytes))
     }
 
