@@ -287,6 +287,7 @@ pub(crate) struct TaskHostOwner {
     host: TaskHost,
     /// The shell's panes holding task sessions, as last pushed.
     panes: Vec<TaskPane>,
+    pub(crate) terminal_callers: Vec<gitterm_core::delegation_state::Caller>,
     /// Iced's steady-state tab label for each pane folder: `None` while its
     /// background read runs. Held only while a pane has the folder.
     pub(crate) folder_labels: std::collections::HashMap<PathBuf, Option<String>>,
@@ -649,6 +650,7 @@ impl TaskHostOwner {
             Self {
                 host,
                 panes: Vec::new(),
+                terminal_callers: Vec::new(),
                 folder_labels: std::collections::HashMap::new(),
                 roots,
                 plan_limits: live

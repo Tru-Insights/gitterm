@@ -378,6 +378,9 @@ fn saved_run_inventory_restores_plain_shells_once_before_panel_or_workspace_sele
                         startup_command: None,
                         task_id: None,
                         task_session_id: None,
+                        session_uid: None,
+                        chat_session_id: None,
+                        bottom: true,
                     });
                 state.panes.insert(pane_id, pane.clone());
                 state.dock.update(cx, |dock, cx| {

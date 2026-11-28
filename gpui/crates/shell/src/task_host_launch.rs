@@ -76,6 +76,7 @@ pub(crate) struct TerminalLaunched {
     /// Iced's persisted `startup_command` for the tab (see
     /// [`persisted_startup_command`]).
     pub startup_command: Option<String>,
+    pub chat_session_id: Option<String>,
     /// The pane's session target. Its `session_uid` is the task MCP caller
     /// the child's environment names (the task session id).
     pub target: session::Target,
@@ -152,6 +153,19 @@ pub(super) enum Started {
 }
 
 impl TaskHostOwner {
+    fn spawn_live_terminal(
+        &self,
+        cwd: &Path,
+        command: Option<&str>,
+        env: Vec<(OsString, OsString)>,
+        session_id: &str,
+        needs_input: &Arc<AtomicBool>,
+        cx: &mut Context<Self>,
+    ) -> Result<HostTerminal, String> {
+        let launch = self.live_launch_spec(cwd, command, &env)?;
+        spawn_terminal_launch(cwd, launch, cx.weak_entity(), session_id, needs_input, cx)
+    }
+
     /// The `task_launch_session` arm in fixture mode (an agent's launch).
     pub(super) fn launch_session(
         &mut self,
@@ -190,17 +204,45 @@ impl TaskHostOwner {
 
     /// Iced's relaunch restore of a task tab (src/main.rs, the saved tab
     /// loop of workspace restore, then `create_tab_with_session_uid`), in
-    /// fixture mode: a restored layout pane with a saved command and task
+    /// Live mode, or the guarded fixture route in Preview. A saved task
     /// runs the command rebuilt as a launch builds it, as the same task
     /// session, in a terminal this host owns until the shell adopts it
     /// ([`Self::take_terminal`]). None restores a plain shell and keeps the
-    /// saved fields: no command or task, a task this host did not create
+    /// saved fields in Preview: no command or task, a task this host did not create
     /// (always so in plain preview), neither folder there, or a refusal.
     pub(crate) fn restore_terminal(
         &mut self,
+        workspace: &str,
         saved: &crate::layout::TerminalSession,
         cx: &mut Context<Self>,
     ) -> Option<TerminalLaunched> {
+        if self.is_live() {
+            if saved.bottom {
+                return None;
+            }
+            let tab = gitterm_core::workspace_config::WorkspaceTabConfig {
+                dir: saved.cwd.to_string_lossy().into_owned(),
+                startup_command: saved.startup_command.clone(),
+                task_id: saved.task_id.clone(),
+                task_session_id: saved.task_session_id.clone(),
+                extra: Default::default(),
+                repo_dir: None,
+                tab_kind: None,
+                agent_config: None,
+                chat_session_id: saved.chat_session_id.clone(),
+                worker_shutdown_refused: false,
+                session_uid: saved
+                    .session_uid
+                    .clone()
+                    .or_else(|| saved.task_session_id.clone()),
+            };
+            return self
+                .open_live_terminal(workspace, &tab, true, cx)
+                .inspect_err(|e| {
+                    eprintln!("[tasks] restore terminal: {e}");
+                })
+                .ok();
+        }
         let (Some(_), Some(task_id)) = (&saved.startup_command, &saved.task_id) else {
             return None;
         };
@@ -381,6 +423,7 @@ impl TaskHostOwner {
             session_id,
             cwd: folder,
             startup_command: restored.startup_command,
+            chat_session_id: restored.chat_session_id,
             target,
         })
     }
@@ -660,48 +703,10 @@ impl TaskHostOwner {
                 .and_then(|()| services.recheck_git_work_trees(&authorized, &env))
                 .map_err(|denied| denied.notice().to_string())?;
             let terminal = if self.is_live() {
-                let readable: Vec<(String, String)> = env
-                    .into_iter()
-                    .map(|(key, value)| {
-                        Ok((
-                            key.into_string()
-                                .map_err(|_| "worker environment name is not UTF-8")?,
-                            value
-                                .into_string()
-                                .map_err(|_| "worker environment value is not UTF-8")?,
-                        ))
-                    })
-                    .collect::<Result<_, String>>()?;
-                let refs: Vec<_> = readable
-                    .iter()
-                    .map(|(key, value)| (key.as_str(), value.as_str()))
-                    .collect();
-                #[allow(unused_mut)] // Tests replace the executable recorder before spawning.
-                let mut spec = gitterm_core::task_host::command::terminal_command(
+                self.spawn_live_terminal(
                     &worktree,
                     command.as_deref(),
-                    &refs,
-                    self.process_root(),
-                    gitterm_browser::browser_mcp::configure_browser_command,
-                );
-                #[cfg(test)]
-                if let Some(hook) = &self.terminal_spec_hook {
-                    hook(&mut spec);
-                }
-                spawn_terminal_launch(
-                    &worktree,
-                    TerminalLaunch {
-                        cwd: Some(spec.cwd),
-                        program: spec.program,
-                        args: spec.args,
-                        env: spec
-                            .env
-                            .into_iter()
-                            .map(|(key, value)| (key, Some(value)))
-                            .collect(),
-                        ..Default::default()
-                    },
-                    owner,
+                    env,
                     &session_id,
                     &needs_input,
                     cx,
@@ -736,6 +741,7 @@ impl TaskHostOwner {
             &options,
             pre_injection,
         );
+        let saved_chat_session_id = chat_session_id.clone();
         let conversation = chat_session_id.map(|session_id| HarnessConversationRef {
             backend: backend.unwrap_or(HarnessConversationBackend::Claude),
             session_id,
@@ -822,6 +828,7 @@ impl TaskHostOwner {
             title: format!("{child_label} · {}", task.title),
             cwd: worktree.clone(),
             startup_command,
+            chat_session_id: saved_chat_session_id,
             target,
         });
         cx.notify();
@@ -1115,11 +1122,283 @@ impl TaskHostOwner {
             .collect()
     }
 
+    /// Iced's create_tab_with_session_uid / create_bottom_terminal_for:
+    /// the same environment and terminal settings builder, without task trust
+    /// or a worker recorder for ordinary shells and CLI presets.
+    pub(crate) fn live_terminal_launch(
+        &self,
+        workspace: &str,
+        cwd: &Path,
+        command: Option<&str>,
+        target: &session::Target,
+        bottom: bool,
+        cx: &App,
+    ) -> Result<TerminalLaunch, String> {
+        if !self.is_live() {
+            return Err(preview_notice("Terminal"));
+        }
+        self.authorize_process("Launch session", &[cwd.to_path_buf()])?;
+        let browser_caller = if bottom {
+            format!("terminal-{}", target.tab_id)
+        } else {
+            target.session_uid.clone()
+        };
+        let env = self.live_terminal_env_for(
+            workspace,
+            cwd,
+            &browser_caller,
+            (!bottom).then_some(target.session_uid.as_str()),
+        )?;
+        let command = command
+            .map(|command| self.ordinary_runtime_command(command, cwd, workspace, !bottom, cx));
+        let launch = self.live_launch_spec(cwd, command.as_deref(), &env)?;
+        if !bottom {
+            self.host.issue_caller(&target.session_uid);
+        }
+        Ok(launch)
+    }
+
+    fn ordinary_runtime_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        workspace: &str,
+        guidelines: bool,
+        cx: &App,
+    ) -> String {
+        let command = if guidelines && gitterm_core::guidelines::starts_a_harness(command) {
+            self.launch_instructions(
+                cwd,
+                gitterm_core::guidelines::instruction_file_for_command(command),
+                workspace,
+                true,
+                cx,
+            )
+            .map(|g| gitterm_core::guidelines::configure_terminal_command(command, &g))
+            .unwrap_or_else(|| command.to_string())
+        } else {
+            command.to_string()
+        };
+        gitterm_core::harness::claude::configure_terminal_chrome(
+            &command,
+            saved_workspace(workspace, cx).is_some_and(|ws| ws.claude_in_chrome),
+        )
+    }
+
+    fn live_launch_spec(
+        &self,
+        cwd: &Path,
+        command: Option<&str>,
+        env: &[(OsString, OsString)],
+    ) -> Result<TerminalLaunch, String> {
+        let readable: Vec<_> = env
+            .iter()
+            .map(|(k, v)| {
+                Ok((
+                    k.to_str().ok_or("environment name is not UTF-8")?,
+                    v.to_str().ok_or("environment value is not UTF-8")?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        #[allow(unused_mut)]
+        let mut spec = gitterm_core::task_host::command::terminal_command(
+            cwd,
+            command,
+            &readable,
+            self.process_root(),
+            gitterm_browser::browser_mcp::configure_browser_command,
+        );
+        #[cfg(test)]
+        if let Some(hook) = &self.terminal_spec_hook {
+            hook(&mut spec);
+        }
+        Ok(TerminalLaunch {
+            cwd: Some(spec.cwd),
+            program: spec.program,
+            args: spec.args,
+            env: spec.env.into_iter().map(|(k, v)| (k, Some(v))).collect(),
+            ..Default::default()
+        })
+    }
+
+    /// A new CLI preset or Iced saved tab. Restart creates a new recorder;
+    /// saved process identities never grant authority over an old process.
+    pub(crate) fn open_live_terminal(
+        &mut self,
+        workspace: &str,
+        tab: &gitterm_core::workspace_config::WorkspaceTabConfig,
+        restore: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<TerminalLaunched, String> {
+        if !self.is_live() {
+            return Err(preview_notice("Terminal"));
+        }
+        let mut task = tab
+            .task_id
+            .as_deref()
+            .and_then(|id| self.host.store().as_ref()?.get(id))
+            .cloned();
+        if tab.task_id.is_some() && task.is_none() {
+            return Err("Saved terminal task is unavailable".into());
+        }
+        if task.as_ref().is_some_and(|task| {
+            !matches!(
+                task.workspace.location,
+                WorkspaceLocationIdentity::Local { .. }
+            )
+        }) {
+            return Err("Remote task terminals cannot be restored locally".into());
+        }
+        let mut cwd = PathBuf::from(&tab.dir);
+        if !cwd.is_dir() {
+            cwd = tab
+                .repo_dir
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| task.as_ref()?.worktree.path.clone())
+                .unwrap_or(cwd);
+        }
+        let identity = tab
+            .session_identity()
+            .open(|| crate::sessions::fresh_target().session_uid)
+            .identity;
+        let task_session = tab.task_id.as_ref().map(|_| {
+            tab.task_session_id
+                .clone()
+                .unwrap_or_else(TaskRecord::fresh_id)
+        });
+        let target = session::Target {
+            session_uid: identity.session_uid,
+            task_id: tab.task_id.clone(),
+            task_session_id: task_session.clone(),
+            ..crate::sessions::fresh_target()
+        };
+        let session_id = task_session
+            .as_deref()
+            .unwrap_or(&target.session_uid)
+            .to_string();
+        let settings = crate::workspace_config::load_iced_settings_from(&self.iced_config);
+        let exists = |id: &str| {
+            dirs::home_dir()
+                .is_some_and(|home| claude_transcript_exists(&home.join(".claude/projects"), id))
+        };
+        if let Some(task) = &mut task {
+            gitterm_core::task_host::prune_phantom_claude_conversations(task, exists);
+        }
+        let restored = if restore {
+            gitterm_core::task_host::restored_startup(
+                tab.startup_command.clone(),
+                tab.chat_session_id.clone(),
+                task.as_ref(),
+                tab.task_session_id.as_deref(),
+                |name| {
+                    settings
+                        .agent_presets
+                        .iter()
+                        .find(|p| p.name == name)
+                        .and_then(|p| preset_backend(&p.name, &p.command))
+                },
+                exists,
+                |command| match (&tab.task_id, &task_session, &self.servers) {
+                    (Some(task), Some(session), Some(servers)) => {
+                        gitterm_core::task_mcp::configure_codex_notify(
+                            &command,
+                            &servers.task_mcp.notify_endpoint(),
+                            task,
+                            session,
+                        )
+                    }
+                    _ => command,
+                },
+            )
+        } else {
+            gitterm_core::task_host::RestoredStartup {
+                startup_command: tab.startup_command.clone(),
+                chat_session_id: tab.chat_session_id.clone(),
+            }
+        };
+        let command = restored.startup_command;
+        let mut targets = vec![cwd.clone()];
+        if let Some(worktree) = task.as_ref().and_then(|t| t.worktree.path.clone()) {
+            targets.push(worktree);
+        }
+        let authorized = self.authorize_process("Launch session", &targets)?;
+        let process = (task.is_some() && command.is_some())
+            .then(gitterm_core::worker_process::WorkerProcess::new)
+            .transpose()?;
+        let mut env = self.live_terminal_env(workspace, &cwd, &target.session_uid)?;
+        if let Some(process) = &process {
+            env.push((
+                gitterm_core::worker_process::PID_FILE_ENV.into(),
+                process.pid_file().into(),
+            ));
+        }
+        let runtime = command
+            .as_deref()
+            .map(|command| match &task {
+                Some(task) => self.runtime_command(command, &cwd, &env, task, cx),
+                None => Ok(self.ordinary_runtime_command(command, &cwd, workspace, true, cx)),
+            })
+            .transpose()?;
+        self.host
+            .services()
+            .recheck(&authorized)
+            .and_then(|()| {
+                self.host
+                    .services()
+                    .recheck_git_work_trees(&authorized, &env)
+            })
+            .map_err(|e| e.notice().to_string())?;
+        let needs_input = Arc::new(AtomicBool::new(false));
+        let terminal =
+            self.spawn_live_terminal(&cwd, runtime.as_deref(), env, &session_id, &needs_input, cx)?;
+        self.host.issue_caller(&target.session_uid);
+        if let Some(task) = &task {
+            self.host.issue_caller(&session_id);
+            self.launched.insert(
+                session_id.clone(),
+                Launched {
+                    task_id: task.task_id.clone(),
+                    provider: command.as_deref().and_then(launch_provider),
+                    view: terminal.view.downgrade(),
+                    target: target.clone(),
+                    live: None,
+                    needs_input,
+                    closing: false,
+                    shutdown_refused: tab.worker_shutdown_refused,
+                    title: None,
+                    process,
+                },
+            );
+        }
+        self.terminals.insert(session_id.clone(), terminal);
+        Ok(TerminalLaunched {
+            session_id,
+            title: task
+                .as_ref()
+                .map_or_else(|| "Terminal".into(), |t| t.title.clone()),
+            cwd,
+            startup_command: command,
+            chat_session_id: restored.chat_session_id,
+            target,
+        })
+    }
+
     fn live_terminal_env(
         &self,
         workspace: &str,
         cwd: &Path,
         session: &str,
+    ) -> Result<Vec<(OsString, OsString)>, String> {
+        self.live_terminal_env_for(workspace, cwd, session, Some(session))
+    }
+
+    fn live_terminal_env_for(
+        &self,
+        workspace: &str,
+        cwd: &Path,
+        browser_caller: &str,
+        task_caller: Option<&str>,
     ) -> Result<Vec<(OsString, OsString)>, String> {
         let file = self.process_root().join("workspaces.json");
         let mut env: Vec<(OsString, OsString)> = match std::fs::read(&file) {
@@ -1148,14 +1427,14 @@ impl TaskHostOwner {
         env.extend(
             servers
                 .browser
-                .terminal_environment(Some(session))
+                .terminal_environment(Some(browser_caller))
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into())),
         );
         env.extend(
             servers
                 .task_mcp
-                .terminal_environment(Some(session))
+                .terminal_environment(task_caller)
                 .map(|(k, v)| (k.into(), v.into())),
         );
         Ok(env)
@@ -1716,6 +1995,16 @@ impl TaskHostOwner {
     ) -> Option<gitterm_core::delegation_state::Caller> {
         if !self.is_live() {
             return None;
+        }
+        self.host
+            .require_issued_caller(Some(uid), "Terminal")
+            .ok()?;
+        if let Some(caller) = self
+            .terminal_callers
+            .iter()
+            .find(|c| c.target.session_uid == uid)
+        {
+            return Some(caller.clone());
         }
         let (session, launched) = self.launched.iter().find(|(_, launched)| {
             launched.target.session_uid == uid && launched.view.upgrade().is_some()
