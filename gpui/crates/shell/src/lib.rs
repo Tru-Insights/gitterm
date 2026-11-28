@@ -1086,18 +1086,27 @@ impl Shell {
     /// use this: `select_session` indexes the strip, which lists only the
     /// selected task's sessions.
     fn select_session_id(&mut self, id: SessionId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.activate_session_id(id, window, cx) {
+            self.persist_live_selection(workspace, Some(id), cx);
+        }
+    }
+    /// Runtime focus also serves failed-close recovery, which must not enqueue
+    /// another write and replace the close failure with a selection-save error.
+    fn activate_session_id(
+        &mut self,
+        id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<WorkspaceId> {
         if self.owner.read(cx).workspace_save_pending {
-            return;
+            return None;
         }
         let active = self.active_workspace(cx);
-        let Some(state) = self
+        let state = self
             .workspaces
             .iter_mut()
             .find(|w| Some(w.workspace.id) == active)
-            .filter(|w| w.sessions.iter().any(|s| s.id == id))
-        else {
-            return;
-        };
+            .filter(|w| w.sessions.iter().any(|s| s.id == id))?;
         let workspace = state.workspace.id;
         self.activate_session_context(workspace, id, cx);
         self.workspace_mut_for_context(workspace).active_session = Some(id);
@@ -1112,7 +1121,7 @@ impl Shell {
             self.show_workspace_pane(workspace, &pane, window, cx);
         }
         self.load_active_iced_history(window, cx);
-        self.persist_live_selection(workspace, Some(id), cx);
+        Some(workspace)
     }
     fn new_claude_chat(
         &mut self,
@@ -5195,6 +5204,11 @@ impl Focusable for Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_task_panel(window, cx);
+        // Plans replaces the dock in the rendered tree. A retained terminal
+        // cannot keep keyboard focus there: its detached path misses Escape.
+        if self.plans_open && self.focused_terminal(window, cx).is_some() {
+            self.focus.focus(window, cx);
+        }
         gitterm_terminal::InputGate::set(self.pty_blocked(cx), cx);
         if self.active_workspace(cx).is_some() {
             let state = self.active(cx);

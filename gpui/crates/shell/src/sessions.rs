@@ -122,7 +122,7 @@ impl crate::Shell {
             // The prompt shows the pane it asks about; the strip's active
             // session follows, so a Stop and close lands from it.
             let workspace = state.workspace.id;
-            self.show_session(workspace, id, window, cx);
+            self.show_session(workspace, id, true, window, cx);
             let panel = self.ensure_task_panel(window, cx);
             panel.update(cx, |panel, cx| {
                 panel.open_stop_and_close(requested.clone(), cx)
@@ -136,7 +136,7 @@ impl crate::Shell {
         ) {
             // Dock removal precedes the close decision; keep a protected last tab visible.
             let workspace = state.workspace.id;
-            self.show_session(workspace, id, window, cx);
+            self.show_session(workspace, id, true, window, cx);
             return;
         }
         if !persisted && live {
@@ -167,7 +167,7 @@ impl crate::Shell {
                         owner.error = Some(format!("Close terminal: {error}"));
                         cx.notify();
                     });
-                    self.show_session(workspace, id, window, cx);
+                    self.show_session(workspace, id, false, window, cx);
                     return;
                 }
                 Ok(Some(save)) => {
@@ -193,7 +193,7 @@ impl crate::Shell {
                                         owner.error = Some(format!("Close terminal: {error}"));
                                         cx.notify();
                                     });
-                                    shell.show_session(workspace, id, window, cx);
+                                    shell.show_session(workspace, id, false, window, cx);
                                 }
                             }
                         });
@@ -244,7 +244,7 @@ impl crate::Shell {
             Some(task) => self.land_after_task_close(workspace, task, window, cx),
             None if was_active => {
                 if let Some(next) = self.workspace(workspace).active_session {
-                    self.show_session(workspace, next, window, cx);
+                    self.show_session(workspace, next, true, window, cx);
                 }
             }
             None => {}
@@ -305,7 +305,7 @@ impl crate::Shell {
             .or(general)
             .or_else(|| state.sessions.first().map(|session| session.id));
         if let Some(next) = next {
-            self.show_session(workspace, next, window, cx);
+            self.show_session(workspace, next, true, window, cx);
         }
     }
 
@@ -344,7 +344,7 @@ impl crate::Shell {
                 .iter()
                 .any(|session| session.id == active)
         {
-            self.show_session(workspace_id, active, window, cx);
+            self.show_session(workspace_id, active, true, window, cx);
         }
         if preserve_selection {
             self.selected_task = selection;
@@ -359,11 +359,16 @@ impl crate::Shell {
         &mut self,
         workspace: crate::data::WorkspaceId,
         id: crate::data::SessionId,
+        persist_selection: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
         if self.active_workspace(cx) == Some(workspace) {
-            self.select_session_id(id, window, cx);
+            if persist_selection {
+                self.select_session_id(id, window, cx);
+            } else {
+                self.activate_session_id(id, window, cx);
+            }
         } else {
             self.workspace_mut(workspace).active_session = Some(id);
             self.show_workspace_pane(workspace, &crate::session_pane_id(id), window, cx);

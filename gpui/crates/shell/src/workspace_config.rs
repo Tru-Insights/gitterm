@@ -721,13 +721,19 @@ mod iced_projection_tests {
             crate::workspace_status::Intent::Activate(crate::data::WorkspaceId(3)),
             std::time::Instant::now(),
         );
-        assert!(
-            model
-                .dispatch(
-                    crate::workspace_status::Intent::Opened,
-                    std::time::Instant::now()
-                )
-                .is_empty()
+        // Remote Files/Git now uses the same status reducer; the owner routes
+        // this request to the remote source instead of running local Git.
+        assert_eq!(
+            model.dispatch(
+                crate::workspace_status::Intent::Opened,
+                std::time::Instant::now()
+            ),
+            [crate::workspace_status::Command::Status {
+                owner: 3,
+                command: gitterm_core::status::StatusCommand::CollectStatus {
+                    root: "opaque:remote".into(),
+                },
+            }]
         );
         assert!(model.workspaces[2].remote);
     }
