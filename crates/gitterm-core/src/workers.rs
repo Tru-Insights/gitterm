@@ -2347,3 +2347,98 @@ pub fn checkout_root(path: &Path) -> Option<PathBuf> {
         .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
         .map(Path::to_path_buf)
 }
+
+/// Preassign Claude's conversation before launch; preserve explicit presets.
+pub fn with_preassigned_session_id(command: &str) -> (String, Option<String>) {
+    if provider_for_command(command) == WorkerProvider::Claude {
+        match claude_preset_session_id(command) {
+            Ok(Some(id)) => return (command.to_string(), Some(id)),
+            Err(()) => return (command.to_string(), None),
+            Ok(None) => {}
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        (format!("{command} --session-id {id}"), Some(id))
+    } else {
+        (command.to_string(), None)
+    }
+}
+
+/// Read an explicit Claude conversation identity from a preset command.
+/// `Err` means the preset selects a session without a safely extractable id.
+#[allow(clippy::result_unit_err)] // Existing preset parser distinguishes unsafe identity from no identity.
+pub fn claude_preset_session_id(command: &str) -> Result<Option<String>, ()> {
+    let words = shell_words::split(command).map_err(|_| ())?;
+    let mut session_id: Option<String> = None;
+    let mut saw_identity_flag = false;
+    for (index, word) in words.iter().enumerate().skip(1) {
+        if word == "--continue" || word == "-c" {
+            return Err(());
+        }
+        let value = if let Some(value) = word
+            .strip_prefix("--resume=")
+            .or_else(|| word.strip_prefix("--session-id="))
+        {
+            saw_identity_flag = true;
+            Some(value)
+        } else if word == "--resume" || word == "-r" || word == "--session-id" {
+            saw_identity_flag = true;
+            Some(
+                words
+                    .get(index + 1)
+                    // A following flag (`--resume -d`) is not an id.
+                    .filter(|value| !value.starts_with('-'))
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            )
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            if value.is_empty()
+                || session_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != value)
+            {
+                return Err(());
+            }
+            session_id = Some(value.to_string());
+        }
+    }
+    if saw_identity_flag {
+        session_id.map(Some).ok_or(())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Production task trust, evaluated on each launch before guidelines/MCP wrapping.
+#[cfg(all(feature = "runtime", any(test, feature = "codex-trust")))]
+pub fn task_trust_command(
+    command: &str,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    roots: &[std::path::PathBuf],
+    extra_env: &[(String, String)],
+) -> Result<String, String> {
+    let command = command.trim();
+    match provider_for_command(command) {
+        WorkerProvider::Claude => {
+            validate_claude_trust_launch(command, home, extra_env, |key| std::env::var(key).ok())?;
+            if let Some(main) = claude_task_trust(cwd, roots, &home.join(".claude.json"))? {
+                eprintln!(
+                    "[tasks] accepted Claude workspace trust for {} in ~/.claude.json",
+                    main.display()
+                );
+            }
+            Ok(command.to_string())
+        }
+        WorkerProvider::Codex => {
+            validate_codex_trust_home(home, extra_env, |key| std::env::var(key).ok())?;
+            match codex_task_trust(command, cwd, roots, &home.join(".codex/config.toml"))? {
+                Some(value) => with_codex_trust(command, &value),
+                None => Ok(command.to_string()),
+            }
+        }
+        _ => Ok(command.to_string()),
+    }
+}

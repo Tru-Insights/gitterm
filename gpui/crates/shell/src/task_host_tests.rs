@@ -3484,46 +3484,50 @@ mod live_writes {
         let (fixture, git) = fixture();
         let (owner, sender) = start(&fixture, cx);
         let created = create(cx, &sender, &git.repo);
-        let id = created["task_id"].as_str().unwrap();
+        assert!(created["task_id"].is_string());
         let before = std::fs::read(fixture.source()).unwrap();
-        for (operation, label) in [
-            (
-                TaskControlOperation::LaunchSession(req(json!({"task_id": id}))),
-                "task_launch_session",
+        assert_eq!(
+            dispatch(
+                cx,
+                &sender,
+                TaskControlOperation::MergePlanSet(req(json!({"entries": []})))
             ),
-            (
-                TaskControlOperation::DelegateTask(req(
-                    json!({"title": "Worker", "objective": "Do work", "repo": git.repo}),
-                )),
-                "delegate_task",
-            ),
-            (
-                TaskControlOperation::RequestReview(req(
-                    json!({"target": "uncommitted", "checkout": git.repo}),
-                )),
-                "review_request",
-            ),
-            (
-                TaskControlOperation::RequestConsult(req(
-                    json!({"brief": "Consult", "checkout": git.repo}),
-                )),
-                "consult_request",
-            ),
-            (
-                TaskControlOperation::MergePlanSet(req(json!({"entries": []}))),
-                "merge_plan_set",
-            ),
-        ] {
-            assert_eq!(dispatch(cx, &sender, operation), Err(preview_notice(label)));
-        }
+            Err(preview_notice("merge_plan_set"))
+        );
         owner.read_with(cx, |owner, _| {
             for effect in [
                 RunnerEffect::RestoreSession,
                 RunnerEffect::AutomaticDelivery,
-                RunnerEffect::QueuePromotion,
                 RunnerEffect::NotifyIngress,
             ] {
                 assert!(owner.host().services().runner(effect, None).is_err());
+            }
+            assert!(
+                owner
+                    .host()
+                    .services()
+                    .runner(RunnerEffect::QueuePromotion, None)
+                    .is_ok()
+            );
+            for label in [
+                "task_launch_session",
+                "delegate_task",
+                "review_request",
+                "consult_request",
+            ] {
+                assert!(
+                    owner
+                        .host()
+                        .services()
+                        .authorize(
+                            gitterm_core::preview::service::Class {
+                                label,
+                                access: gitterm_core::preview::service::Access::Process
+                            },
+                            None
+                        )
+                        .is_ok()
+                );
             }
             assert!(owner.host().launch_queue().is_empty());
             assert!(!owns_in_flight_work(owner.host()));
@@ -3531,4 +3535,5 @@ mod live_writes {
         assert_eq!(std::fs::read(fixture.source()).unwrap(), before);
         owner.update(cx, |owner, _| owner.shutdown());
     }
+    include!("task_host_live_worker_tests.rs");
 }
