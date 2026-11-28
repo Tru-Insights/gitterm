@@ -77,6 +77,7 @@ fn installed_executable(exe: &Path) -> bool {
         })
 }
 pub fn launch_mode(args: &mut Vec<std::ffi::OsString>) -> Result<crate::launch::LaunchMode> {
+    gitterm_core::worker_process::handle_recorder(args);
     // Cargo/debug and unbundled launches always default to Preview.
     let installed = installed_executable(&std::env::current_exe()?);
     let activated = if installed && !args.iter().any(|a| a == "--live" || a == "--preview") {

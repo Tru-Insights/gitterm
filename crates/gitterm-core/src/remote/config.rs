@@ -39,7 +39,7 @@ pub enum WorkspaceLocationConfig {
 }
 
 /// `remote-agents.json` in the desktop config dir: the user-maintained list
-/// of remote agents. Hosts read it; only Iced's connect form writes it.
+/// of remote agents. Both desktop hosts share the connect-form writer.
 pub const REMOTE_AGENTS_FILE: &str = "remote-agents.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

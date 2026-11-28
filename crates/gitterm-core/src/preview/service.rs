@@ -378,8 +378,8 @@ impl ServiceContext {
         })
     }
 
-    /// Live admits task creation and handoffs; later-slice writers and
-    /// process runners retain the Preview notices.
+    /// Live admits task writes and worker/review/consult execution. Delivery,
+    /// restore and other later-slice effects retain the Preview notices.
     pub fn for_gpui_live(mut self) -> Self {
         self.gpui_live = true;
         self
@@ -583,9 +583,34 @@ impl ServiceContext {
     }
 
     fn decide(&self, label: &str, access: Access, target: Option<&Path>) -> Result<(), Denied> {
-        let live_task_write =
-            access == Access::Write && matches!(label, "task_create" | "task_update_handoff");
-        if self.gpui_live && !matches!(access, Access::Read | Access::Existing) && !live_task_write
+        let live_task_write = access == Access::Write
+            && matches!(
+                label,
+                "task_create"
+                    | "task_update_handoff"
+                    | "delegate_task"
+                    | "Save delegation"
+                    | "Queue session"
+                    | "Worker notify"
+            );
+        let live_task_process = access == Access::Process
+            && matches!(
+                label,
+                "task_launch_session"
+                    | "review_request"
+                    | "consult_request"
+                    | "delegate_task"
+                    | "Launch session"
+                    | "Start worker"
+                    | "Start queued session"
+                    | "Start queued delegation"
+                    | "Start delegation"
+                    | "Stop delegation"
+            );
+        if self.gpui_live
+            && !matches!(access, Access::Read | Access::Existing)
+            && !live_task_write
+            && !live_task_process
         {
             return Err(denied(label));
         }
@@ -912,15 +937,30 @@ mod live_tests {
         assert!(!live.is_preview());
         assert!(live.browser_read_only());
         assert_eq!(production.task_mcp().token(), live.task_mcp().token());
-        for label in ["task_create", "task_update_handoff"] {
+        for label in [
+            "task_create",
+            "task_update_handoff",
+            "delegate_task",
+            "Save delegation",
+            "Queue session",
+        ] {
             assert!(live.authorize(class(label, Access::Write), None).is_ok());
         }
         for label in [
-            "merge_plan_set",
-            "notify",
-            "Save delegation",
-            "Save delivery",
+            "task_launch_session",
+            "delegate_task",
+            "review_request",
+            "consult_request",
+            "Launch session",
+            "Start worker",
+            "Start queued session",
+            "Start queued delegation",
+            "Start delegation",
+            "Stop delegation",
         ] {
+            assert!(live.authorize(class(label, Access::Process), None).is_ok());
+        }
+        for label in ["merge_plan_set", "notify", "Save delivery"] {
             assert_eq!(
                 live.authorize(class(label, Access::Write), None)
                     .unwrap_err()
