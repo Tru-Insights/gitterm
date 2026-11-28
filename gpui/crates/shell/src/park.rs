@@ -881,7 +881,12 @@ impl Shell {
                 .map(|w| w.park_key(cx))
                 .collect();
             self.change_live_workspace(
-                crate::workspace_config::LiveWorkspaceAction::Resume { key, reopen, open },
+                crate::workspace_config::LiveWorkspaceAction::Resume {
+                    key,
+                    reopen,
+                    for_chat: false,
+                    open,
+                },
                 crate::sessions::WorkspaceCompletion::Open { created: false },
                 window,
                 cx,

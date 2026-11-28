@@ -926,6 +926,7 @@ pub(crate) enum LiveWorkspaceAction {
     Resume {
         key: gitterm_core::park::Key,
         reopen: bool,
+        for_chat: bool,
         open: Vec<gitterm_core::park::Key>,
     },
     Done(gitterm_core::park::Key),
@@ -1065,7 +1066,12 @@ pub(crate) fn save_live_workspace(
                     }
                     workspace
                 }
-                LiveWorkspaceAction::Resume { key, reopen, open } => {
+                LiveWorkspaceAction::Resume { key, reopen, for_chat, open } => {
+                    if for_chat && let Some(workspace) = file.workspaces.iter_mut().find(|w| key.matches(w) && w.done_at.is_some()) {
+                        workspace.tabs.clear();
+                        workspace.bottom_terminals.clear();
+                        workspace.active_tab = None;
+                    }
                     if reopen {
                         park::reopen_done(&mut file.workspaces, &key);
                     }
@@ -1299,6 +1305,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key: key.clone(),
                     reopen: false,
+                    for_chat: false,
                     open: vec![],
                 },
                 None,
@@ -1342,6 +1349,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key,
                     reopen: true,
+                    for_chat: false,
                     open: vec![],
                 },
                 None,
@@ -1384,6 +1392,7 @@ mod live_workspace_tests {
                     LiveWorkspaceAction::Resume {
                         key,
                         reopen: false,
+                        for_chat: false,
                         open: vec![],
                     },
                     None,
@@ -1489,6 +1498,7 @@ mod live_workspace_tests {
                 LiveWorkspaceAction::Resume {
                     key,
                     reopen: false,
+                    for_chat: false,
                     open: vec![running],
                 },
                 None,
@@ -1522,6 +1532,7 @@ mod live_workspace_tests {
                         LiveWorkspaceAction::Resume {
                             key,
                             reopen: false,
+                            for_chat: false,
                             open: vec![]
                         },
                         None

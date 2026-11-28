@@ -521,7 +521,7 @@ fn write_facts_inner(path: &Path, facts: &ChatFacts) -> Result<(), String> {
 /// the live writer, the PR catch-up and the backfill (each on its own
 /// blocking thread) never drop each other's additions. One per path for the
 /// process; there is one per chat, so the map stays small.
-fn facts_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+pub fn facts_write_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
         std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
     > = std::sync::OnceLock::new();

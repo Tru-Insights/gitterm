@@ -157,3 +157,203 @@ fn work_sidebar_find_sidebar_live_index_older_chats_writes_and_refreshes(cx: &mu
     }
     host.update(vcx, |host, cx| host.quit(cx));
 }
+
+
+fn sidebar_review_catalog(fixture: &Fixture, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = fixture.iced.join("workspaces.json");
+    let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut file);
+    std::fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+}
+
+fn sidebar_review_start(fixture: &Fixture, cx: &mut TestAppContext) -> Entity<TaskHostOwner> {
+    let (config, _) = fixture.config();
+    let lock = Arc::new(HostLock::acquire(&fixture.iced).unwrap());
+    let desktop = crate::workspace_config::live_desktop_store(lock.clone()).unwrap();
+    let services = Arc::new(ServiceContext::production(&fixture.iced, std::process::id().to_string()).unwrap().for_gpui_live());
+    let host = cx.update(|cx| TaskHostOwner::start_live(config, lock, services, cx)).unwrap();
+    cx.update(|cx| cx.set_global(crate::workspace_config::LiveWorkspaces(desktop)));
+    host
+}
+
+#[gpui::test]
+fn work_sidebar_review_f2_done_owner_discards_old_sessions_on_chat_resume(cx: &mut TestAppContext) {
+    if child("work_sidebar_review_f2_done_owner_discards_old_sessions_on_chat_resume") { return; }
+    use gitterm_core::chats::{ChatBackend, ChatRef};
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    golive10_workspace(&fixture, &git.repo, json!([]), json!([]));
+    sidebar_review_catalog(&fixture, |file| {
+        file["workspaces"].as_array_mut().unwrap().push(json!({
+            "name":"Done owner", "abbrev":"DO", "dir":git.outside, "color":"green",
+            "chats":["placeholder-requested"], "active":false,
+            "done_at":"2026-01-01T00:00:00Z",
+            "parked":{"note":"Finished", "parked_at":"2026-01-01T00:00:00Z"},
+            "active_tab":0, "tabs":[{"dir":git.repo,"startup_command":"claude --resume placeholder-old", "chat_session_id":"placeholder-old"}],
+            "bottom_terminals":[{"dir":git.repo}], "env":{"KEEP":"yes"}
+        }));
+    });
+    let host = sidebar_review_start(&fixture, cx);
+    let (shell, vcx) = golive10_shell(&fixture, &host, cx);
+    shell.update_in(vcx, |shell, window, cx| {
+        sidebar_index(shell, vec![sidebar_entry("placeholder-requested", &git.repo, ChatBackend::Claude)]);
+        shell.go_to_chat_owner(&ChatRef::local("placeholder-requested"), window, cx);
+    });
+    wait_until(vcx, |cx| shell.read_with(cx, |s, cx| s.active(cx).workspace.name == "Done owner" && !s.owner.read(cx).workspace_save_pending));
+    shell.read_with(vcx, |s, cx| {
+        assert!(s.owner.read(cx).error.is_none(), "{:?}", s.owner.read(cx).error);
+        let saved = s.owner.read(cx).iced_workspace(s.active(cx).workspace.id).unwrap();
+        assert!(saved.done_at.is_none());
+        assert_eq!(saved.chats, ["placeholder-requested"]);
+        assert_eq!(saved.env["KEEP"], "yes");
+        assert!(saved.bottom_terminals.is_empty());
+        assert!(saved.tabs.iter().all(|tab| tab.startup_command.is_none() && tab.chat_session_id.as_deref() != Some("placeholder-old")));
+        assert!(crate::bottom_pane_ids(s.active(cx), cx).is_empty());
+        let session = s.active(cx).sessions.iter().find(|session| Some(session.id) == s.active(cx).active_session).unwrap();
+        assert_eq!(s.find_conversation(s.active(cx), session, cx), Some(ChatRef::local("placeholder-requested")));
+    });
+    // Repeat from a Done workspace still mounted in this process, including
+    // its stopped bottom-pane inventory rather than only the persisted DTOs.
+    shell.update_in(vcx, |shell, window, cx| {
+        let workspace = shell.active(cx).workspace.id;
+        let entry = sidebar_entry("placeholder-stale-native", &git.repo, ChatBackend::Claude);
+        shell.open_saved_live_chat(workspace, "placeholder-stale-native", Some(entry), window, cx).unwrap();
+        shell.new_terminal_at(gpui_component::dock::DockPlacement::Bottom, Some(git.repo.clone()), window, cx);
+        assert!(!crate::bottom_pane_ids(shell.active(cx), cx).is_empty());
+        let target = shell.active(cx).park_target(cx);
+        shell.park_intent(Some(&target), gitterm_core::park::Intent::Close(target.uid), window, cx);
+    });
+    wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+    shell.update_in(vcx, |shell, window, cx| {
+        shell.go_to_chat_owner(&ChatRef::local("placeholder-requested"), window, cx);
+    });
+    wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+    shell.read_with(vcx, |s, cx| {
+        assert_eq!(s.active(cx).workspace.name, "Done owner");
+        assert!(crate::bottom_pane_ids(s.active(cx), cx).is_empty());
+        assert!(s.active(cx).sessions.iter().all(|session| s.find_conversation(s.active(cx), session, cx) != Some(ChatRef::local("placeholder-stale-native"))));
+    });
+    host.update(vcx, |host, cx| host.quit(cx));
+    assert!(!fake.file("ready", 1).exists(), "Done work ran an old startup command");
+}
+
+#[gpui::test]
+fn find_sidebar_review_f3_parked_owner_focuses_requested_chat_after_save(cx: &mut TestAppContext) {
+    if child("find_sidebar_review_f3_parked_owner_focuses_requested_chat_after_save") { return; }
+    use gitterm_core::chats::{ChatBackend, ChatRef};
+    use crate::find_sidebar::ResumeMode;
+    cx.background_executor.allow_parking();
+    let _fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    golive10_workspace(&fixture, &git.repo, json!([]), json!([]));
+    sidebar_review_catalog(&fixture, |file| {
+        file["workspaces"][0]["chats"] = json!(["placeholder-wanted"]);
+        file["workspaces"].as_array_mut().unwrap().push(json!({"name":"Other", "abbrev":"OT", "dir":git.outside, "color":"green", "tabs":[]}));
+    });
+    let host = sidebar_review_start(&fixture, cx);
+    let (shell, vcx) = golive10_shell(&fixture, &host, cx);
+    for mode in [gitterm_core::park::Mode::Stop, gitterm_core::park::Mode::KeepRunning] {
+        shell.update_in(vcx, |shell, window, cx| {
+            let workspace = crate::WorkspaceId(1);
+            for id in ["placeholder-wanted", "placeholder-other"] {
+                let entry = sidebar_entry(id, &git.repo, ChatBackend::Claude);
+                sidebar_index(shell, vec![entry.clone()]);
+                shell.resume_indexed_chat(&ChatRef::local(id), Some(entry), ResumeMode::Chat, Some(workspace), window, cx).unwrap();
+            }
+            sidebar_index(shell, vec![sidebar_entry("placeholder-wanted", &git.repo, ChatBackend::Claude)]);
+            let target = shell.workspace(workspace).park_target(cx);
+            shell.park_workspace(&target, mode, window, cx);
+        });
+        wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+        shell.update_in(vcx, |shell, window, cx| {
+            assert_eq!(shell.active(cx).workspace.name, "Other");
+            if mode == gitterm_core::park::Mode::Stop {
+                shell.go_to_chat_owner(&ChatRef::local("placeholder-wanted"), window, cx);
+            } else {
+                shell.resume_indexed_chat(&ChatRef::local("placeholder-wanted"), None, ResumeMode::Chat, None, window, cx).unwrap();
+            }
+        });
+        wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+        shell.read_with(vcx, |s, cx| {
+            assert_eq!(s.active(cx).workspace.name, "Placeholder");
+            let active = s.active(cx);
+            let session = active.sessions.iter().find(|session| Some(session.id) == active.active_session).unwrap();
+            assert_eq!(s.find_conversation(active, session, cx), Some(ChatRef::local("placeholder-wanted")));
+            assert_eq!(active.sessions.iter().filter(|session| s.find_conversation(active, session, cx) == Some(ChatRef::local("placeholder-wanted"))).count(), 1);
+        });
+    }
+    host.update(vcx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn find_sidebar_review_f4_recreate_managed_worktree_uses_repo_workspace(cx: &mut TestAppContext) {
+    if child("find_sidebar_review_f4_recreate_managed_worktree_uses_repo_workspace") { return; }
+    use gitterm_core::chats::{ChatBackend, ChatRef};
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    let deleted = fixture._dir.path().join("deleted-task-worktree/nested");
+    let mut record = task("placeholder-task", TaskLifecycle::Ready);
+    record.workspace.location = gitterm_core::tasks::WorkspaceLocationIdentity::Local { directory: git.repo.clone() };
+    record.worktree.path = Some(deleted.parent().unwrap().into());
+    record.worktree.state = gitterm_core::tasks::TaskWorktreeState::Missing;
+    fixture.write_iced(vec![record], vec![]);
+    golive10_workspace(&fixture, &git.repo, json!([]), json!([]));
+    let host = sidebar_review_start(&fixture, cx);
+    let (shell, vcx) = golive10_shell(&fixture, &host, cx);
+    shell.update_in(vcx, |shell, window, cx| {
+        let entry = sidebar_entry("placeholder-rescue", &deleted, ChatBackend::Claude);
+        shell.resume_indexed_chat(&ChatRef::local("placeholder-rescue"), Some(entry), crate::find_sidebar::ResumeMode::RecreateDirectory, None, window, cx).unwrap();
+    });
+    wait_until(vcx, |_| fake.file("ready", 1).exists());
+    shell.read_with(vcx, |s, cx| {
+        assert_eq!(s.active(cx).workspace.name, "Placeholder");
+        let saved = s.owner.read(cx).iced_workspace(s.active(cx).workspace.id).unwrap();
+        assert_eq!(saved.dir, git.repo.to_str().unwrap());
+        assert_eq!(s.owner.read(cx).iced_catalog().unwrap().workspaces.len(), 1);
+    });
+    assert!(deleted.is_dir());
+    assert_eq!(fake.text("pwd", 1).trim(), deleted.canonicalize().unwrap().to_str().unwrap());
+    assert!(fake.text("args", 1).contains("placeholder-rescue"));
+    host.update(vcx, |host, cx| host.quit(cx));
+}
+
+#[gpui::test]
+fn work_sidebar_review_f5_missing_cwd_still_navigates_to_open_or_parked_owner(cx: &mut TestAppContext) {
+    if child("work_sidebar_review_f5_missing_cwd_still_navigates_to_open_or_parked_owner") { return; }
+    use gitterm_core::chats::{ChatBackend, ChatRef};
+    cx.background_executor.allow_parking();
+    let fake = LiveFake::new();
+    let (fixture, git) = fixture();
+    let missing = fixture._dir.path().join("missing-recorded-directory");
+    golive10_workspace(&fixture, &git.repo, json!([]), json!([]));
+    sidebar_review_catalog(&fixture, |file| {
+        file["workspaces"].as_array_mut().unwrap().push(json!({"name":"Owner", "abbrev":"OW", "dir":git.outside, "color":"green", "chats":["placeholder-missing"], "tabs":[]}));
+    });
+    let host = sidebar_review_start(&fixture, cx);
+    let (shell, vcx) = golive10_shell(&fixture, &host, cx);
+    for parked in [false, true] {
+        shell.update_in(vcx, |shell, window, cx| {
+            sidebar_index(shell, vec![sidebar_entry("placeholder-missing", &missing, ChatBackend::Claude)]);
+            shell.select_workspace_id(crate::WorkspaceId(1), window, cx);
+            shell.go_to_chat_owner(&ChatRef::local("placeholder-missing"), window, cx);
+        });
+        wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+        shell.read_with(vcx, |s, cx| {
+            assert_eq!(s.active(cx).workspace.name, "Owner", "parked={parked}");
+            assert!(s.owner.read(cx).error.as_deref().unwrap().contains("Recreate directory"));
+            assert!(s.active(cx).sessions.iter().all(|session| s.find_conversation(s.active(cx), session, cx) != Some(ChatRef::local("placeholder-missing"))));
+        });
+        assert!(!missing.exists());
+        if !parked {
+            shell.update_in(vcx, |shell, window, cx| {
+                let target = shell.active(cx).park_target(cx);
+                shell.park_workspace(&target, gitterm_core::park::Mode::Stop, window, cx);
+            });
+            wait_until(vcx, |cx| shell.read_with(cx, |s, cx| !s.owner.read(cx).workspace_save_pending));
+        }
+    }
+    host.update(vcx, |host, cx| host.quit(cx));
+    assert!(!fake.file("ready", 1).exists());
+}

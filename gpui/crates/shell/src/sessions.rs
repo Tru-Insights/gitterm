@@ -1651,7 +1651,7 @@ impl crate::Shell {
 
 pub(crate) struct IndexedResume {
     pub id: gitterm_core::chats::ChatRef,
-    pub entry: gitterm_core::chats::ChatIndexEntry,
+    pub entry: Option<gitterm_core::chats::ChatIndexEntry>,
     pub mode: crate::find_sidebar::ResumeMode,
     pub work_sidebar: bool,
 }
@@ -1794,7 +1794,7 @@ impl crate::Shell {
                                 if let Some(request) = resume {
                                     if let Err(error) = shell.resume_indexed_chat(
                                         &request.id,
-                                        Some(request.entry),
+                                        request.entry,
                                         request.mode,
                                         Some(id),
                                         window,
@@ -1850,7 +1850,23 @@ impl crate::Shell {
         use gpui::AppContext as _;
         let mut sessions = self.data.sessions(workspace, cx);
         let active = self.data.active_session(workspace, cx);
-        let bottom = crate::bottom_pane_ids(self.workspace(workspace), cx);
+        // A chat reopening Done work has discarded both saved inventories.
+        // Do not retain stopped bottom panes that the new DTO no longer owns.
+        let discard_done_bottom = self
+            .workspace(workspace)
+            .parked
+            .as_ref()
+            .is_some_and(|p| p.done)
+            && self
+                .owner
+                .read(cx)
+                .iced_workspace(workspace)
+                .is_some_and(|w| w.bottom_terminals.is_empty());
+        let bottom = if discard_done_bottom {
+            vec![]
+        } else {
+            crate::bottom_pane_ids(self.workspace(workspace), cx)
+        };
         let state = self
             .workspaces
             .iter_mut()
@@ -2371,9 +2387,23 @@ impl crate::Shell {
             })
         });
         if let Some((workspace, session)) = existing {
-            self.reopen_workspace(workspace, window, cx);
-            self.select_workspace_id(workspace, window, cx);
-            self.select_session_id(session, window, cx);
+            if !self.workspace(workspace).on_bar() {
+                let key = self.workspace(workspace).park_key(cx);
+                self.reopen_workspace_for_chat(
+                    key,
+                    IndexedResume {
+                        id: id.clone(),
+                        entry: indexed,
+                        mode,
+                        work_sidebar: into.is_some(),
+                    },
+                    window,
+                    cx,
+                )?;
+            } else {
+                self.select_workspace_id(workspace, window, cx);
+                self.select_session_id(session, window, cx);
+            }
             return Ok(());
         }
         anyhow::ensure!(
@@ -2418,13 +2448,19 @@ impl crate::Shell {
                 })
         };
         let all: Vec<_> = catalog.workspaces.iter().chain(&catalog.closed).collect();
+        let canonical = |path: &std::path::Path| {
+            gitterm_core::task_host::canonical_task_workspace_directory(
+                crate::task_panel::host(cx).and_then(|host| host.store().as_ref()),
+                path,
+            )
+        };
+        let cwd = canonical(&entry.cwd);
+        let root = entry
+            .repo_root
+            .as_deref()
+            .map(canonical)
+            .unwrap_or_else(|| cwd.clone());
         let folder = || {
-            let cwd = gitterm_core::chat::tool_input::resolve_for_match(&entry.cwd);
-            let root = entry
-                .repo_root
-                .as_deref()
-                .map(gitterm_core::chat::tool_input::resolve_for_match)
-                .unwrap_or_else(|| cwd.clone());
             let matches = |w: &&gitterm_core::workspace_config::WorkspaceConfig| {
                 local(w)
                     && w.chats.is_empty()
@@ -2483,6 +2519,7 @@ impl crate::Shell {
                         dir: saved.dir,
                     },
                     reopen: true,
+                    for_chat: true,
                     open: self
                         .workspaces
                         .iter()
@@ -2493,14 +2530,14 @@ impl crate::Shell {
             } else {
                 crate::workspace_config::LiveWorkspaceAction::ChatFolder {
                     name: entry.group_name(),
-                    dir: entry.repo_root.clone().unwrap_or_else(|| entry.cwd.clone()),
+                    dir: root,
                 }
             };
             self.change_live_workspace(
                 action,
                 WorkspaceCompletion::ResumeChat(Box::new(IndexedResume {
                     id: id.clone(),
-                    entry,
+                    entry: Some(entry),
                     mode,
                     work_sidebar: into.is_some(),
                 })),
@@ -2538,6 +2575,38 @@ impl crate::Shell {
         }
     }
 
+    fn reopen_workspace_for_chat(
+        &mut self,
+        key: gitterm_core::park::Key,
+        request: IndexedResume,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            cx.try_global::<crate::workspace_config::LiveWorkspaces>()
+                .is_some(),
+            "Live workspace persistence owner unavailable"
+        );
+        let open = self
+            .workspaces
+            .iter()
+            .filter(|w| w.on_bar() || w.parked.as_ref().is_some_and(|p| p.running))
+            .map(|w| w.park_key(cx))
+            .collect();
+        self.change_live_workspace(
+            crate::workspace_config::LiveWorkspaceAction::Resume {
+                key,
+                reopen: true,
+                for_chat: true,
+                open,
+            },
+            WorkspaceCompletion::ResumeChat(Box::new(request)),
+            window,
+            cx,
+        );
+        Ok(())
+    }
+
     /// Iced `WorkspaceGoToChatOwner`: membership includes a child's root.
     pub(crate) fn go_to_chat_owner(
         &mut self,
@@ -2567,21 +2636,48 @@ impl crate::Shell {
                 .read(cx)
                 .iced_catalog()
                 .ok_or_else(|| anyhow::anyhow!("Workspace catalog unavailable"))?;
-            anyhow::ensure!(
-                gitterm_core::work::summary::owning_workspace(
-                    catalog
-                        .workspaces
-                        .iter()
-                        .chain(&catalog.closed)
-                        .map(|w| w.chats.as_slice()),
-                    &id.id,
-                    entry.root_id.as_deref()
+            let owner = gitterm_core::work::summary::owning_workspace(
+                catalog
+                    .workspaces
+                    .iter()
+                    .chain(&catalog.closed)
+                    .map(|w| w.chats.as_slice()),
+                &id.id,
+                entry.root_id.as_deref(),
+            )
+            .ok_or_else(|| anyhow::anyhow!("No workspace owns chat {}", id.id))?;
+            let saved = catalog
+                .workspaces
+                .iter()
+                .chain(&catalog.closed)
+                .nth(owner)
+                .expect("owner index");
+            let workspace = crate::WorkspaceId(owner as u64 + 1);
+            if owner < catalog.workspaces.len()
+                && self
+                    .workspaces
+                    .iter()
+                    .any(|w| w.workspace.id == workspace && w.on_bar())
+            {
+                self.select_workspace_id(workspace, window, cx);
+                self.resume_indexed_chat(id, Some(entry), mode, Some(workspace), window, cx)
+            } else {
+                let key = gitterm_core::park::Key {
+                    name: saved.name.clone(),
+                    dir: saved.dir.clone(),
+                };
+                self.reopen_workspace_for_chat(
+                    key,
+                    IndexedResume {
+                        id: id.clone(),
+                        entry: Some(entry),
+                        mode,
+                        work_sidebar: false,
+                    },
+                    window,
+                    cx,
                 )
-                .is_some(),
-                "No workspace owns chat {}",
-                id.id
-            );
-            self.resume_indexed_chat(id, Some(entry), mode, None, window, cx)
+            }
         })();
         if let Err(error) = result {
             self.owner.update(cx, |owner, cx| {
