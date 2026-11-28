@@ -1044,8 +1044,16 @@ impl TaskHostOwner {
         cx.notify();
     }
 
-    /// Whether launched session `session_id` shows Iced's input-needed
-    /// attention on its pane.
+    /// Raw harness title, before the pane adds folder/status decorations.
+    pub(crate) fn notification_terminal_title(&self, session_id: &str) -> Option<&str> {
+        self.launched.get(session_id)?.title.as_deref()
+    }
+    pub(crate) fn notification_session_working(&self, session_id: &str) -> bool {
+        self.launched
+            .get(session_id)
+            .is_some_and(|session| session.live == Some(TaskSessionLiveState::Working))
+    }
+    /// Whether launched session `session_id` shows Iced's input-needed attention.
     pub(crate) fn needs_input(&self, session_id: &str) -> bool {
         self.launched
             .get(session_id)
@@ -2288,7 +2296,15 @@ fn spawn_terminal_launch(
                 let session = title_session.clone();
                 cx.defer(move |cx| {
                     _ = owner.update(cx, |owner, _| {
+                        let live = owner.is_live();
                         if let Some(launched) = owner.launched.get_mut(&session) {
+                            if live {
+                                // Iced's terminal-title adapter clears input attention
+                                // when the harness works again, even before a keystroke.
+                                launched
+                                    .needs_input
+                                    .store(title.starts_with('✳'), Ordering::Relaxed);
+                            }
                             launched.title = Some(title);
                         }
                     });

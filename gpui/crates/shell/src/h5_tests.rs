@@ -210,7 +210,10 @@ fn git_mount_actions_file_cover_return_and_unavailable_worktrees(cx: &mut TestAp
     for action in [
         pane::git_view::GitAction::OpenWorktree(root.path().join("MUST NOT CREATE")),
         pane::git_view::GitAction::AdoptWorktree(root.path().join("MUST NOT CREATE")),
-        pane::git_view::GitAction::RemoveWorktree(root.path().join("work")),
+        pane::git_view::GitAction::RemoveWorktree {
+            path: root.path().join("work"),
+            force: false,
+        },
     ] {
         git.update(cx, |_, cx| cx.emit(action));
         draw(cx);

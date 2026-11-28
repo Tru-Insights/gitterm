@@ -28,7 +28,10 @@ pub fn local_folder(path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) type IdentityAliases = std::collections::BTreeMap<String, String>;
+
 pub struct WorkspaceStore {
+    pub(crate) identity_aliases: IdentityAliases,
     pub(crate) iced: Option<IcedCatalog>,
     pub(crate) chats: Vec<crate::chat::SavedChat>,
     pub(crate) parked: Vec<crate::park::SavedPark>,
@@ -40,6 +43,7 @@ impl WorkspaceStore {
     #[cfg(test)]
     pub fn new(config: &Path) -> Self {
         Self {
+            identity_aliases: Default::default(),
             iced: None,
             chats: vec![],
             parked: vec![],
@@ -50,6 +54,7 @@ impl WorkspaceStore {
     }
     pub(crate) fn guarded(guard: std::sync::Arc<crate::preview::Writer>) -> Self {
         Self {
+            identity_aliases: Default::default(),
             iced: None,
             chats: vec![],
             parked: vec![],
@@ -63,6 +68,30 @@ impl WorkspaceStore {
             if let Some(guard) = &self.guard {
                 guard.preview().scoped(&self.path)?;
             }
+            let alias_path = self.path.with_file_name("workspace-identities.json");
+            if let Some(guard) = &self.guard {
+                guard.preview().scoped(&alias_path)?;
+            }
+            self.identity_aliases = match std::fs::read(&alias_path) {
+                Ok(bytes) => {
+                    let aliases: IdentityAliases =
+                        serde_json::from_slice(&bytes).with_context(|| {
+                            format!("read workspace identities {}", alias_path.display())
+                        })?;
+                    ensure!(
+                        aliases
+                            .iter()
+                            .all(|(key, original)| [key, original].iter().all(|value| value
+                                .strip_prefix("workspace-")
+                                .is_some_and(|suffix| suffix.len() == 16
+                                    && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())))),
+                        "invalid workspace identity alias"
+                    );
+                    aliases
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(error) => return Err(error.into()),
+            };
             let bytes = match std::fs::read(&self.path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -115,6 +144,58 @@ impl WorkspaceStore {
             parked_workspaces: self.parked.clone(),
         })?)
     }
+    pub(crate) fn layout_key(
+        &self,
+        workspace: &gitterm_core::workspace_config::WorkspaceConfig,
+    ) -> String {
+        let key = iced_layout_key(workspace);
+        self.identity_aliases.get(&key).cloned().unwrap_or(key)
+    }
+
+    /// This GPUI-only record must reach disk before the V6 name changes.
+    pub(crate) fn prepare_rename_alias(
+        &self,
+        workspace: &gitterm_core::workspace_config::WorkspaceConfig,
+        draft: &str,
+    ) -> Result<Option<(IdentityAliases, crate::preview::SaveResult)>> {
+        let mut renamed = workspace.clone();
+        if !gitterm_core::workspace_config::rename_workspace(&mut renamed.name, draft) {
+            return Ok(None);
+        }
+        let destination = iced_layout_key(&renamed);
+        ensure!(
+            !self.iced.as_ref().is_some_and(|catalog| catalog
+                .workspaces
+                .iter()
+                .chain(&catalog.closed)
+                .any(|other| iced_layout_key(other) == destination)),
+            "Another workspace already uses this name and folder"
+        );
+        let mut aliases = self.identity_aliases.clone();
+        aliases.insert(destination, self.layout_key(workspace));
+        ensure!(
+            !self.refused,
+            "refusing to overwrite invalid workspace identities"
+        );
+        let bytes = serde_json::to_vec_pretty(&aliases)?;
+        let path = self.path.with_file_name("workspace-identities.json");
+        let save = if let Some(guard) = &self.guard {
+            guard.submit(path, bytes)?
+        } else {
+            #[cfg(not(test))]
+            anyhow::bail!("workspace writer has no preview guard");
+            #[cfg(test)]
+            {
+                gitterm_core::atomic_file::write_atomically(&path, &bytes)
+                    .map_err(anyhow::Error::msg)?;
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let _ = send.send(Ok(()));
+                receive
+            }
+        };
+        Ok(Some((aliases, save)))
+    }
+
     pub(crate) fn save_async(&self, folders: &[PathBuf]) -> Result<crate::preview::SaveResult> {
         let bytes = self.bytes(folders)?;
         if let Some(guard) = &self.guard {
@@ -1578,6 +1659,206 @@ mod live_workspace_tests {
                     Some("owned")
                 );
             },
+        );
+    }
+}
+
+/// Called off the UI thread before newly discovered repo controls are published.
+pub(crate) fn persist_auto_repo_joins(
+    desktop: &gitterm_core::desktop_store::DesktopStore,
+    target: gitterm_core::workspace_config::WorkspaceTarget,
+    dirs: Vec<PathBuf>,
+) -> Result<gitterm_core::workspace_config::WorkspacesFile, String> {
+    desktop
+        .try_edit_workspaces(move |file| file.join_discovered_repos(&target, dirs))
+        .wait()
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use gitterm_core::{
+        desktop_store::{DesktopStore, LoadState},
+        workspace_config::{RepoEdit, WorkspaceTarget, WorkspacesFile},
+    };
+
+    fn fixture(root: &Path) -> WorkspacesFile {
+        let file = serde_json::from_value(serde_json::json!({"active_workspace":0,"workspaces":[{
+            "name":"Original", "abbrev":"O", "color":"blue", "dir":"/fixture/home", "repos":["/fixture/home"],
+            "tabs":[{"dir":"/fixture/home", "session_uid":"saved-shell"}, {"dir":"/fixture/home", "tab_kind":"agent", "chat_session_id":"saved-chat"}]
+        }]})).unwrap();
+        std::fs::write(
+            root.join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn review_regression_f2_rename_restart_keeps_layout_inventory_and_imported_ids() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let file = fixture(root.path());
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let mut metadata = WorkspaceStore::new(&root.path().join("gpui"));
+        metadata.iced = Some(IcedCatalog::from_document(root.path(), file.clone()));
+        let saved = &file.workspaces[0];
+        let key = metadata.layout_key(saved);
+        let sessions = crate::data::iced_sessions_with_key(saved, &key);
+        let path = crate::layout::workspace_layout_path(&root.path().join("gpui"), &key);
+        let mut layout = crate::layout::LayoutStore::new(path.clone());
+        layout.regions.sidebar_width = 421.;
+        layout.terminals = Some(vec![crate::layout::TerminalSession {
+            id: 777,
+            cwd: "/fixture/extra".into(),
+            startup_command: None,
+            task_id: None,
+            task_session_id: None,
+            session_uid: None,
+            chat_session_id: None,
+            bottom: false,
+        }]);
+        layout.save(&Default::default()).unwrap();
+        for name in ["Renamed", "Renamed again"] {
+            let (aliases, receipt) = metadata
+                .prepare_rename_alias(&metadata.iced.as_ref().unwrap().workspaces[0], name)
+                .unwrap()
+                .unwrap();
+            receipt.blocking_recv().unwrap().unwrap();
+            // A concurrent chat metadata save cannot overwrite the alias file.
+            metadata.save(&[]).unwrap();
+            metadata.identity_aliases = aliases;
+            let target = WorkspaceTarget::of(&metadata.iced.as_ref().unwrap().workspaces[0]);
+            let name = name.to_string();
+            let file = desktop
+                .try_edit_workspaces(move |file| file.edit_repo(&target, RepoEdit::Rename(name)))
+                .wait()
+                .unwrap();
+            metadata.iced = Some(IcedCatalog::from_document(root.path(), file));
+        }
+        let mut restarted = WorkspaceStore::new(&root.path().join("gpui"));
+        restarted.load().unwrap();
+        let catalog = IcedCatalog::read(root.path()).unwrap();
+        let renamed = &catalog.workspaces[0];
+        assert_eq!(restarted.layout_key(renamed), key);
+        assert_eq!(
+            crate::data::iced_sessions_with_key(renamed, &restarted.layout_key(renamed))
+                .iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            sessions.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        let mut restored = crate::layout::LayoutStore::new(crate::layout::workspace_layout_path(
+            &root.path().join("gpui"),
+            &restarted.layout_key(renamed),
+        ));
+        assert_eq!(restored.load_terminals().unwrap().unwrap()[0].id, 777);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["regions"]["sidebar_width"], 421.);
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("workspaces.json")).unwrap())
+                .unwrap();
+        assert!(wire["workspaces"][0].get("identity_aliases").is_none());
+    }
+
+    #[test]
+    fn review_regression_f7_failed_repo_save_retains_acknowledged_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let file = fixture(root.path());
+        let before = std::fs::read(root.path().join("workspaces.json")).unwrap();
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let no_op = target.clone();
+        desktop
+            .try_edit_workspaces(move |file| file.edit_repo(&no_op, RepoEdit::Rename("  ".into())))
+            .wait()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            before
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = desktop
+            .try_edit_workspaces(move |file| {
+                file.edit_repo(&target, RepoEdit::Rename("Unsaved".into()))
+            })
+            .wait();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        let snapshot = desktop.snapshot().wait().unwrap();
+        assert!(!snapshot.workspaces.dirty);
+        let LoadState::Valid(file) = snapshot.workspaces.loaded else {
+            panic!("expected valid acknowledged document")
+        };
+        assert_eq!(file.workspaces[0].name, "Original");
+        assert_eq!(
+            IcedCatalog::read(root.path()).unwrap().workspaces[0].name,
+            "Original"
+        );
+        desktop.drain().wait().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("workspaces.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn review_regression_f8_chat_repo_joins_are_saved_before_command_edit() {
+        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let mut file = fixture(root.path());
+        file.workspaces[0]
+            .repos_removed
+            .push("/fixture/removed".into());
+        std::fs::write(
+            root.path().join("workspaces.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let desktop = DesktopStore::open(root.path()).unwrap();
+        let target = WorkspaceTarget::of(&file.workspaces[0]);
+        let joined = persist_auto_repo_joins(
+            &desktop,
+            target.clone(),
+            vec!["/fixture/joined".into(), "/fixture/removed".into()],
+        )
+        .unwrap();
+        assert!(
+            joined.workspaces[0].repos_added.is_empty(),
+            "automatic joins are not manual pins"
+        );
+        assert!(
+            !joined.workspaces[0]
+                .repos
+                .contains(&"/fixture/removed".into())
+        );
+        assert!(
+            IcedCatalog::read(root.path()).unwrap().workspaces[0]
+                .repos
+                .contains(&"/fixture/joined".into())
+        );
+        desktop
+            .try_edit_workspaces(move |file| {
+                file.edit_repo(
+                    &target,
+                    RepoEdit::RunCommand {
+                        dir: "/fixture/joined".into(),
+                        draft: "placeholder run".into(),
+                    },
+                )
+            })
+            .wait()
+            .unwrap();
+        let disk = IcedCatalog::read(root.path()).unwrap();
+        assert_eq!(
+            disk.repos
+                .iter()
+                .find(|repo| repo.dir == "/fixture/joined")
+                .unwrap()
+                .run_command
+                .as_deref(),
+            Some("placeholder run")
         );
     }
 }

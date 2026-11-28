@@ -48,6 +48,7 @@ pub use live::launch_mode;
 pub use startup_failure::show_startup_failure;
 #[cfg(test)]
 mod modal_input_tests;
+mod notifications;
 mod owner;
 #[cfg(test)]
 mod page_tests;
@@ -262,6 +263,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         let client_height = f32::from(window.viewport_size().height);
+        owner.update(cx, |owner, _| {
+            if let Some(notifications) = &mut owner.notifications {
+                notifications.enabled = settings.notifications.needs_you;
+            }
+        });
         let sidebar_width = layout::clamp_sidebar(settings.sidebar_width);
         let bottom = cx.new(|_| {
             bottom_panel::BottomPanel::new(bottom_panel::Input::from_settings(
@@ -915,6 +921,7 @@ impl Shell {
     }
     /// Pushes [`Self::task_panes`] to the task host when they changed.
     fn sync_task_panes(&mut self, cx: &mut Context<Self>) {
+        self.sync_notification_panes(cx);
         let Some(host) = cx
             .try_global::<task_host::GpuiTaskHost>()
             .map(|host| host.0.clone())
@@ -1254,7 +1261,26 @@ impl Shell {
             });
             return;
         };
-        let mut id = layout::stable_path_hash(&cwd);
+        // A Live action may have just added this tab to the V6 document.
+        // Use its imported identity so the local layout cannot restore it twice.
+        let imported = cx
+            .try_global::<workspace_config::LiveWorkspaces>()
+            .and_then(|_| {
+                let owner = self.owner.read(cx);
+                let saved = owner.iced_workspace(state.workspace.id)?;
+                self.owner
+                    .read(cx)
+                    .iced_sessions(saved)
+                    .into_iter()
+                    .zip(&saved.tabs)
+                    .find(|(session, tab)| {
+                        !used.contains(&session.id.0)
+                            && gitterm_core::workspace_config::RepoKey::local(Path::new(&tab.dir))
+                                == gitterm_core::workspace_config::RepoKey::local(&cwd)
+                    })
+                    .map(|(session, _)| session.id.0)
+            });
+        let mut id = imported.unwrap_or_else(|| layout::stable_path_hash(&cwd));
         while used.contains(&id) {
             id = id.wrapping_add(1);
         }
@@ -2533,7 +2559,9 @@ impl Shell {
                 .filter(|s| self.session_task(s.id, cx) == self.selected_task)
                 .map(|s| {
                     let tab = saved.and_then(|saved| {
-                        data::iced_sessions(saved)
+                        self.owner
+                            .read(cx)
+                            .iced_sessions(saved)
                             .iter()
                             .position(|session| session.id == s.id)
                             .and_then(|index| saved.tabs.get(index))
@@ -3679,11 +3707,8 @@ impl Shell {
                 window,
                 cx,
             ),
-            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree(_) => {
-                self.owner.update(cx, |owner, cx| {
-                    owner.error = Some("Worktree actions are not available in preview".into());
-                    cx.notify();
-                });
+            A::OpenWorktree(_) | A::AdoptWorktree(_) | A::RemoveWorktree { .. } => {
+                self.live_worktree_action(workspace, action, window, cx);
             }
         }
         cx.notify();
@@ -4829,10 +4854,31 @@ impl Render for Shell {
         gitterm_terminal::InputGate::set(self.pty_blocked(cx), cx);
         if self.active_workspace(cx).is_some() {
             let state = self.active(cx);
+            let active_tab = state
+                .active_session
+                .and_then(|id| state.panes.get(&session_pane_id(id)))
+                .and_then(|pane| pane.read(cx).task_folder(cx))
+                .and_then(|folder| {
+                    folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .or_else(|| {
+                    state
+                        .workspace
+                        .repositories
+                        .first()
+                        .and_then(|repo| std::path::Path::new(repo).file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                });
             window.set_window_title(&window_title(
-                "GitTerm V6 Development",
+                if chat::policy::is_live(cx) {
+                    "GitTerm V6 Development"
+                } else {
+                    "GitTerm GPUI Preview"
+                },
                 &state.workspace.name,
-                state.store.regions.sidebar_mode,
+                active_tab.as_deref(),
             ));
         }
         for state in &self.workspaces {
@@ -4889,6 +4935,7 @@ impl Render for Shell {
                                 cx,
                             );
                         }
+                        shell.repo_outcome(outcome, window, cx);
                         // The repo row's ▶ is an explicit Run, as in Iced (RunRepoCommand).
                         if let work_sidebar::WorkSidebarOutcome::RunRepoCommand { repo } = outcome {
                             shell.run_repo(
@@ -5201,7 +5248,7 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
         let model = workspace_config::load_iced_workspaces(&mut store);
         (model, None)
     };
-    let title_workspace = model
+    let (title_workspace, title_tab) = model
         .active()
         .and_then(|active| {
             model
@@ -5209,18 +5256,21 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
                 .iter()
                 .find(|workspace| workspace.id == active)
         })
-        .map(|workspace| workspace.status.repo_name.clone())
-        .unwrap_or_else(|| {
-            if sample {
-                "Sample data".into()
-            } else {
-                "GitTerm".into()
-            }
-        });
+        .map(|workspace| {
+            (
+                workspace.name.clone(),
+                Some(workspace.status.repo_name.clone()),
+            )
+        })
+        .unwrap_or_else(|| (if sample { "Sample data" } else { "GitTerm" }.into(), None));
     let window_title = window_title(
-        "GitTerm V6 Development",
+        if mode == launch::LaunchMode::Live {
+            "GitTerm V6 Development"
+        } else {
+            "GitTerm GPUI Preview"
+        },
         &title_workspace,
-        SidebarMode::Work,
+        title_tab.as_deref(),
     );
     let task_host = (!sample).then(|| task_host::HostConfig::production(preview.roots.clone()));
     gpui_kit::application().run(move |cx| {
@@ -5337,16 +5387,11 @@ pub fn run(mode: launch::LaunchMode, folders: Vec<std::path::PathBuf>, sample: b
     Ok(())
 }
 
-fn window_title(app_name: &str, workspace: &str, sidebar_mode: SidebarMode) -> String {
-    let mode = match sidebar_mode {
-        SidebarMode::Work => "Work",
-        SidebarMode::Files => "Files",
-        SidebarMode::Find => "Find",
-        SidebarMode::Git => "Git",
-        SidebarMode::Agent => "Agent",
-        SidebarMode::Tasks => "Tasks",
-    };
-    format!("{app_name} - {workspace} - {mode}")
+fn window_title(app_name: &str, workspace: &str, active_tab: Option<&str>) -> String {
+    match active_tab {
+        Some(tab) => format!("{app_name} - {workspace} - {tab}"),
+        None => format!("{app_name} - {workspace}"),
+    }
 }
 
 impl Shell {
@@ -5360,7 +5405,12 @@ impl Shell {
             .iter()
             .find(|w| w.sessions.iter().any(|s| s.id == id))?;
         let saved = self.owner.read(cx).iced_workspace(state.workspace.id)?;
-        let index = data::iced_sessions(saved).iter().position(|s| s.id == id)?;
+        let index = self
+            .owner
+            .read(cx)
+            .iced_sessions(saved)
+            .iter()
+            .position(|s| s.id == id)?;
         saved.tabs.get(index)
     }
 
@@ -6386,18 +6436,18 @@ mod tests {
     }
 
     #[test]
-    fn window_title_matches_iced_workspace_and_sidebar_format() {
+    fn window_title_matches_iced_workspace_and_active_tab_format() {
         assert_eq!(
-            window_title(
-                "GitTerm V6 Development",
-                "GitTerm V6 Upgrade",
-                SidebarMode::Work
-            ),
+            window_title("GitTerm V6 Development", "GitTerm V6 Upgrade", Some("Work")),
             "GitTerm V6 Development - GitTerm V6 Upgrade - Work"
         );
         assert_eq!(
-            window_title("GitTerm V6 Development", "GitRepo", SidebarMode::Git),
-            "GitTerm V6 Development - GitRepo - Git"
+            window_title("GitTerm V6 Development", "GitRepo", Some("Keep going")),
+            "GitTerm V6 Development - GitRepo - Keep going"
+        );
+        assert_eq!(
+            window_title("GitTerm GPUI Preview", "Sample data", None),
+            "GitTerm GPUI Preview - Sample data"
         );
     }
 

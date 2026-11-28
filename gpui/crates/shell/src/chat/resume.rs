@@ -58,8 +58,26 @@ impl LiveTab {
         &self,
         file: &mut gitterm_core::workspace_config::WorkspacesFile,
     ) -> Result<()> {
+        let uid = self.tab.session_uid.as_deref();
+        let bound = uid.is_some_and(|uid| {
+            file.workspaces.iter().any(|workspace| {
+                workspace.dir == self.workspace_dir
+                    && workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.session_uid.as_deref() == Some(uid))
+            })
+        });
         let mut matches = file.workspaces.iter_mut().filter(|workspace| {
-            workspace.name == self.workspace_name && workspace.dir == self.workspace_dir
+            workspace.dir == self.workspace_dir
+                && if bound {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.session_uid.as_deref() == uid)
+                } else {
+                    workspace.name == self.workspace_name
+                }
         });
         let workspace = matches
             .next()
@@ -145,6 +163,20 @@ pub(crate) fn tab(cwd: &Path, uid: String, id: Option<String>) -> WorkspaceTabCo
 }
 
 impl ChatPane {
+    pub(crate) fn rebind_live_workspace(
+        &mut self,
+        previous: &WorkspaceConfig,
+        next: &WorkspaceConfig,
+    ) {
+        if let Some(live) = &mut self.live_tab
+            && live.workspace_name == previous.name
+            && live.workspace_dir == previous.dir
+        {
+            live.workspace_name = next.name.clone();
+            live.workspace_dir = next.dir.clone();
+        }
+    }
+
     pub(super) fn init_live_tab(&mut self, cx: &mut Context<Self>) {
         let Some(launch) = &self.deferred_live else {
             return;

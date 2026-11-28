@@ -368,6 +368,7 @@ struct DeferredLive {
 
 pub(crate) struct ChatPane {
     controller: Controller,
+    pub(crate) notification_attention: crate::notifications::ChatAttention,
     deferred_live: Option<DeferredLive>,
     remote: Option<remote::Binding>,
     guidelines_status: Option<std::sync::mpsc::Receiver<bool>>,
@@ -497,6 +498,7 @@ impl ChatPane {
             controller,
             deferred_live,
             remote: None,
+            notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
             live_tab: None,
@@ -671,7 +673,11 @@ impl ChatPane {
                 return Receipt::rejected(error);
             }
         }
+        let sending = matches!(&intent, ChatIntent::Send { .. });
         let (receipt, update) = self.controller.dispatch(intent);
+        if sending && receipt.state == gitterm_gpui_chat::adapter::ReceiptState::ChannelAccepted {
+            self.notification_attention.working();
+        }
         self.pending.push(update);
         self.changed(cx);
         receipt
@@ -803,6 +809,7 @@ impl ChatPane {
             controller,
             deferred_live: None,
             remote: None,
+            notification_attention: Default::default(),
             guidelines_status: None,
             live_claim: None,
             live_tab: None,
@@ -1084,9 +1091,24 @@ impl ChatPane {
         ) {
             crate::task_host::revoke_caller(&self.controller.target.session_uid, cx);
         }
+        let attention_event = match &event {
+            RuntimeEvent::Harness(
+                event @ (HarnessEvent::RuntimeRequest { .. }
+                | HarnessEvent::RuntimeRequestResolved { .. }
+                | HarnessEvent::TurnCompleted { .. }
+                | HarnessEvent::Error(_)),
+            ) => Some(event.clone()),
+            _ => None,
+        };
         let previous_settings = self.controller.adapter.state().acknowledged.clone();
         if let Some(update) = self.controller.apply_runtime_outcome(source, event) {
             self.pending.push(update);
+            if let Some(event) = &attention_event {
+                self.notification_attention.event(
+                    event,
+                    self.controller.adapter.state().has_pending_requests(),
+                );
+            }
             self.changed(cx);
         }
         if self.controller.live
@@ -1420,12 +1442,17 @@ impl Render for ChatPane {
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(self.view.clone()))
-            .children(self.resume_error.clone().map(|error| {
-                div().p_2().child(error).child(
-                    gpui_component::button::Button::new("start-fresh-chat")
-                        .label("Start a fresh chat here")
-                        .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
-                )
+            .children(self.resume_error.as_ref().map(|_| {
+                div()
+                    .id("resume-failure-recovery")
+                    .debug_selector(|| "resume-failure-recovery".into())
+                    .p_2()
+                    .child(
+                        gpui_component::button::Button::new("start-fresh-chat")
+                            .debug_selector(|| "start-fresh-chat".into())
+                            .label("Start a fresh chat here")
+                            .on_click(cx.listener(|pane, _, _, cx| pane.fresh_chat(cx))),
+                    )
             }))
     }
 }

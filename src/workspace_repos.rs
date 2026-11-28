@@ -158,21 +158,7 @@ pub fn derive_repo_list(
 }
 
 /// Records a manual add of `dir`: it is listed and no longer removed.
-pub fn add_manually(dir: &Path, added: &mut Vec<PathBuf>, removed: &mut Vec<PathBuf>) {
-    removed.retain(|gone| gone != dir);
-    if !added.iter().any(|known| known == dir) {
-        added.push(dir.to_path_buf());
-    }
-}
-
-/// Records a manual remove of `dir`: it stays out even when its chats
-/// touch it again.
-pub fn remove_manually(dir: &Path, added: &mut Vec<PathBuf>, removed: &mut Vec<PathBuf>) {
-    added.retain(|known| known != dir);
-    if !removed.iter().any(|gone| gone == dir) {
-        removed.push(dir.to_path_buf());
-    }
-}
+pub use gitterm_core::workspace_config::{add_manually, remove_manually};
 
 /// The repo a path is in among `repos`: the deepest one containing it.
 pub fn containing_repo<'a>(path: &Path, repos: &'a [PathBuf]) -> Option<&'a PathBuf> {
