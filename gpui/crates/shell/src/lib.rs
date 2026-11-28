@@ -4412,8 +4412,22 @@ impl Shell {
             I::ChartTokens(tokens) => self.usage_input.chart_tokens = tokens,
             I::ToggleHeadless => self.usage_input.show_headless = !self.usage_input.show_headless,
             I::PinChanged(pin) => {
-                if self.usage_input.plan_limits.pin != pin {
+                if !crate::chat::policy::is_live(cx) {
                     self.preview_unavailable("Routing pin", cx);
+                } else if let Some(host) = cx
+                    .try_global::<task_host::GpuiTaskHost>()
+                    .map(|host| host.0.clone())
+                {
+                    if let Some(file) =
+                        host.update(cx, |host, cx| host.routing_pin_changed(pin, cx))
+                    {
+                        self.usage_input.plan_limits = file;
+                    }
+                } else {
+                    self.owner.update(cx, |owner, cx| {
+                        owner.error = Some("Routing pin: Live routing host unavailable".into());
+                        cx.notify();
+                    });
                 }
             }
         }

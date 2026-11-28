@@ -1,7 +1,4 @@
-//! Host facade: credential lookup and phone pairing remain desktop-owned.
-use super::protocol::v6::git_term_agent_client::GitTermAgentClient;
-use super::protocol::v6::{CreatePhonePairingRequest, ListPhonesRequest, RevokePhoneRequest};
-use gitterm_core::remote::client::connect_channel;
+//! Host facade: desktop credential lookup for core's remote transport.
 #[cfg(test)]
 use gitterm_core::remote::client::{rpc_failed, PROTOCOL_VERSION};
 pub use gitterm_core::remote::client::{
@@ -13,6 +10,7 @@ pub use gitterm_core::remote::client::{
 };
 #[cfg(test)]
 use std::time::Duration;
+#[cfg(test)]
 use tonic::Request;
 
 /// The panel DTOs live in core so every frontend can draw them (TRU-151).
@@ -41,75 +39,6 @@ impl RemoteAgentBackend {
     /// Transfer the configured transport to a source adapter without resolving a token.
     pub fn into_core(self) -> gitterm_core::remote::client::RemoteAgentBackend {
         self.inner
-    }
-
-    /// A one-time pairing for a phone named `device_name` (capability
-    /// "phone").
-    pub async fn create_phone_pairing(
-        &self,
-        device_name: String,
-        scope: String,
-    ) -> Result<PhonePairing, RemoteAgentClientError> {
-        let mut request = Request::new(CreatePhonePairingRequest { device_name, scope });
-        self.authorize(&mut request)?;
-        let channel = connect_channel(&self.inner.config().endpoint).await?;
-        let response = GitTermAgentClient::new(channel)
-            .create_phone_pairing(request)
-            .await
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!(
-                    "create_phone_pairing failed: {}",
-                    err.message()
-                ))
-            })?
-            .into_inner();
-        // The long code itself is only ever used inside the URL.
-        Ok(PhonePairing {
-            pairing_url: response.pairing_url,
-            expires_unix_secs: response.expires_unix_secs,
-            scope: response.scope,
-            short_code: response.short_code,
-        })
-    }
-
-    /// The phones paired with the agent (capability "phone").
-    pub async fn list_phones(&self) -> Result<Vec<PairedPhoneInfo>, RemoteAgentClientError> {
-        let mut request = Request::new(ListPhonesRequest {});
-        self.authorize(&mut request)?;
-        let channel = connect_channel(&self.inner.config().endpoint).await?;
-        let response = GitTermAgentClient::new(channel)
-            .list_phones(request)
-            .await
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!("list_phones failed: {}", err.message()))
-            })?
-            .into_inner();
-        Ok(response
-            .phones
-            .into_iter()
-            .map(|phone| PairedPhoneInfo {
-                id: phone.id,
-                name: phone.name,
-                scope: phone.scope,
-                created_unix_secs: phone.created_unix_secs,
-                last_seen_unix_secs: phone.last_seen_unix_secs,
-            })
-            .collect())
-    }
-
-    /// Revoke a paired phone; `false` when the agent had no phone `id`.
-    pub async fn revoke_phone(&self, id: String) -> Result<bool, RemoteAgentClientError> {
-        let mut request = Request::new(RevokePhoneRequest { id });
-        self.authorize(&mut request)?;
-        let channel = connect_channel(&self.inner.config().endpoint).await?;
-        let response = GitTermAgentClient::new(channel)
-            .revoke_phone(request)
-            .await
-            .map_err(|err| {
-                RemoteAgentClientError::new(format!("revoke_phone failed: {}", err.message()))
-            })?
-            .into_inner();
-        Ok(response.revoked)
     }
 }
 

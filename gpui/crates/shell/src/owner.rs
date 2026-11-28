@@ -908,7 +908,13 @@ impl WorkspaceOwner {
         let index = catalog
             .workspaces
             .iter()
-            .position(|w| w.name == workspace.name && w.dir == workspace.dir)
+            .position(|w| {
+                w.name == workspace.name
+                    && w.dir == workspace.dir
+                    && w.location == workspace.location
+                    && w.remote_session.as_ref().map(|s| &s.session_name)
+                        == workspace.remote_session.as_ref().map(|s| &s.session_name)
+            })
             .unwrap_or(catalog.workspaces.len());
         let id = crate::WorkspaceId(index as u64 + 1);
         if claims_new_chats {

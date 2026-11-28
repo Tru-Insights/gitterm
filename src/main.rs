@@ -8484,8 +8484,10 @@ type PhonePanel = phone_panel::PhonePanel<iced::widget::image::Handle>;
 
 /// Pixels per QR module in the pairing panel, and the quiet zone around
 /// the code (modules) that scanners need.
-const PHONE_QR_SCALE: usize = 6;
-const PHONE_QR_QUIET: usize = 4;
+#[cfg(test)]
+const PHONE_QR_SCALE: usize = phone_panel::PHONE_QR_SCALE;
+#[cfg(test)]
+const PHONE_QR_QUIET: usize = phone_panel::PHONE_QR_QUIET;
 
 /// Run one phone panel call against the remote's agent; the answer comes
 /// back as the event the panel applies.
@@ -8520,29 +8522,9 @@ async fn run_phone_call(call: PhoneCall<RemoteAgentClientConfig>) -> Event {
 
 /// The pairing URL as a QR image (black on white, quiet zone included).
 fn phone_pairing_qr(url: &str) -> Result<iced::widget::image::Handle, String> {
-    let code = qrcode::QrCode::new(url.as_bytes())
-        .map_err(|err| format!("could not draw the pairing QR code: {err}"))?;
-    let modules = code.width();
-    let side = (modules + 2 * PHONE_QR_QUIET) * PHONE_QR_SCALE;
-    let mut pixels = vec![255u8; side * side * 4];
-    for (index, color) in code.to_colors().iter().enumerate() {
-        if *color != qrcode::Color::Dark {
-            continue;
-        }
-        let (mx, my) = (index % modules, index / modules);
-        for dy in 0..PHONE_QR_SCALE {
-            let y = (my + PHONE_QR_QUIET) * PHONE_QR_SCALE + dy;
-            for dx in 0..PHONE_QR_SCALE {
-                let x = (mx + PHONE_QR_QUIET) * PHONE_QR_SCALE + dx;
-                let at = (y * side + x) * 4;
-                pixels[at..at + 3].fill(0);
-            }
-        }
-    }
+    let qr = phone_panel::pairing_qr(url)?;
     Ok(iced::widget::image::Handle::from_rgba(
-        side as u32,
-        side as u32,
-        pixels,
+        qr.side, qr.side, qr.pixels,
     ))
 }
 
@@ -18008,16 +17990,10 @@ impl App {
             );
             return Task::none();
         };
-        let name = root
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|segment| !segment.is_empty())
-            .unwrap_or("remote")
-            .to_string();
+        let name = gitterm_core::remote::folders::workspace_name(&remote_name, &root);
         let used_colors: Vec<WorkspaceColor> = self.workspaces.iter().map(|ws| ws.color).collect();
         let mut workspace = Workspace::new(
-            format!("{remote_name}:{name}"),
+            name,
             PathBuf::from(&root),
             WorkspaceColor::next_available(&used_colors),
         );
@@ -18071,30 +18047,20 @@ impl App {
     /// "same machine" alone isn't enough to reuse the active workspace.
     fn open_remote_folder_tab(&mut self, remote_id: &str, dir: String) -> Task<Event> {
         let folder = PathBuf::from(&dir);
-        let holds = |ws: &Workspace| match &ws.location {
-            WorkspaceLocation::RemoteAgent {
-                remote_id: rid,
-                root,
-                ..
-            } => rid == remote_id && folder.starts_with(root),
-            _ => false,
-        };
-        let existing = self
-            .active_workspace()
-            .filter(|ws| holds(ws))
-            .map(|_| self.active_workspace_index())
-            .or_else(|| {
-                // Deepest root first, as for chats.
-                self.workspaces
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ws)| holds(ws))
-                    .max_by_key(|(_, ws)| {
-                        remote_agent_root(&ws.location)
-                            .map_or(0, |root| Path::new(root).components().count())
-                    })
-                    .map(|(idx, _)| idx)
-            });
+        let locations: Vec<_> = self
+            .workspaces
+            .iter()
+            .map(|ws| workspace_location_config_from_location(&ws.location))
+            .collect();
+        let existing = gitterm_core::remote::folders::folder_workspace(
+            locations
+                .iter()
+                .enumerate()
+                .map(|(i, location)| (i, location.as_ref())),
+            self.active_workspace_index(),
+            remote_id,
+            &folder,
+        );
         let mut tasks = Vec::new();
         match existing {
             Some(ws_idx) => {

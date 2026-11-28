@@ -1650,10 +1650,20 @@ impl TaskHostOwner {
         let Some(job) = state.begin_save(path) else {
             return;
         };
+        let receipt = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .ok_or_else(|| "Live plan limits store unavailable".to_string())
+            .and_then(|store| job.submit_to(&store.0));
         let (done, result) = tokio::sync::oneshot::channel();
         servers.limits_jobs.retain(|job| !job.is_finished());
         servers.limits_jobs.push(servers.runtime.spawn(async move {
-            _ = done.send(job.run().await);
+            let saved = match receipt {
+                Ok(receipt) => tokio::task::spawn_blocking(move || receipt.wait())
+                    .await
+                    .unwrap_or_else(|error| Err(format!("plan limits save task failed: {error}"))),
+                Err(error) => Err(error),
+            };
+            _ = done.send(gitterm_core::limits::PlanLimitsEvent::Saved(saved));
         }));
         cx.spawn(async move |owner: gpui::WeakEntity<Self>, cx| {
             let event = result.await.unwrap_or_else(|error| {
@@ -1662,6 +1672,16 @@ impl TaskHostOwner {
             _ = owner.update(cx, |owner, cx| owner.update_live_plan_limits(event, cx));
         })
         .detach();
+    }
+
+    pub(crate) fn routing_pin_changed(
+        &mut self,
+        pin: Option<gitterm_core::plan_limits::RoutingPin>,
+        cx: &mut Context<Self>,
+    ) -> Option<gitterm_core::plan_limits::PlanLimitsFile> {
+        self.update_live_plan_limits(gitterm_core::limits::PlanLimitsEvent::PinChanged(pin), cx);
+        cx.notify();
+        self.plan_limits.as_ref().map(|state| state.file().clone())
     }
 
     fn update_live_plan_limits(

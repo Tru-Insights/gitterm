@@ -1,7 +1,7 @@
 //! Shell hookup for remote machines: the in-app folder picker,
 //! the connection form, legacy remote-session Refresh, "Show {machine}
 //! chats", each configured agent's connection state and the phone panel's
-//! list. Live connect saves through core; Preview stays read-only.
+//! controls. Live saves through core; Preview stays read-only.
 
 use std::{
     cell::RefCell,
@@ -415,7 +415,7 @@ impl Shell {
                 );
             }
             FolderPickerOutcome::Confirm {
-                purpose: _,
+                purpose,
                 remote_id,
                 dir,
             } => {
@@ -423,10 +423,9 @@ impl Shell {
                     .last_dirs
                     .borrow_mut()
                     .insert(remote_id.clone(), dir.clone());
-                if remote_id.is_some() {
-                    // A remote folder would become an Iced workspace (a config write).
+                if let Some(remote_id) = remote_id {
                     self.close_folder_picker(window, cx);
-                    self.chrome_unavailable("Use this folder", cx);
+                    self.use_remote_folder(*purpose, remote_id, dir, window, cx);
                     return;
                 }
                 // Today's behaviour for a folder on this Mac.
@@ -435,6 +434,190 @@ impl Shell {
                 self.finish_folder_pick(Ok(Some(PathBuf::from(dir))), sheet, window, cx);
             }
         }
+    }
+
+    fn use_remote_folder(
+        &mut self,
+        purpose: FolderPickerPurpose,
+        remote_id: &str,
+        dir: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !crate::chat::policy::is_live(cx) {
+            self.chrome_unavailable("Use this folder", cx);
+            return;
+        }
+        // Iced only accepts remote folders for these two purposes.
+        if !matches!(
+            purpose,
+            FolderPickerPurpose::NewWorkspace | FolderPickerPurpose::OpenFolder
+        ) {
+            self.owner.update(cx, |owner, cx| {
+                owner.error = Some("Repos join from this Mac".into());
+                cx.notify();
+            });
+            return;
+        }
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        let remotes = self.reload_remotes(cx);
+        let remote = remotes.iter().find(|r| r.id == remote_id).cloned();
+        let store = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .map(|s| s.0.clone());
+        let (Some(remote), Some(store)) = (remote, store) else {
+            self.owner.update(cx, |owner, cx| {
+                owner.error =
+                    Some("Use this folder: remote or Live workspace store unavailable".into());
+                cx.notify();
+            });
+            return;
+        };
+        let active = self
+            .active_workspace(cx)
+            .and_then(|id| self.owner.read(cx).iced_workspace(id))
+            .map(gitterm_core::workspace_config::WorkspaceTarget::of);
+        let running: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter(|w| w.parked.as_ref().is_some_and(|p| p.running))
+            .filter_map(|w| self.owner.read(cx).iced_workspace(w.workspace.id))
+            .map(gitterm_core::workspace_config::WorkspaceTarget::of)
+            .collect();
+        let dir = dir.to_string();
+        self.owner
+            .update(cx, |owner, _| owner.workspace_save_pending = true);
+        let receipt = store.transact_workspaces(move |file| {
+            // Iced stores the configured definitions with every workspace save.
+            file.remote_agents = remotes;
+            let active = active
+                .and_then(|target| target.index(file).ok())
+                .unwrap_or(usize::MAX);
+            let workspace = file.open_remote_folder(
+                &remote.id,
+                &remote.name,
+                &dir,
+                purpose == FolderPickerPurpose::NewWorkspace,
+                active,
+                &running,
+            )?;
+            Ok(crate::workspace_config::LiveWorkspaceSaved {
+                workspace,
+                repos: file.repos.clone(),
+                closed: file
+                    .workspaces
+                    .iter()
+                    .filter(|w| !w.active)
+                    .cloned()
+                    .collect(),
+            })
+        });
+        cx.spawn_in(window, async move |shell, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { receipt.wait() })
+                .await;
+            _ = shell.update_in(cx, |shell, window, cx| {
+                shell
+                    .owner
+                    .update(cx, |owner, _| owner.workspace_save_pending = false);
+                let result = result.map_err(anyhow::Error::msg).and_then(|saved| {
+                    let id = shell
+                        .owner
+                        .update(cx, |owner, cx| owner.publish_workspace(saved, false, cx))
+                        .ok_or_else(|| anyhow::anyhow!("Remote workspace unavailable"))?;
+                    shell.mount_workspace(id, window, cx)?;
+                    shell.mount_remote_folder_browser(id, window, cx)?;
+                    if let Some(state) = shell.workspaces.iter_mut().find(|w| w.workspace.id == id)
+                    {
+                        state.parked = None;
+                    }
+                    shell.owner.update(cx, |owner, _| {
+                        owner.stopped_workspaces.remove(&id);
+                    });
+                    shell.select_workspace_id(id, window, cx);
+                    if let Some(session) = shell.workspace(id).active_session {
+                        shell.select_session_id(session, window, cx);
+                    }
+                    shell.sync_git_visibility(false, cx);
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    shell.owner.update(cx, |owner, cx| {
+                        owner.error = Some(format!("Use this folder: {error:#}"));
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn mount_remote_folder_browser(
+        &mut self,
+        workspace: crate::WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let id = self
+            .data
+            .active_session(workspace, cx)
+            .ok_or_else(|| anyhow::anyhow!("Remote browser identity unavailable"))?;
+        let session = self
+            .data
+            .sessions(workspace, cx)
+            .into_iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Remote browser tab unavailable"))?;
+        let pane_id = crate::session_pane_id(id);
+        if !self.workspace(workspace).panes.contains_key(&pane_id) {
+            let text = self
+                .data
+                .imported_session(workspace, id, cx)
+                .ok_or_else(|| anyhow::anyhow!("Remote browser metadata unavailable"))?;
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    pane_id.clone(),
+                    session.title.clone(),
+                    crate::pane::PaneKind::IcedSession(text),
+                    workspace,
+                    self.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            self._subscriptions
+                .push(crate::sessions::subscribe(&pane, window, cx));
+            self.registry
+                .borrow_mut()
+                .insert(pane_id.clone(), pane.downgrade());
+            let state = self
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace.id == workspace)
+                .expect("mounted workspace");
+            state.panes.insert(pane_id, pane.clone());
+            state.sessions.push(session);
+            state.dock.update(cx, |dock, cx| {
+                dock.add_panel_view(
+                    crate::panel_handle(pane),
+                    gpui_component::dock::DockPlacement::Center,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+        }
+        // A Run tab need not be persisted. Append only the new browser;
+        // reconciling the full saved inventory would drop those live panes.
+        self.workspaces
+            .iter_mut()
+            .find(|w| w.workspace.id == workspace)
+            .expect("mounted workspace")
+            .active_session = Some(id);
+        Ok(())
     }
 
     pub(crate) fn open_connect_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -673,7 +856,7 @@ impl Shell {
     }
 
     /// "Pair a phone…" (machine key): Iced's panel. It lists the paired
-    /// phones as it opens; pairing and revoking are refused by the gate.
+    /// phones as it opens; Live can pair and revoke through the same gate.
     pub(crate) fn open_phone_panel(
         &mut self,
         key: &str,
@@ -725,7 +908,7 @@ impl Shell {
     fn phone_panel_call(
         &mut self,
         rule: impl FnOnce(
-            &mut gitterm_core::remote::phone_panel::PhonePanel<()>,
+            &mut gitterm_core::remote::phone_panel::PhonePanel<crate::phone::PairingImage>,
             &dyn Fn(&str) -> Result<RemoteAgentConfig, String>,
         ) -> Option<PhoneCall<RemoteAgentConfig>>,
         cx: &mut Context<Self>,
@@ -760,27 +943,63 @@ impl Shell {
             });
             return;
         }
+        self.run_phone_panel_call(panel, call, cx);
+    }
+
+    fn run_phone_panel_call(
+        &mut self,
+        panel: Entity<PhonePanel>,
+        call: PhoneCall<RemoteAgentConfig>,
+        cx: &mut Context<Self>,
+    ) {
         let PhoneCall {
             remote_id,
             request,
             client: remote,
         } = call;
-        if request != PhoneRequest::List {
-            // Only a production context passes a write, and this shell
-            // builds a preview one; it has no client to grant or revoke with.
-            let notice = preview_notice(classify_phone_request(&request).label);
-            panel.update(cx, |panel, cx| panel.refused(notice, cx));
-            return;
+        enum Answer {
+            List(Result<Vec<gitterm_core::remote::phone_panel::PairedPhoneInfo>, String>),
+            Create(Result<gitterm_core::remote::phone_panel::PhonePairing, String>),
+            Revoke(Result<bool, String>),
         }
+        let list_generation = panel.update(cx, |panel, _| {
+            if request == PhoneRequest::List {
+                panel.list_generation += 1;
+            }
+            panel.list_generation
+        });
         let client = self.remote.client.clone();
         cx.spawn(async move |shell, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { client.list_phones(&remote) })
+                .spawn(async move {
+                    match request {
+                        PhoneRequest::List => Answer::List(client.list_phones(&remote)),
+                        PhoneRequest::Create { device_name, scope } => Answer::Create(
+                            client.create_phone_pairing(&remote, device_name, scope.into()),
+                        ),
+                        PhoneRequest::Revoke { id } => {
+                            Answer::Revoke(client.revoke_phone(&remote, id))
+                        }
+                    }
+                })
                 .await;
             _ = shell.update(cx, |shell, cx| {
-                if let Some(panel) = shell.phone_panel().cloned() {
-                    panel.update(cx, |panel, cx| panel.phones_loaded(&remote_id, result, cx));
+                // A closed/reopened panel on the same machine is a new owner.
+                if shell.phone_panel() != Some(&panel) {
+                    return;
+                }
+                match result {
+                    Answer::List(result) => panel.update(cx, |panel, cx| {
+                        panel.phones_loaded_at(list_generation, &remote_id, result, cx);
+                    }),
+                    Answer::Create(result) => panel.update(cx, |panel, cx| {
+                        panel.pairing_created(&remote_id, result, cx)
+                    }),
+                    Answer::Revoke(result) => shell.phone_panel_call(
+                        |panel, resolve| panel.revoked(&remote_id, result, resolve),
+                        cx,
+                    ),
                 }
             });
         })
@@ -798,10 +1017,12 @@ impl Shell {
         let Some(preview) = self.owner.read(cx).preview() else {
             return Err(refused());
         };
-        let services = ServiceContext::preview(preview).map_err(|error| {
-            eprintln!("[phone] preview services: {error}");
-            refused()
-        })?;
+        let services = match crate::chat::policy::current(preview, cx) {
+            crate::chat::policy::ChatLaunchPolicy::Live { services } => services,
+            crate::chat::policy::ChatLaunchPolicy::Preview(preview) => {
+                ServiceContext::preview(preview).map_err(|_| refused())?
+            }
+        };
         services
             .phone(call)
             .map_err(|denied| denied.notice().to_string())
@@ -1747,5 +1968,448 @@ mod connect_tests {
                 Some(Connection::Connected { .. })
             ));
         });
+    }
+}
+
+#[cfg(test)]
+mod parity_live_controls_tests {
+    use super::*;
+    use crate::remote_shell_tests::{FakeRemote, Fixture, click, draw, fixture, snapshot};
+    use gitterm_core::remote::{
+        client::RemoteAgentHandshake,
+        phone_panel::{PairedPhoneInfo, PhonePairing},
+        source::SourceDirListing,
+        ssh_sessions::RemoteSessionsSnapshot,
+    };
+    use gpui::{TestAppContext, VisualTestContext};
+    use std::sync::Mutex;
+
+    struct Phones {
+        reads: Arc<FakeRemote>,
+        calls: Mutex<Vec<&'static str>>,
+    }
+    impl RemoteClient for Phones {
+        fn handshake(&self, r: &RemoteAgentConfig) -> Result<RemoteAgentHandshake, String> {
+            self.reads.handshake(r)
+        }
+        fn list_dir(&self, r: &RemoteAgentConfig, dir: String) -> SourceDirListing {
+            self.reads.list_dir(r, dir)
+        }
+        fn list_chats(
+            &self,
+            r: &RemoteAgentConfig,
+        ) -> Result<Vec<gitterm_core::chats::ChatIndexEntry>, String> {
+            self.reads.list_chats(r)
+        }
+        fn list_sessions(&self, r: &RemoteHostConfig) -> RemoteSessionsSnapshot {
+            self.reads.list_sessions(r)
+        }
+        fn list_phones(&self, _: &RemoteAgentConfig) -> Result<Vec<PairedPhoneInfo>, String> {
+            self.calls.lock().unwrap().push("list");
+            Ok(vec![])
+        }
+        fn create_phone_pairing(
+            &self,
+            _: &RemoteAgentConfig,
+            device_name: String,
+            scope: String,
+        ) -> Result<PhonePairing, String> {
+            assert_eq!(device_name, "iPhone");
+            assert_eq!(scope, "view");
+            self.calls.lock().unwrap().push("create");
+            Ok(PhonePairing {
+                pairing_url: "http://fixture.invalid/pair#placeholder".into(),
+                short_code: "ABCD-EFGH".into(),
+                scope,
+                expires_unix_secs: 2000,
+            })
+        }
+        fn revoke_phone(&self, _: &RemoteAgentConfig, id: String) -> Result<bool, String> {
+            assert_eq!(id, "placeholder");
+            self.calls.lock().unwrap().push("revoke");
+            Ok(true)
+        }
+    }
+    fn enable(f: &Fixture, cx: &mut VisualTestContext) {
+        let root = f.iced();
+        cx.update(|_, cx| {
+            cx.set_global(crate::workspace_config::LiveWorkspaces(
+                gitterm_core::desktop_store::DesktopStore::open(&root).unwrap(),
+            ));
+            let services = ServiceContext::production(&root, "parity-test")
+                .unwrap()
+                .for_gpui_live();
+            crate::chat::policy::install_live(services, cx).unwrap();
+        });
+    }
+    fn settle(f: &Fixture, cx: &mut VisualTestContext) {
+        // DesktopStore owns an OS thread; yield until its acknowledgement lands.
+        for _ in 0..1000 {
+            draw(cx);
+            if !f
+                .shell
+                .read_with(cx, |s, cx| s.owner.read(cx).workspace_save_pending)
+            {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("workspace acknowledgement did not arrive");
+    }
+    fn disk(f: &Fixture) -> gitterm_core::workspace_config::WorkspacesFile {
+        serde_json::from_slice(&std::fs::read(f.iced().join("workspaces.json")).unwrap()).unwrap()
+    }
+
+    #[gpui::test]
+    fn parity_live_remote_folder_picker_creates_and_opens_browser(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (f, cx) = fixture(cx);
+        enable(&f, cx);
+        f.shell.update_in(cx, |s, window, cx| {
+            s.open_folder_picker(
+                FolderPickerPurpose::NewWorkspace,
+                Some("mini".into()),
+                window,
+                cx,
+            )
+        });
+        draw(cx);
+        click("folder-picker-confirm", cx);
+        settle(&f, cx);
+        let file = disk(&f);
+        let remote = file
+            .workspaces
+            .iter()
+            .find(|w| w.name == "Mini:fixture")
+            .unwrap();
+        assert_eq!(remote.dir, "/home/fixture");
+        assert_eq!(remote.tabs.len(), 1);
+        assert_eq!(remote.tabs[0].dir, "/home/fixture");
+        assert!(remote.tabs[0].startup_command.is_none());
+        f.shell.update_in(cx, |s, window, cx| {
+            let workspace = s.active(cx).workspace.id;
+            let id = crate::data::SessionId(u64::MAX - 7);
+            let pane_id = crate::session_pane_id(id);
+            let pane = cx.new(|cx| {
+                crate::pane::Pane::new(
+                    pane_id.clone(),
+                    "Ephemeral".into(),
+                    crate::pane::PaneKind::IcedSession("placeholder".into()),
+                    workspace,
+                    s.data.clone(),
+                    window,
+                    cx,
+                )
+            });
+            let state = s
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace.id == workspace)
+                .expect("mounted workspace");
+            state.sessions.push(crate::data::Session {
+                id,
+                title: "Ephemeral".into(),
+                kind: crate::data::SessionKind::Terminal,
+            });
+            state.panes.insert(pane_id, pane);
+        });
+        f.shell.update_in(cx, |s, window, cx| {
+            s.folder_picker_outcome(
+                &FolderPickerOutcome::Confirm {
+                    purpose: FolderPickerPurpose::OpenFolder,
+                    remote_id: Some("mini".into()),
+                    dir: "/home/fixture/code".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        settle(&f, cx);
+        let file = disk(&f);
+        let remote = file
+            .workspaces
+            .iter()
+            .find(|w| w.name == "Mini:fixture")
+            .unwrap();
+        assert_eq!(remote.tabs.len(), 2);
+        assert_eq!(remote.active_tab, Some(1));
+        assert_eq!(remote.tabs[1].dir, "/home/fixture/code");
+        assert_eq!(remote.tabs[1].repo_dir.as_deref(), Some("/home/fixture"));
+        f.shell.read_with(cx, |s, cx| {
+            assert!(
+                s.owner.read(cx).error.is_none(),
+                "{:?}",
+                s.owner.read(cx).error
+            );
+            let active = s.active(cx);
+            assert_eq!(active.sessions.len(), 3);
+            assert!(active.sessions.iter().any(|s| s.title == "Ephemeral"));
+            assert_eq!(active.active_session, active.sessions.last().map(|s| s.id));
+        });
+    }
+
+    #[gpui::test]
+    fn parity_live_remote_folder_machine_identity_is_not_a_path(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (f, cx) = fixture(cx);
+        let path = f.iced().join("remote-agents.json");
+        let mut remotes: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        remotes["remote_agents"].as_array_mut().unwrap().push(serde_json::json!({"id":"second","name":"Second","endpoint":"http://127.0.0.1:9","auth":{"type":"token","token_ref":"env:PLACEHOLDER_UNSET"}}));
+        std::fs::write(path, serde_json::to_vec(&remotes).unwrap()).unwrap();
+        enable(&f, cx);
+        let mut ids = Vec::new();
+        for remote in ["mini", "second"] {
+            f.shell.update_in(cx, |s, window, cx| {
+                s.folder_picker_outcome(
+                    &FolderPickerOutcome::Confirm {
+                        purpose: FolderPickerPurpose::OpenFolder,
+                        remote_id: Some(remote.into()),
+                        dir: "/srv/project".into(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            settle(&f, cx);
+            f.shell.read_with(cx, |s, cx| {
+                let id = s.active(cx).workspace.id;
+                ids.push(id);
+                assert_eq!(
+                    crate::workspace_config::workspace_remote_id(
+                        s.owner.read(cx).iced_workspace(id).unwrap()
+                    )
+                    .as_deref(),
+                    Some(remote)
+                );
+                assert!(s.owner.read(cx).error.is_none());
+            });
+        }
+        assert_ne!(ids[0], ids[1]);
+        let file = disk(&f);
+        assert_eq!(
+            file.workspaces
+                .iter()
+                .filter(|w| w.name == "project")
+                .count(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    fn parity_live_remote_folder_reopens_running_and_stopped_parks_once(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (f, cx) = fixture(cx);
+        enable(&f, cx);
+        f.shell.update_in(cx, |s, window, cx| {
+            s.folder_picker_outcome(
+                &FolderPickerOutcome::Confirm {
+                    purpose: FolderPickerPurpose::OpenFolder,
+                    remote_id: Some("mini".into()),
+                    dir: "/srv/project".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        settle(&f, cx);
+        let workspace = f.shell.read_with(cx, |s, cx| s.active(cx).workspace.id);
+        for running in [true, false] {
+            let store = cx.read(|cx| {
+                cx.global::<crate::workspace_config::LiveWorkspaces>()
+                    .0
+                    .clone()
+            });
+            let saved = store
+                .transact_workspaces(|file| {
+                    let workspace = file
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.name == "project")
+                        .unwrap();
+                    workspace.active = false;
+                    workspace.parked = Some(gitterm_core::workspace_config::ParkedInfo {
+                        note: "placeholder".into(),
+                        parked_at: "2026-01-01T00:00:00Z".into(),
+                    });
+                    Ok(crate::workspace_config::LiveWorkspaceSaved {
+                        workspace: workspace.clone(),
+                        repos: file.repos.clone(),
+                        closed: file
+                            .workspaces
+                            .iter()
+                            .filter(|w| !w.active)
+                            .cloned()
+                            .collect(),
+                    })
+                })
+                .wait()
+                .unwrap();
+            f.shell.update_in(cx, |s, window, cx| {
+                s.owner.update(cx, |owner, cx| {
+                    owner.publish_workspace(saved, false, cx);
+                    if !running {
+                        owner.stopped_workspaces.insert(workspace);
+                    }
+                });
+                s.workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace.id == workspace)
+                    .unwrap()
+                    .parked = Some(crate::park::Parked {
+                    info: gitterm_core::park::Info::new(
+                        "placeholder",
+                        "2026-01-01T00:00:00Z".into(),
+                    ),
+                    running,
+                    done: false,
+                });
+                s.select_workspace(0, window, cx);
+                s.folder_picker_outcome(
+                    &FolderPickerOutcome::Confirm {
+                        purpose: FolderPickerPurpose::OpenFolder,
+                        remote_id: Some("mini".into()),
+                        dir: "/srv/project/sub".into(),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            settle(&f, cx);
+            let file = disk(&f);
+            let saved = file
+                .workspaces
+                .iter()
+                .find(|w| w.name == "project")
+                .unwrap();
+            assert_eq!(saved.tabs.len(), if running { 2 } else { 1 });
+            assert!(saved.active && saved.parked.is_none());
+            f.shell.read_with(cx, |s, cx| {
+                assert_eq!(s.active(cx).workspace.id, workspace);
+                assert!(s.active(cx).parked.is_none());
+                assert!(!s.owner.read(cx).stopped_workspaces.contains(&workspace));
+                assert!(
+                    s.owner.read(cx).error.is_none(),
+                    "{:?}",
+                    s.owner.read(cx).error
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn parity_live_phone_pair_revoke_qr_and_closed_panel_reply(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (f, cx) = fixture(cx);
+        enable(&f, cx);
+        let before = snapshot(&f.iced());
+        let client = Arc::new(Phones {
+            reads: f.fake.clone(),
+            calls: Mutex::new(vec![]),
+        });
+        f.shell.update_in(cx, |s, window, cx| {
+            s.set_remote_client(client.clone());
+            s.open_phone_panel("agent:mini", window, cx);
+        });
+        draw(cx);
+        click("phone-create", cx);
+        assert!(cx.debug_bounds("phone-pairing-qr").is_some());
+        f.shell.update(cx, |s, cx| {
+            s.phone_panel_call(
+                |panel, resolve| panel.revoke("placeholder".into(), resolve),
+                cx,
+            )
+        });
+        draw(cx);
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            ["list", "create", "revoke", "list"]
+        );
+        // Finish the old create only after its originating panel was replaced.
+        f.shell.update_in(cx, |s, window, cx| {
+            s.phone_panel_call(|panel, resolve| panel.create(resolve), cx);
+            s.open_phone_panel("agent:mini", window, cx);
+        });
+        draw(cx);
+        f.shell.read_with(cx, |s, cx| {
+            assert!(s.phone_panel().unwrap().read(cx).panel.pairing.is_none())
+        });
+        assert!(cx.debug_bounds("phone-pairing-qr").is_none());
+        let panel = f
+            .shell
+            .read_with(cx, |s, _| s.phone_panel().unwrap().clone());
+        panel.update(cx, |panel, cx| {
+            let stale = panel.list_generation;
+            panel.list_generation += 1;
+            panel.phones_loaded_at(panel.list_generation, "mini", Ok(vec![]), cx);
+            panel.phones_loaded_at(stale, "mini", Err("obsolete placeholder reply".into()), cx);
+            assert!(panel.panel.error.is_none());
+        });
+        assert_eq!(snapshot(&f.iced()), before); // pairings live only on the agent.
+    }
+
+    #[gpui::test]
+    fn parity_preview_refuses_all_three_writes_before_client_or_store(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
+        let (f, cx) = fixture(cx);
+        let before = snapshot(&f.iced());
+        let client = Arc::new(Phones {
+            reads: f.fake.clone(),
+            calls: Mutex::new(vec![]),
+        });
+        f.shell.update_in(cx, |s, window, cx| {
+            s.set_remote_client(client.clone());
+            s.folder_picker_outcome(
+                &FolderPickerOutcome::Confirm {
+                    purpose: FolderPickerPurpose::NewWorkspace,
+                    remote_id: Some("mini".into()),
+                    dir: "/srv/placeholder".into(),
+                },
+                window,
+                cx,
+            );
+        });
+        f.shell.read_with(cx, |s, cx| {
+            assert!(
+                s.owner
+                    .read(cx)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not available in preview")
+            )
+        });
+        f.shell.update_in(cx, |s, window, cx| {
+            s.open_phone_panel("agent:mini", window, cx)
+        });
+        draw(cx);
+        click("phone-create", cx);
+        f.shell.update(cx, |s, cx| {
+            s.phone_panel_call(|p, r| p.revoke("placeholder".into(), r), cx)
+        });
+        draw(cx);
+        assert_eq!(*client.calls.lock().unwrap(), ["list"]);
+        f.shell.update(cx, |s, cx| {
+            s.usage_intent(
+                crate::usage::UsageIntent::PinChanged(Some(
+                    gitterm_core::plan_limits::RoutingPin {
+                        provider: gitterm_core::plan_limits::Provider::Codex,
+                        until: 2000,
+                    },
+                )),
+                cx,
+            )
+        });
+        f.shell.read_with(cx, |s, cx| {
+            assert!(
+                s.owner
+                    .read(cx)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("not available in preview")
+            )
+        });
+        assert_eq!(snapshot(&f.iced()), before);
     }
 }

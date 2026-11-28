@@ -500,6 +500,9 @@ impl ServiceContext {
     }
 
     pub fn phone<C>(&self, call: &crate::remote::phone_panel::PhoneCall<C>) -> Result<(), Denied> {
+        if self.gpui_live && matches!(self.mode, Mode::Production) {
+            return Ok(());
+        }
         self.authorize(classify_phone_request(&call.request), None)
     }
 
@@ -1008,6 +1011,46 @@ mod live_tests {
         assert!(live.runner(RunnerEffect::HtmlPreview, None).is_ok());
         assert!(preview.runner(RunnerEffect::HtmlPreview, None).is_err());
         assert!(live.runner(RunnerEffect::AutomaticDelivery, None).is_ok());
+    }
+
+    #[test]
+    fn parity_phone_live_context_admits_pair_and_revoke_preview_refuses() {
+        use crate::remote::phone_panel::{PhoneCall, PhoneRequest};
+        let temp = tempfile::tempdir().unwrap();
+        let production = ServiceContext::production(temp.path(), "placeholder").unwrap();
+        let live = production.clone().for_gpui_live();
+        assert_eq!(production.task_mcp().token(), live.task_mcp().token());
+        let protected = super::super::ProtectedRoots::new(&temp.path().join("home"), []).unwrap();
+        let roots = Arc::new(Preview::validate(&temp.path().join("preview"), protected).unwrap());
+        let preview = ServiceContext::preview(roots.clone())
+            .unwrap()
+            .for_gpui_live();
+        let fixture = temp.path().join("fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        std::fs::write(fixture.join(FIXTURE_MARKER), b"").unwrap();
+        let fixtures = ServiceContext::fixture_launch(roots, [fixture])
+            .unwrap()
+            .for_gpui_live();
+        for request in [
+            PhoneRequest::List,
+            PhoneRequest::Create {
+                device_name: "Example".into(),
+                scope: "view",
+            },
+            PhoneRequest::Revoke {
+                id: "placeholder".into(),
+            },
+        ] {
+            let read = request == PhoneRequest::List;
+            let call = PhoneCall {
+                remote_id: "placeholder".into(),
+                request,
+                client: (),
+            };
+            assert!(live.phone(&call).is_ok());
+            assert_eq!(preview.phone(&call).is_ok(), read);
+            assert_eq!(fixtures.phone(&call).is_ok(), read);
+        }
     }
 
     #[test]
