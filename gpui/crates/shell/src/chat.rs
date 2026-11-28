@@ -404,6 +404,10 @@ impl EventEmitter<SavedChat> for ChatPane {}
 impl EventEmitter<TurnEnded> for ChatPane {}
 impl EventEmitter<gitterm_gpui_chat::model::roster::RosterOutcome> for ChatPane {}
 impl ChatPane {
+    pub(crate) fn conversation_events(&self) -> &[AgentEvent] {
+        &self.controller.adapter.state().conversation
+    }
+
     #[cfg(feature = "stt")]
     pub(crate) fn dictation_view(&self) -> Entity<ChatView> {
         self.view.clone()

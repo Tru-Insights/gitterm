@@ -713,3 +713,219 @@ fn tab_context_gap3_directory_uses_v6_dir_in_live_and_never_writes_source_in_pre
         cx.remove_global::<crate::workspace_config::LiveWorkspaces>();
     });
 }
+
+#[gpui::test]
+fn tab_context_gap5_chat_events_and_strip_toggle_wire_files_and_git(cx: &mut TestAppContext) {
+    use crate::{chat::ChatPane, data::ShellData};
+    use gitterm_core::chat::{runtime::RuntimeEvent, types::HarnessEvent};
+
+    let _app = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    cx.update(gpui_component::init);
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    let repo = repo.canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let output = gitterm_core::git_status::git_command()
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture",
+        "--allow-empty",
+    ]);
+    let linked = [temp.path().join("one"), temp.path().join("two")];
+    for (path, branch) in linked.iter().zip(["one", "two"]) {
+        git(&["worktree", "add", "-qb", branch, path.to_str().unwrap()]);
+        fs::write(path.join(format!("{branch}.txt")), "fixture").unwrap();
+    }
+    let linked = linked.map(|path| path.canonicalize().unwrap());
+    let source = temp.path().join("source");
+    fs::create_dir(&source).unwrap();
+    let config = temp.path().join("preview");
+    let (shell, cx) = cx.add_window_view(|window, cx| {
+        let shutdown = crate::chat::RuntimeShutdown::new();
+        let chats = ["first", "second"].map(|uid| {
+            cx.new(|cx| {
+                ChatPane::history(
+                    shutdown.clone(),
+                    crate::chat::SavedChat {
+                        uid: uid.into(),
+                        cwd: repo.clone(),
+                        provider: repo.join("fixture-provider"),
+                        session_id: None,
+                        records: vec![],
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        let tabs: Vec<_> = chats
+            .iter()
+            .map(|chat| {
+                serde_json::json!({
+                    "dir": repo, "repo_dir": repo, "tab_kind": "agent",
+                    "session_uid": chat.read(cx).target().session_uid,
+                })
+            })
+            .collect();
+        fs::write(
+            source.join("workspaces.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "workspaces": [{"name": "Fixture", "abbrev": "F", "color": "blue",
+                    "dir": repo, "tabs": tabs}], "active_workspace": 0,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = crate::workspace_config::IcedCatalog::read(&source).unwrap();
+        let model = WorkspaceStatus::from_iced(&catalog);
+        let mut store = WorkspaceStore::new(&config);
+        store.iced = Some(catalog);
+        let owner = cx.new(|cx| WorkspaceOwner::new(model, Some(store), cx));
+        let mut shell = crate::Shell::with_owner(
+            Rc::new(LocalData(owner.clone())),
+            owner.clone(),
+            &config,
+            true,
+            window,
+            cx,
+        )
+        .unwrap();
+        let sessions = shell.workspaces[0].sessions.clone();
+        for (session, chat) in sessions.iter().zip(chats) {
+            shell.workspaces[0].panes[&crate::session_pane_id(session.id)].update(
+                cx,
+                |pane, cx| {
+                    pane.session = Some(chat.read(cx).target());
+                    pane.content = crate::pane::PaneContent::PreviewChat(chat.clone());
+                },
+            );
+            owner.update(cx, |owner, cx| {
+                owner.chats.insert(chat.read(cx).target().session_uid, chat);
+            });
+        }
+        shell.select_session_id(sessions[0].id, window, cx);
+        shell
+    });
+    let before = fs::read(source.join("workspaces.json")).unwrap();
+    let (owner, sessions, chats) = cx.read(|cx| {
+        let shell = shell.read(cx);
+        let sessions = shell.workspaces[0].sessions.clone();
+        let chats: Vec<_> = sessions
+            .iter()
+            .map(|session| {
+                let pane = shell.workspaces[0].panes[&crate::session_pane_id(session.id)].read(cx);
+                let crate::pane::PaneContent::PreviewChat(chat) = &pane.content else {
+                    panic!("chat")
+                };
+                chat.clone()
+            })
+            .collect();
+        (shell.owner.clone(), sessions, chats)
+    });
+    let workspace = crate::data::WorkspaceId(1);
+    let emit = |index: usize, cx: &mut VisualTestContext| {
+        chats[index].update(cx, |chat, cx| {
+            for event in [
+                HarnessEvent::ItemStarted {
+                    id: "read".into(),
+                    kind: gitterm_core::chat::types::ItemKind::ToolCall {
+                        name: "Read".into(),
+                        input: serde_json::json!({"file_path": linked[index].join("fixture.txt")}),
+                    },
+                },
+                HarnessEvent::ItemCompleted {
+                    id: "read".into(),
+                    output: String::new(),
+                    is_error: false,
+                },
+            ] {
+                chat.receive_runtime_event(
+                    &chat.runtime_source(),
+                    RuntimeEvent::Harness(event),
+                    cx,
+                );
+            }
+        });
+    };
+    let owner_handle = owner.clone();
+    let wait_context = |root: &Path, branch: &str, cx: &mut VisualTestContext| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            if owner.read_with(cx, |owner, cx| {
+                let status = LocalData(owner_handle.clone()).status(workspace, cx);
+                owner.model.workspaces[0].root == root
+                    && status.checked
+                    && status.branch == branch
+                    && owner
+                        .files
+                        .get(&workspace)
+                        .is_some_and(|tree| tree.root == root)
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Files/Git did not follow {}",
+                root.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        draw(cx);
+    };
+    cx.run_until_parked();
+    emit(0, cx);
+    wait_context(&linked[0], "one", cx);
+    emit(1, cx);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        cx.run_until_parked();
+        if owner.read_with(cx, |owner, _| {
+            owner.model.session_contexts[&sessions[1].id]
+                .follow
+                .panel_root()
+                == Some(linked[1].as_path())
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "background chat did not follow");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_context(&linked[0], "one", cx);
+    cx.update(|window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.select_session_id(sessions[1].id, window, cx)
+        })
+    });
+    wait_context(&linked[1], "two", cx);
+    click(cx, "pstrip-worktree");
+    wait_context(&repo, "main", cx);
+    click(cx, "pstrip-worktree");
+    wait_context(&linked[1], "two", cx);
+    owner.read_with(cx, |owner, _| {
+        for session in &sessions {
+            assert_eq!(owner.model.session_contexts[&session.id].cwd, repo);
+        }
+    });
+    assert_eq!(fs::read(source.join("workspaces.json")).unwrap(), before);
+}

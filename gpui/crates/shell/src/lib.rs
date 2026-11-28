@@ -2742,9 +2742,10 @@ impl Shell {
                     }
                     session_strip::Outcome::TaskOverview => shell.general_context(true, window, cx),
                     session_strip::Outcome::ToggleWorktreeFollow => {
-                        let input = shell.strip_input(cx);
-                        if let Some(follow) = &input.worktree_follow {
-                            shell.chrome_unavailable(&follow.text(&input.branch), cx);
+                        if let Some(workspace) = shell.active_workspace(cx) {
+                            shell.owner.update(cx, |owner, cx| {
+                                owner.toggle_session_worktree_follow(workspace, cx)
+                            });
                         }
                     }
                     outcome => shell.strip_outcome(outcome, window, cx),

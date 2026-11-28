@@ -39,6 +39,7 @@ pub(crate) struct FilesView {
     samples: Vec<FileNode>,
     session: Option<SessionId>,
     navigation: HashMap<Option<SessionId>, Navigation>,
+    chat_observers: HashMap<EntityId, Subscription>,
 }
 #[cfg(test)]
 impl EventEmitter<crate::content::actions::OpenEditor> for FilesView {}
@@ -94,6 +95,7 @@ impl FilesView {
             samples: vec![],
             session: None,
             navigation: HashMap::new(),
+            chat_observers: HashMap::new(),
         };
         if let Some(owner) = this.owner.clone() {
             cx.observe(&owner, |this, _, cx| this.sync(cx)).detach();
@@ -268,6 +270,7 @@ impl FilesView {
             .map(|parent| parent.to_path_buf())
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_worktree_chats(cx);
         self.actions.clear();
         if let Some(owner) = self.owner.clone() {
             let (session, root, initial, overridden) = {
@@ -302,7 +305,8 @@ impl FilesView {
                     self.browsing_root = nav.browsing_root.clone();
                     self.selected_file = nav.selected_file.clone();
                 } else {
-                    self.directory = initial.unwrap_or_else(|| self.directory.clone());
+                    self.directory = if overridden { root.clone() } else { initial }
+                        .unwrap_or_else(|| self.directory.clone());
                     self.source_root = root.clone().unwrap_or_else(|| self.source_root.clone());
                     self.browsing_root = None;
                     self.selected_file = None;
@@ -408,6 +412,66 @@ impl FilesView {
             }
         }
         cx.notify();
+    }
+    fn sync_worktree_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.clone() else {
+            return;
+        };
+        let chats: Vec<_> = owner.read(cx).chats.values().cloned().collect();
+        self.chat_observers
+            .retain(|id, _| chats.iter().any(|chat| chat.entity_id() == *id));
+        for chat in chats {
+            self.chat_observers
+                .entry(chat.entity_id())
+                .or_insert_with(|| {
+                    cx.observe(&chat, |this, chat, cx| this.observe_worktree_chat(chat, cx))
+                });
+            // Also catch events received before mounting, or before the tab's
+            // context was installed. The owner consumes each tab's events once.
+            self.observe_worktree_chat(chat, cx);
+        }
+    }
+
+    fn observe_worktree_chat(&self, chat: Entity<crate::chat::ChatPane>, cx: &mut Context<Self>) {
+        let Some(owner) = self.owner.clone() else {
+            return;
+        };
+        let session = {
+            let owner = owner.read(cx);
+            let Some(saved) = owner.iced_workspace(self.workspace) else {
+                return;
+            };
+            let chat = chat.read(cx);
+            let uid = chat.target().session_uid;
+            let Some(index) = saved.tabs.iter().position(|tab| {
+                tab.session_uid.as_ref() == Some(&uid)
+                    || (tab.session_uid.is_none()
+                        && tab
+                            .chat_session_id
+                            .as_deref()
+                            .is_some_and(|id| chat.matches_chat(id)))
+            }) else {
+                return;
+            };
+            // Newly mounted chats use their uid; restored tabs use the catalog's
+            // workspace-scoped id (install_live_pane's existing-session path).
+            let mounted = SessionId(crate::layout::stable_path_hash(std::path::Path::new(&uid)));
+            if owner.model.session_contexts.contains_key(&mounted) {
+                mounted
+            } else {
+                owner.iced_sessions(saved)[index].id
+            }
+        };
+        chat.update(cx, |chat, cx| {
+            owner.update(cx, |owner, cx| {
+                owner.observe_session_worktree_events(
+                    self.workspace,
+                    session,
+                    chat.conversation_events(),
+                    cx,
+                )
+            });
+        });
     }
     fn activate(&mut self, id: &SharedString, cx: &mut Context<Self>) {
         match self.actions.get(id).cloned() {
