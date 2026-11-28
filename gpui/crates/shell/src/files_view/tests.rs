@@ -105,6 +105,7 @@ fn names(view: &Entity<FilesView>, cx: &mut VisualTestContext) -> Vec<String> {
 fn folder_click_replaces_listing_and_parent_returns_without_inline_expansion(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("child/nested")).unwrap();
@@ -134,6 +135,7 @@ fn folder_click_replaces_listing_and_parent_returns_without_inline_expansion(
 
 #[gpui::test]
 fn complete_directory_is_shown_without_paging(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     for ix in 0..crate::files::PAGE_SIZE + 1 {
@@ -150,6 +152,7 @@ fn complete_directory_is_shown_without_paging(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn clicking_file_opens_it_and_selects_only_that_file(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::write(root.path().join("file.txt"), "file").unwrap();
@@ -176,6 +179,7 @@ fn clicking_file_opens_it_and_selects_only_that_file(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn edit_click_requests_terminal_editor_without_launching_in_tests(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("folder")).unwrap();
@@ -235,6 +239,7 @@ fn edit_click_requests_terminal_editor_without_launching_in_tests(cx: &mut TestA
 
 #[gpui::test]
 fn roots_back_and_directory_rows_have_iced_insets_and_heights(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
@@ -322,6 +327,7 @@ fn work_folders_keep_iced_repo_then_docs_order_without_duplicates() {
 
 #[gpui::test]
 fn selecting_work_root_retains_directory_after_workspace_refresh(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
@@ -392,6 +398,7 @@ fn edit_click_never_runs_configured_editor() {
 
 #[gpui::test]
 fn sample_folders_also_navigate_without_an_inline_tree(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, cx| {
         FilesView::new(
@@ -411,6 +418,7 @@ fn sample_folders_also_navigate_without_an_inline_tree(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -477,4 +485,110 @@ fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppC
         cx.debug_bounds("files-root-icon-0").unwrap().origin.x,
         px(16.)
     );
+}
+
+fn work_document(home: &Path, repos: &[&Path]) -> gitterm_core::workspace_config::WorkspacesFile {
+    serde_json::from_value(serde_json::json!({
+        "workspaces": [{ "name": "Fixture", "abbrev": "F", "color": "blue", "dir": home,
+            "chats": ["owned"], "repos": repos, "tabs": [] }], "active_workspace": 0
+    }))
+    .unwrap()
+}
+
+#[gpui::test]
+fn files_roots_follow_repositories_added_and_removed_during_session(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    let docs = home.path().join("docs");
+    for dir in [&first, &second, &docs] {
+        fs::create_dir(dir).unwrap();
+    }
+    fs::write(first.join("file.txt"), "snapshot").unwrap();
+    let (view, owner, cx) = setup(cx, home.path(), config.path());
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&first]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), first.clone(), docs.clone()]
+        )
+    });
+    view.update(cx, |view, cx| view.browse_root(first.clone(), cx));
+    wait_for(&view, "file.txt", cx);
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(
+            config.path(),
+            work_document(home.path(), &[&first, &second]),
+            cx,
+        )
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[
+                home.path().to_path_buf(),
+                first.clone(),
+                second.clone(),
+                docs.clone()
+            ]
+        );
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    owner.update(cx, |owner, cx| {
+        owner.apply_desktop_document(config.path(), work_document(home.path(), &[&second]), cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.roots.as_ref().unwrap(),
+            &[home.path().to_path_buf(), second, docs]
+        );
+        // Iced retains panel_repo_root until All folders is clicked.
+        assert_eq!(view.browsing_root.as_ref(), Some(&first));
+    });
+    click(cx, "files-all-folders");
+    assert!(cx.debug_bounds("files-root-0").is_some());
+}
+
+#[gpui::test]
+fn files_hidden_entries_follow_saved_show_hidden_setting(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    for name in ["visible.txt", ".hidden"] {
+        fs::write(root.path().join(name), "fixture").unwrap();
+    }
+    fs::create_dir(root.path().join(".hidden-dir")).unwrap();
+    fs::create_dir(root.path().join("target")).unwrap();
+    let (_, owner, cx) = setup(cx, root.path(), config.path());
+    for show_hidden in [false, true] {
+        let settings =
+            serde_json::to_vec(&serde_json::json!({"show_hidden": show_hidden})).unwrap();
+        fs::write(config.path().join("settings.json"), &settings).unwrap();
+        owner.update(cx, |owner, cx| {
+            owner.apply_desktop_document(config.path(), work_document(root.path(), &[]), cx)
+        });
+        let view = cx.new(|cx| {
+            FilesView::new(
+                crate::data::WorkspaceId(1),
+                Rc::new(LocalData(owner.clone())),
+                cx,
+            )
+        });
+        wait_for(&view, "visible.txt", cx);
+        let listed = names(&view, cx);
+        assert_eq!(listed.contains(&".hidden".into()), show_hidden);
+        assert_eq!(listed.contains(&".hidden-dir".into()), show_hidden);
+        assert!(!listed.contains(&"target".into()));
+        assert_eq!(
+            fs::read(config.path().join("settings.json")).unwrap(),
+            settings
+        );
+    }
 }

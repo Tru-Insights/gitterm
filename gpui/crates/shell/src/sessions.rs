@@ -461,8 +461,12 @@ impl crate::Shell {
                 self.new_acp_chat(*id, window, cx)
             }
             O::Terminal if self.local => self.new_terminal(window, cx),
-            O::Cli { preset } => self.launch_agent_preset(*preset, window, cx),
-            O::CliResume { preset, .. } => self.launch_cli_preset(*preset, true, window, cx),
+            O::Cli { preset } if self.live_chat_enabled(cx) => {
+                self.launch_agent_preset(*preset, window, cx)
+            }
+            O::CliResume { preset, .. } if self.live_chat_enabled(cx) => {
+                self.launch_cli_preset(*preset, true, window, cx)
+            }
             O::Continue { task_id, preset } => self.launch_task_child(task_id, *preset, window, cx),
             _ => {
                 self.owner.update(cx, |owner, cx| {
@@ -681,7 +685,7 @@ impl crate::Shell {
             O::OpenReposMenu => self.unavailable("Repos ▾", cx),
             O::OpenReady => self.open_ready_list(window, cx),
             O::OpenParked => self.open_parked_list(window, cx),
-            O::Browser(_) => self.unavailable("Browser", cx),
+            O::Browser(action) => self.browser_action(action, window, cx),
             O::OpenMoreMenu => self.unavailable("Help and browser actions", cx),
             O::ToggleTerminal => self.unavailable("Terminal", cx),
             O::AddWorkspace(key) => {
@@ -704,6 +708,7 @@ impl crate::Shell {
             }
             O::ShowMachineChats(key) => self.show_machine_chats(&key, window, cx),
             O::PairPhone(key) => self.open_phone_panel(&key, window, cx),
+            outcome => self.repo_bar_outcome(outcome, window, cx),
         }
     }
     pub(crate) fn spine_outcome(
@@ -2067,18 +2072,20 @@ impl crate::Shell {
                 let pane =
                     self.workspace(workspace).panes[&crate::session_pane_id(session.id)].clone();
                 if pane.read(cx).session.is_none() {
-                    let Some(host) = cx
+                    let host = cx
                         .try_global::<crate::task_host::GpuiTaskHost>()
-                        .map(|h| h.0.clone())
-                    else {
-                        continue;
-                    };
+                        .map(|h| h.0.clone());
                     let name = self.workspace(workspace).workspace.name.clone();
-                    let result = host.update(cx, |host, cx| {
-                        host.open_live_terminal(&name, &tab, true, cx)
-                    });
+                    let result = host
+                        .ok_or_else(|| "Live terminal host is unavailable".to_owned())
+                        .and_then(|host| {
+                            let launched = host.update(cx, |host, cx| {
+                                host.open_live_terminal(&name, &tab, true, cx)
+                            })?;
+                            Ok((host, launched))
+                        });
                     match result {
-                        Ok(launched) => {
+                        Ok((host, launched)) => {
                             if let Some(view) =
                                 host.update(cx, |host, _| host.take_terminal(&launched.session_id))
                             {
@@ -2395,12 +2402,22 @@ mod tests {
         });
         let before = shell.read_with(cx, |shell, cx| shell.active(cx).sessions.len());
         shell.update_in(cx, |shell, window, cx| {
-            for kind in [
-                gitterm_core::remote::launch::SessionKind::Shell,
-                gitterm_core::remote::launch::SessionKind::Codex,
-                gitterm_core::remote::launch::SessionKind::Claude,
+            for (kind, expected) in [
+                (
+                    gitterm_core::remote::launch::SessionKind::Shell,
+                    "Shell · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Codex,
+                    "Codex · not available in preview",
+                ),
+                (
+                    gitterm_core::remote::launch::SessionKind::Claude,
+                    "Claude · not available in preview",
+                ),
             ] {
                 shell.open_remote_session_terminal(kind, window, cx);
+                assert_eq!(shell.owner.read(cx).error.as_deref(), Some(expected));
             }
             shell.new_terminal(window, cx);
         });
@@ -2443,6 +2460,7 @@ mod tests {
     fn live_restore_keeps_selected_tab_when_background_tab_shares_conversation(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let live = tempfile::tempdir().unwrap();
         let services = gitterm_core::preview::service::ServiceContext::production(
             live.path(),
@@ -2788,6 +2806,7 @@ mod tests {
     /// a final text; then a second prompt and turn.
     #[gpui::test]
     fn replayed_claude_transcript_folds_each_finished_turn(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {
             cx.run_until_parked();
@@ -2913,6 +2932,7 @@ mod tests {
     /// hook summary, and then a GitTerm delivery and the next turn.
     #[gpui::test]
     fn real_claude_turn_shape_folds_into_one_worked_row(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_gpui_chat::model::RowKind;
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {

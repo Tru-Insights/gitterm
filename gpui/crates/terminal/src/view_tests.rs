@@ -20,6 +20,7 @@ use std::{sync::Arc, time::Duration};
 
 #[::gpui::test]
 fn multiline_clipboard_paste_waits_for_enter_in_real_zsh(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let mut settings = BackendSettings {
         program: "/bin/zsh".into(),
@@ -62,6 +63,7 @@ fn multiline_clipboard_paste_waits_for_enter_in_real_zsh(cx: &mut TestAppContext
 
 #[::gpui::test]
 fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let backend = python(query_script(
         b"\x1b[?1049h\x1b[?1000h\x1b[?1006h",
@@ -76,7 +78,7 @@ fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
                 )
         })
     });
-    entity.update(cx, |view, _| {
+    entity.update(cx, |view, cx| {
         *view.layout_metrics.lock() = LayoutMetrics {
             origin: point(px(0.), px(0.)),
             cell_width: px(10.),
@@ -85,11 +87,14 @@ fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
             rows: 24,
         };
         let position = point(px(15.), px(25.));
-        view.mouse_down(&MouseDownEvent {
-            position,
-            click_count: 1,
-            ..Default::default()
-        });
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                click_count: 1,
+                ..Default::default()
+            },
+            cx,
+        );
         view.mouse_up(&MouseUpEvent {
             position,
             ..Default::default()
@@ -117,6 +122,7 @@ fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
 
 #[::gpui::test]
 fn ime_preedit_utf16_commit_selection_and_unicode_snapshots(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let backend = python(query_script(b"\x1b]2;READY\x07", "界😀e\u{301}".as_bytes()));
     let handle = cx.add_window(|_, cx| TerminalView::new(backend, TerminalConfig::default(), cx));
@@ -170,6 +176,7 @@ fn ime_preedit_utf16_commit_selection_and_unicode_snapshots(cx: &mut TestAppCont
 
 #[::gpui::test]
 fn configured_menlo_cell_width_matches_measured_monospace_advance(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui_kit::{Font, FontFeatures, FontStyle, FontWeight, TextRun, black};
 
     let backend = Backend::new(BackendSettings::default()).unwrap();
@@ -210,6 +217,7 @@ fn configured_menlo_cell_width_matches_measured_monospace_advance(cx: &mut TestA
 
 #[::gpui::test]
 fn deferred_shell_starts_with_first_laid_out_grid(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
 
     cx.background_executor.allow_parking();
@@ -277,6 +285,7 @@ fn deferred_shell_starts_with_first_laid_out_grid(cx: &mut TestAppContext) {
 
 #[::gpui::test]
 fn real_pty_resize_reaches_child_and_grid(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let backend = python(
         r#"import os,tty,time
@@ -322,6 +331,7 @@ os.write(1,b'\x1b]2;' + ('SIZE:%d:%d' % (s.columns,s.lines)).encode() + b'\x07')
 fn hidden_view_200mb_no_render_no_foreground_drain_bounds_memory_and_verifies_all_bytes(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::sync::atomic::Ordering;
     use test_support::{Counts, ObservedPty, PATTERN, TAIL, TOTAL, hex, rss_kib};
     cx.background_executor.allow_parking();
@@ -422,6 +432,7 @@ os.write(1,bytes.fromhex('{tail}'))
 
 #[::gpui::test]
 fn headless_paint_selection_preedit_and_resize_use_bounded_snapshot(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
     cx.background_executor.allow_parking();
     cx.update(gpui_kit::init);
@@ -488,6 +499,7 @@ fn headless_paint_selection_preedit_and_resize_use_bounded_snapshot(cx: &mut Tes
 
 #[::gpui::test]
 fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui_kit::Modifiers;
     cx.background_executor.allow_parking();
     let backend = Backend::new(BackendSettings {
@@ -511,11 +523,14 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
                 cols: 80,
                 rows: 24,
             };
-            view.mouse_down(&MouseDownEvent {
-                position: point(px(15.), px(5.)),
-                click_count: 1,
-                ..Default::default()
-            });
+            view.mouse_down(
+                &MouseDownEvent {
+                    position: point(px(15.), px(5.)),
+                    click_count: 1,
+                    ..Default::default()
+                },
+                cx,
+            );
             let term = view.backend.term.clone();
             let guard = term.lock_unfair();
             view.mouse_up(&MouseUpEvent {
@@ -532,15 +547,18 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
                     .unwrap(),
                 "bcd"
             );
-            view.mouse_down(&MouseDownEvent {
-                position: point(px(65.), px(5.)),
-                click_count: 1,
-                modifiers: Modifiers {
-                    shift: true,
+            view.mouse_down(
+                &MouseDownEvent {
+                    position: point(px(65.), px(5.)),
+                    click_count: 1,
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            });
+                cx,
+            );
             view.mouse_up(&MouseUpEvent {
                 position: point(px(65.), px(5.)),
                 ..Default::default()
@@ -585,6 +603,7 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
 
 #[::gpui::test]
 fn dropping_view_joins_reader_and_reaps_child(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let backend = python("import os, signal, time\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nos.write(1,b'\x1b]2;' + str(os.getpid()).encode() + b'\x07')\ntime.sleep(60)".into());
     let weak = Arc::downgrade(&backend.term);
@@ -622,6 +641,7 @@ fn dropping_view_joins_reader_and_reaps_child(cx: &mut TestAppContext) {
 
 #[::gpui::test]
 fn exited_and_failed_views_paint_persistent_status_and_ignore_input(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gpui_kit::{AvailableSpace, IntoElement, ParentElement, Styled, div, size};
     cx.background_executor.allow_parking();
     cx.update(gpui_kit::init);
@@ -671,6 +691,7 @@ fn exited_and_failed_views_paint_persistent_status_and_ignore_input(cx: &mut Tes
 
 #[::gpui::test]
 fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let backend = python(query_script(
         b"\x1b[?1049h\x1b[?1000h",
@@ -682,7 +703,7 @@ fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContex
             view.backend.sync() && view.backend.mode().contains(TermMode::MOUSE_REPORT_CLICK)
         })
     });
-    entity.update(cx, |view, _| {
+    entity.update(cx, |view, cx| {
         *view.layout_metrics.lock() = LayoutMetrics {
             origin: point(px(0.), px(0.)),
             cell_width: px(10.),
@@ -692,23 +713,29 @@ fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContex
         };
         let position = point(px(15.), px(25.));
         // Consumed Cmd-click must suppress its release even if Cmd is released first.
-        view.mouse_down(&MouseDownEvent {
-            position,
-            modifiers: gpui_kit::Modifiers {
-                platform: true,
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                modifiers: gpui_kit::Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        });
+            cx,
+        );
         view.mouse_up(&MouseUpEvent {
             position,
             ..Default::default()
         });
-        view.mouse_down(&MouseDownEvent {
-            position,
-            click_count: 1,
-            ..Default::default()
-        });
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                click_count: 1,
+                ..Default::default()
+            },
+            cx,
+        );
         // A regular press still needs a release if Cmd is pressed in between.
         view.mouse_up(&MouseUpEvent {
             position,
@@ -738,6 +765,7 @@ fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContex
 
 #[::gpui::test]
 fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use alacritty_terminal::vte::ansi::Processor;
     use gpui_kit::{Modifiers, ModifiersChangedEvent, MouseMoveEvent};
     use std::{cell::RefCell, rc::Rc};
@@ -809,10 +837,10 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
                 },
                 ..Default::default()
             };
-            view.mouse_down(&click(position));
+            view.mouse_down(&click(position), cx);
             // Clicking another URL without a prior hover must never use the old URL.
-            view.mouse_down(&click(point(px(35.), px(30.))));
-            view.mouse_down(&click(point(px(600.), px(30.))));
+            view.mouse_down(&click(point(px(35.), px(30.))), cx);
+            view.mouse_down(&click(point(px(600.), px(30.))), cx);
             assert_eq!(
                 &*opened.borrow(),
                 &["https://example.com/path", "https://example.org/second"]
@@ -821,7 +849,7 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
             // Lock contention clears hover and refuses an old cached destination.
             let term = view.backend.term.clone();
             let guard = term.lock_unfair();
-            view.mouse_down(&click(position));
+            view.mouse_down(&click(position), cx);
             assert_eq!(opened.borrow().len(), 2);
             drop(guard);
             view.on_modifiers_changed(&ModifiersChangedEvent::default(), window, cx);
@@ -837,6 +865,7 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
 
 #[::gpui::test]
 fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
     cx.background_executor.allow_parking();
     let entity = cx.new(|cx| {
@@ -862,6 +891,7 @@ fn find_busy_polls_notify_only_when_visible_state_changes(cx: &mut TestAppContex
 fn iced_find_input_submit_count_buttons_shortcuts_and_close_without_process(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use alacritty_terminal::vte::ansi::Processor;
     use gpui_kit::{Entity, VisualTestContext, component::Root, size};
     cx.background_executor.allow_parking();
@@ -1050,6 +1080,7 @@ fn iced_find_input_submit_count_buttons_shortcuts_and_close_without_process(
 
 #[::gpui::test]
 fn launch_cwd_and_title_callbacks_reach_app_headlessly(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use std::{cell::RefCell, rc::Rc};
     cx.background_executor.allow_parking();
     let cwd = Rc::new(RefCell::new(None));
@@ -1077,6 +1108,77 @@ fn launch_cwd_and_title_callbacks_reach_app_headlessly(cx: &mut TestAppContext) 
         Some(std::path::Path::new("/tmp/callback cwd"))
     );
     assert_eq!(title.borrow().as_deref(), Some("CALLBACK_TITLE"));
+}
+
+#[::gpui::test]
+fn terminal_osc52_callback_stores_decoded_text_and_rejects_invalid_payloads(
+    cx: &mut TestAppContext,
+) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    use alacritty_terminal::vte::ansi::Processor;
+    let mut backend = Backend::new_deferred(BackendSettings::default());
+    backend.cancel();
+    let stored = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let callback = stored.clone();
+    let window = cx.add_window(|_, cx| {
+        TerminalView::new(backend, Default::default(), cx)
+            .with_clipboard_store_callback(move |_, _, text| callback.lock().push(text.to_owned()))
+    });
+    window
+        .update(cx, |view, window, cx| {
+            let mut parser: Processor = Processor::new();
+            for payload in [
+                b"\x1b]52;c;bad*base64\x07".as_slice(),
+                b"\x1b]52;c;/w==\x07",
+                b"\x1b]52;x;YQ==\x07",
+            ] {
+                parser.advance(&mut *view.backend.term.lock_unfair(), payload);
+                view.process_events(window, cx);
+            }
+            assert!(stored.lock().is_empty());
+            parser.advance(
+                &mut *view.backend.term.lock_unfair(),
+                b"\x1b]52;c;Zml4dHVyZSDinJM=\x07",
+            );
+            view.process_events(window, cx);
+            assert_eq!(&*stored.lock(), &["fixture ✓"]);
+            // Iced adds no app-level size cap; the shared parser accepts a larger payload too.
+            let payload = format!("\x1b]52;s;{}\x07", "eHh4".repeat(1366));
+            parser.advance(&mut *view.backend.term.lock_unfair(), payload.as_bytes());
+            view.process_events(window, cx);
+            assert_eq!(stored.lock()[1], "x".repeat(4098));
+        })
+        .unwrap();
+}
+
+#[::gpui::test]
+fn terminal_scrollback_limit_survives_deferred_pty_start(cx: &mut TestAppContext) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    let entity = cx.new(|cx| {
+        TerminalView::new_deferred(
+            BackendSettings {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "read fixture".into()],
+                ..Default::default()
+            },
+            TerminalConfig {
+                scrollback: 13,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    entity.update(cx, |view, _| {
+        assert!(view.backend.sync());
+        assert!(view.backend.initialize_deferred(80, 24, 8, 16).unwrap());
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(
+            &mut *view.backend.term.lock_unfair(),
+            "line\r\n".repeat(100).as_bytes(),
+        );
+        assert_eq!(view.backend.term.lock_unfair().grid().history_size(), 13);
+    });
 }
 
 #[::gpui::test]

@@ -735,6 +735,7 @@ mod iced_projection_tests {
     fn imported_panes_keep_selection_without_terminal_or_agent_construction(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::AppContext;
         use std::rc::Rc;
         cx.background_executor.allow_parking();
@@ -792,6 +793,7 @@ mod preview_terminal_restore_test {
     fn imported_work_restores_and_resaves_only_its_preview_terminal_inventory(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::AppContext;
         use std::rc::Rc;
         cx.background_executor.allow_parking();
@@ -1218,6 +1220,7 @@ fn new_work_config(
         run_command: None,
         bottom_terminals: vec![],
         env: Default::default(),
+        legacy_env_base: None,
         active: true,
         chats: vec![],
         parked: None,

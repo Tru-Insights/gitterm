@@ -53,6 +53,8 @@ impl<C> Default for WorkspacesFile<C> {
 /// workspace does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<WorkspaceLocationConfig>,
@@ -188,6 +190,10 @@ pub struct WorkspaceConfig<C = WorkspaceColor> {
     /// "env": { "LINEAR_WORKSPACE": "truinsights", "LINEAR_TEAM": "TRU", "GH_TOKEN": "..." }
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Iced keeps a legacy remote's home env in its runtime repo, separate
+    /// from the effective compatibility copy written to `env` on each save.
+    #[serde(skip)]
+    pub legacy_env_base: Option<HashMap<String, String>>,
     /// Whether this workspace is currently open. Closed workspaces are kept in
     /// workspaces.json so their env vars and settings are preserved for reopening.
     #[serde(default = "default_true")]
@@ -283,6 +289,7 @@ impl<C> WorkspaceConfig<C> {
     /// hold them. Its terminals stay the workspace's.
     pub fn own_home_repo(&self) -> RepoConfig {
         RepoConfig {
+            extra: Default::default(),
             dir: self.home_dir().to_string(),
             location: self.location.clone(),
             run_command: self.run_command.clone(),
@@ -643,6 +650,7 @@ impl<C> WorkspacesFile<C> {
                 }
                 if self.repo(&key).is_none() {
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir,
                         location: None,
                         run_command: detected_command,
@@ -687,6 +695,7 @@ impl<C> WorkspacesFile<C> {
                     // Legacy lists can name an extra repo without a settings
                     // record. Iced's list_repo gives it an empty environment.
                     self.repos.push(RepoConfig {
+                        extra: Default::default(),
                         dir: dir.to_string_lossy().into_owned(),
                         location: None,
                         run_command: None,
@@ -905,3 +914,5 @@ pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
     }
     unreachable!("u32 suffixes exhausted under {}", base.display())
 }
+
+mod workspace_bar;

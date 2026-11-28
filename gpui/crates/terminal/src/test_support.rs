@@ -27,7 +27,7 @@ pub fn wait(mut predicate: impl FnMut() -> bool) {
     let start = Instant::now();
     while !predicate() {
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < Duration::from_secs(120),
             "PTY gate deadline"
         );
         std::thread::sleep(Duration::from_millis(2));
@@ -35,14 +35,17 @@ pub fn wait(mut predicate: impl FnMut() -> bool) {
 }
 pub fn query_script(query: &[u8], expected: &[u8]) -> String {
     format!(
-        r#"import os, tty, select, time
+        r#"import os, tty
 tty.setraw(0)
 os.write(1, bytes.fromhex('{query}'))
 reply = b''
-end = time.monotonic() + 3
-while len(reply) < {size} and time.monotonic() < end:
-    if select.select([0], [], [], max(0,end-time.monotonic()))[0]:
-        reply += os.read(0,4096)
+# The parent gate bounds the test and owns/kills this child. Wait for the
+# actual reply instead of expiring while the parent is descheduled.
+while len(reply) < {size}:
+    chunk = os.read(0,4096)
+    if not chunk:
+        break
+    reply += chunk
 os.write(1, b'\x1b]2;' + (b'OK' if reply == bytes.fromhex('{expected}') else b'FAIL:' + reply.hex().encode()) + b'\x07')
 "#,
         query = hex(query),

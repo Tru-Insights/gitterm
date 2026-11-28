@@ -6,6 +6,7 @@ mod agent_sidebar;
 mod agent_tests;
 pub mod app_menus;
 pub mod bottom_panel;
+mod browser;
 #[cfg(test)]
 mod center_tests;
 mod chat;
@@ -80,6 +81,7 @@ mod task_host_tests;
 mod task_panel;
 pub mod task_switcher;
 pub mod tasks;
+mod terminal_setup;
 mod theme;
 pub mod usage;
 pub mod work_sidebar;
@@ -206,6 +208,7 @@ pub struct Shell {
     saved_facts_catalog_key: Option<String>,
     saved_facts_generation: u64,
     bar_menu: Option<workspace_bar::Menu>,
+    browser: browser::State,
     work_sidebars: HashMap<WorkspaceId, Entity<work_sidebar::WorkSidebar>>,
     work_subscriptions: HashMap<WorkspaceId, Subscription>,
     agent_sidebars: HashMap<WorkspaceId, Entity<agent_sidebar::AgentSidebar>>,
@@ -264,6 +267,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        cx.set_global(terminal_setup::Scrollback(settings.scrollback_lines));
         let client_height = f32::from(window.viewport_size().height);
         owner.update(cx, |owner, _| {
             if let Some(notifications) = &mut owner.notifications {
@@ -452,6 +456,8 @@ impl Shell {
                 owner.dispatch(Intent::Opened, Instant::now(), cx)
             });
         }
+        subscriptions
+            .push(cx.observe(&owner, |shell, _, cx| shell.sync_settings_sheet_pending(cx)));
         // Panes, their sessions and the active one change with the shell.
         subscriptions.push(cx.observe_self(|shell, cx| shell.sync_task_panes(cx)));
         let mut shell = Self {
@@ -525,6 +531,7 @@ impl Shell {
             saved_facts_catalog_key: None,
             saved_facts_generation: 0,
             bar_menu: None,
+            browser: browser::State::new(cx),
             work_sidebars: HashMap::new(),
             work_subscriptions: HashMap::new(),
             agent_sidebars: HashMap::new(),
@@ -535,6 +542,7 @@ impl Shell {
             #[cfg(test)]
             dock_fixture: false,
         };
+        shell.start_browser_poll(cx);
         shell.reload_remotes(cx);
         shell.selected_task = shell
             .active_workspace(cx)
@@ -1302,7 +1310,7 @@ impl Shell {
                 } else if placement == DockPlacement::Bottom {
                     PaneKind::BottomTerminal(cwd.clone())
                 } else {
-                    PaneKind::CenterTerminal(cwd.clone())
+                    PaneKind::CenterTerminal(cwd.clone(), None)
                 },
                 state.workspace.id,
                 self.data.clone(),
@@ -1935,7 +1943,7 @@ fn build_workspace(
             } else if saved.bottom && host.as_ref().is_some_and(|h| h.read(cx).is_live()) {
                 PaneKind::BottomTerminal(saved.cwd.clone())
             } else {
-                PaneKind::CenterTerminal(saved.cwd.clone())
+                PaneKind::CenterTerminal(saved.cwd.clone(), saved.session_uid.clone())
             }
         } else {
             session.kind.into()
@@ -2351,13 +2359,7 @@ impl Shell {
                             .is_some_and(|pane| terminal_alive(pane.read(cx), cx))
                 })
             }),
-            browser: workspace_bar::Browser {
-                color: colors.muted,
-                driving: false,
-                hint: "Browser idle".into(),
-                action: Some(workspace_bar::BrowserAction::Open),
-                has_evidence: false,
-            },
+            browser: self.browser.bar(colors),
             more_open: self.bar_menu == Some(workspace_bar::Menu::More),
         }
     }
@@ -2699,12 +2701,6 @@ impl Shell {
                         O::OpenSettings(id) => shell.open_settings_sheet(id, window, cx),
                         O::OpenReady => shell.open_ready_list(window, cx),
                         O::OpenParked => shell.open_parked_list(window, cx),
-                        O::Browser(workspace_bar::BrowserAction::Open) => {
-                            shell.chrome_unavailable("Open browser", cx)
-                        }
-                        O::Browser(workspace_bar::BrowserAction::Focus) => {
-                            shell.chrome_unavailable("Focus browser", cx)
-                        }
                         outcome => shell.bar_outcome(outcome, window, cx),
                     }
                 });
@@ -3549,21 +3545,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        let launch = {
-            let mut launch = launch;
-            launch.program = "/bin/zsh".into();
-            launch.args = vec!["-d".into(), "-l".into()];
-            launch.env.insert(
-                "HOME".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch.env.insert(
-                "ZDOTDIR".into(),
-                Some(self.config_dir.to_string_lossy().into_owned()),
-            );
-            launch
-        };
         let preview = self.owner.read(cx).preview();
         if let Err(error) = preview::executable(
             preview.as_deref(),
@@ -3609,17 +3590,37 @@ impl Shell {
             pane.exit_pending = false;
         });
         let target = pane.read(cx).session.clone();
+        let mut launch = launch;
+        if let Some(target) = &target {
+            browser::terminal_environment(&mut launch, &target.session_uid, cx);
+        }
+        #[cfg(test)]
+        let launch = {
+            let mut launch = launch;
+            launch.program = "/bin/zsh".into();
+            launch.args = vec!["-d".into(), "-l".into()];
+            launch.env.insert(
+                "HOME".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch.env.insert(
+                "ZDOTDIR".into(),
+                Some(self.config_dir.to_string_lossy().into_owned()),
+            );
+            launch
+        };
         let weak = pane.downgrade();
         let view = cx.new(|cx| {
-            gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
-                .with_exit_callback(move |_, cx| {
+            terminal_setup::launch(launch, terminal_setup::Placement::Main, cx).with_exit_callback(
+                move |_, cx| {
                     _ = weak.update(cx, |pane, cx| {
                         if pane.session == target {
                             pane.mark_exited(cx);
                             cx.notify();
                         }
                     });
-                })
+                },
+            )
         });
         self._subscriptions
             .push(cx.observe_in(&view, window, |_, view, window, cx| {
@@ -3825,6 +3826,9 @@ impl Shell {
         if self.dictation_enabled() {
             context.push_str(" IcedStt");
         }
+        if self.browser.evidence_open {
+            return context;
+        }
         if self.usage_open {
             context.push_str(" IcedUsage");
             return context;
@@ -3903,6 +3907,7 @@ impl Shell {
     fn shell_modal(&self, window: &mut Window, cx: &mut App) -> Option<app_menus::Modal> {
         use app_menus::Modal;
         [
+            (self.browser.evidence_open, Modal::BrowserEvidence),
             (self.task_switcher.is_some(), Modal::TaskSwitcher),
             (self.usage_open, Modal::Usage),
             (Self::has_dialog(window, cx), Modal::Dialog),
@@ -3931,7 +3936,8 @@ impl Shell {
     /// switcher, the new-task form and task prompts, the New Work and Park
     /// sheets (not the Parked and Ready lists) and a PR action confirmation.
     fn pty_blocked(&self, cx: &App) -> bool {
-        self.task_switcher.is_some()
+        self.browser.evidence_open
+            || self.task_switcher.is_some()
             || self.task_panel_modal_open(cx)
             || self.new_work_sheet.is_some()
             || self
@@ -4406,7 +4412,10 @@ impl Shell {
         }
         self.usage_open = !self.usage_open;
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open || self.task_switcher.is_some() || self.usage_open;
+            content.picker = self.browser.evidence_open
+                || self.plans_open
+                || self.task_switcher.is_some()
+                || self.usage_open;
             content.sync_covers(window, cx);
         });
         if self.usage_open {
@@ -4596,6 +4605,9 @@ impl Shell {
         cx.notify();
     }
     fn escape(&mut self, _: &app_menus::Escape, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_browser_evidence(window, cx) {
+            return;
+        }
         if self.task_switcher.is_some() {
             self.task_switcher_outcome(&task_switcher::Outcome::Close, window, cx);
             return;
@@ -4740,6 +4752,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser.evidence_open {
+            if event.keystroke.key == "escape" {
+                self.close_browser_evidence(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // A terminal can hold focus behind these (its focus is set in code,
         // or the sheet's field lost it); no key may reach its PTY.
         if self.pty_blocked(cx) && self.focused_terminal(window, cx).is_some() {
@@ -4885,6 +4904,7 @@ impl Render for Shell {
             ));
         }
         for state in &self.workspaces {
+            terminal_setup::sync_workspace_insets(state, cx);
             for pane in state.panes.values() {
                 if let pane::PaneContent::Chat(view) = &pane.read(cx).content {
                     view.clone()
@@ -4905,7 +4925,8 @@ impl Render for Shell {
             switcher.update(cx, |s, cx| s.set_inputs(inputs, cx));
         }
         self.content.update(cx, |content, cx| {
-            content.picker = self.plans_open
+            content.picker = self.browser.evidence_open
+                || self.plans_open
                 || self.task_switcher.is_some()
                 || self.usage_open
                 || self.session_picker.is_some()
@@ -4996,6 +5017,7 @@ impl Render for Shell {
                 )
                 .children(self.new_work_sheet.clone())
                 .children(self.remote_overlays())
+                .children(self.browser_evidence_view(window, cx))
                 .into_any_element();
         }
         let state = self.active(cx);
@@ -5136,6 +5158,7 @@ impl Render for Shell {
             )
             .when(self.plans_open, |view| view.child(self.plans_viewer(cx)))
             .children(self.remote_overlays())
+            .children(self.browser_evidence_view(window, cx))
             .child(content::visual::reconciler(self.content.clone()))
             .into_any_element()
     }
@@ -6204,6 +6227,36 @@ mod tests {
     use gpui_component::dock::{InsertTarget, PaneRef};
 
     #[test]
+    fn test_teardown_releases_window_terminals_before_the_next_test() {
+        // Exercise the borrowed VisualTestContext path repeatedly in one
+        // process; without Cleanup each window retains its live PTY.
+        let mut cx = TestAppContext::single();
+        cx.background_executor.allow_parking();
+        for _ in 0..8 {
+            let cleanup = crate::test_app::Cleanup::new(&cx);
+            let (view, _) = cx.add_window_view(|_, cx| {
+                gitterm_terminal::TerminalView::new(
+                    gitterm_terminal::Backend::new(gitterm_terminal::BackendSettings {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "read fixture".into()],
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                    Default::default(),
+                    cx,
+                )
+            });
+            let weak = view.downgrade();
+            drop(view);
+            drop(cleanup);
+            assert!(
+                weak.upgrade().is_none(),
+                "test window retained its terminal"
+            );
+        }
+    }
+
+    #[test]
     fn roster_entries_project_delegation_and_task_checkouts() {
         let delegation: gitterm_core::tasks::Delegation = serde_json::from_value(serde_json::json!({
             "delegation_id": "checkout-option",
@@ -6459,6 +6512,7 @@ mod tests {
     fn live_local_status_crosses_application_bridge_and_survives_closed_git_pane(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let repo = tempfile::tempdir().unwrap();
@@ -6630,7 +6684,7 @@ mod tests {
         needle: &str,
         cx: &mut gpui::VisualTestContext,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             if view.read_with(cx, |view, _| {
                 view.backend()
@@ -6659,6 +6713,7 @@ mod tests {
     fn terminal_and_chat_survive_moves_grouping_close_reopen_workspace_and_restore(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6789,6 +6844,7 @@ mod tests {
 
     #[gpui::test]
     fn permanent_session_close_releases_terminal_and_removes_reopen_entry(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
@@ -6816,6 +6872,7 @@ mod tests {
 
     #[gpui::test]
     fn clicks_and_input_are_scoped_to_the_focused_terminal(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(|cx| {
             gpui_component::init(cx);
@@ -6887,8 +6944,12 @@ mod tests {
             cx.simulate_input(
                 "printf '\\033]7;file:///tmp/reported-pane\\007\\033]2;REPORTED_PANE\\007'\n",
             );
-            let deadline = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
             loop {
+                // PTY I/O runs on a real thread; its UI notification uses GPUI's
+                // simulated 16ms timer. Deliver that timer while awaiting OSC.
+                cx.executor()
+                    .advance_clock(std::time::Duration::from_millis(20));
                 draw(cx);
                 let pane = if selector == "session-12" {
                     &first
@@ -6900,7 +6961,7 @@ mod tests {
                     break;
                 }
                 assert!(
-                    deadline.elapsed().as_secs() < 5,
+                    std::time::Instant::now() < deadline,
                     "pane reports not delivered"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -6968,6 +7029,7 @@ mod tests {
 
     #[gpui::test]
     fn corrupt_file_starts_default_dock_and_remains_intact(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("layout-1.json");
@@ -7002,6 +7064,7 @@ mod tests {
 
     #[gpui::test]
     fn saved_workspace_layout_restores_position_and_size(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().unwrap();
         let (shell, cx) = cx.add_window_view(|w, cx| {
@@ -7029,3 +7092,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../../../test_app.rs"]
+mod test_app;

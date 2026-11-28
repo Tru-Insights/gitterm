@@ -36,6 +36,9 @@ use iced::{color, Length, Size, Subscription, Task, Theme};
 use iced_term::{SearchMatch, TerminalView};
 use muda::{accelerator::Accelerator, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
+use gitterm_core::content::syntax::{
+    syntect_syntax_for_path, syntect_syntax_set, syntect_theme_for, syntect_theme_set,
+};
 use similar::{ChangeTag, TextDiff};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -46,8 +49,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 #[cfg(feature = "excalidraw")]
@@ -2973,9 +2974,6 @@ const MAX_INLINE_WEBVIEW_BYTES: u64 = 1_500_000;
 const MAX_FULL_TEXT_LOAD_BYTES: u64 = 1_000_000;
 const LARGE_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
 const LARGE_TEXT_PREVIEW_LINES: usize = 2000;
-const MAX_SYNTAX_HIGHLIGHT_BYTES: usize = 96 * 1024;
-const MAX_SYNTAX_HIGHLIGHT_LINES: usize = 1200;
-const MAX_SYNTAX_HIGHLIGHT_SEGMENTS: usize = 8000;
 const MAX_FILE_VIEW_RENDER_LINES: usize = 1200;
 const MAX_FILE_VIEW_RENDER_LINES_WITH_SYNTAX: usize = 1200;
 const MAX_DIFF_SYNTAX_HIGHLIGHT_BYTES: usize = 768 * 1024;
@@ -3126,17 +3124,9 @@ pub struct FileVersionSignature {
 }
 
 fn file_version_signature(path: &Path) -> Option<FileVersionSignature> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified_unix_nanos = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-
-    Some(FileVersionSignature {
-        modified_unix_nanos,
-        file_len: metadata.len(),
+    gitterm_core::content::file_version_signature(path).map(|signature| FileVersionSignature {
+        modified_unix_nanos: signature.modified_unix_nanos,
+        file_len: signature.file_len,
     })
 }
 
@@ -3238,41 +3228,6 @@ fn hash_diff_lines(diff_lines: &[DiffLine]) -> u64 {
     hasher.finish()
 }
 
-fn syntect_syntax_set() -> &'static SyntaxSet {
-    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn syntect_theme_set() -> &'static ThemeSet {
-    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
-    THEME_SET.get_or_init(ThemeSet::load_defaults)
-}
-
-fn syntect_theme_for(is_dark_theme: bool) -> &'static syntect::highlighting::Theme {
-    let theme_set = syntect_theme_set();
-    let preferred = if is_dark_theme {
-        [
-            "base16-eighties.dark",
-            "base16-ocean.dark",
-            "Solarized (dark)",
-        ]
-    } else {
-        ["InspiredGitHub", "base16-ocean.light", "Solarized (light)"]
-    };
-
-    for name in preferred {
-        if let Some(theme) = theme_set.themes.get(name) {
-            return theme;
-        }
-    }
-
-    theme_set
-        .themes
-        .values()
-        .next()
-        .expect("syntect default themes should not be empty")
-}
-
 fn warm_syntect_engine() {
     let started = Instant::now();
     let syntax_set = syntect_syntax_set();
@@ -3312,61 +3267,6 @@ fn warm_syntect_engine() {
     perf_log!("syntect warmup took={}ms", started.elapsed().as_millis());
 }
 
-fn syntect_syntax_for_path(path: &Path) -> &'static SyntaxReference {
-    let syntax_set = syntect_syntax_set();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext = ext.to_ascii_lowercase();
-        if let Some(syntax) = syntax_set.find_syntax_by_extension(&ext) {
-            return syntax;
-        }
-
-        // Some packaged syntax sets do not register TS/TSX extensions.
-        // Fall back to close JavaScript/TypeScript aliases before plain text.
-        let alias_extensions: &[&str] = match ext.as_str() {
-            "ts" => &["tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
-            "tsx" => &["ts", "jsx", "js", "mjs", "cjs"],
-            "mts" | "cts" => &["ts", "js", "mjs", "cjs"],
-            "jsx" => &["js", "tsx", "ts", "mjs", "cjs"],
-            "mjs" | "cjs" => &["js", "jsx", "ts", "tsx"],
-            _ => &[],
-        };
-        for alias in alias_extensions {
-            if let Some(syntax) = syntax_set.find_syntax_by_extension(alias) {
-                return syntax;
-            }
-        }
-
-        let alias_tokens: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &["typescript", "ts", "tsx", "javascript", "js", "jsx"],
-            "js" | "jsx" | "mjs" | "cjs" => &["javascript", "js", "jsx", "typescript", "ts", "tsx"],
-            _ => &[],
-        };
-        for token in alias_tokens {
-            if let Some(syntax) = syntax_set.find_syntax_by_token(token) {
-                return syntax;
-            }
-        }
-
-        let alias_names: &[&str] = match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => &[
-                "TypeScript",
-                "TypeScript React",
-                "JavaScript",
-                "JavaScript (Babel)",
-            ],
-            "js" | "jsx" | "mjs" | "cjs" => &["JavaScript", "JavaScript (Babel)", "TypeScript"],
-            _ => &[],
-        };
-        for name in alias_names {
-            if let Some(syntax) = syntax_set.find_syntax_by_name(name) {
-                return syntax;
-            }
-        }
-    }
-
-    syntax_set.find_syntax_plain_text()
-}
-
 fn syntect_color_to_iced(color: syntect::highlighting::Color) -> iced::Color {
     // Keep syntax colors fully opaque in the Iced viewer; some themes encode alpha in ways
     // that can make token colors appear washed out or invisible.
@@ -3394,94 +3294,27 @@ fn build_syntax_highlight_lines(
         }
     }
 
-    let total_bytes = content.len();
-
-    let syntax_set = syntect_syntax_set();
-    let syntax = syntect_syntax_for_path(path);
-    let theme = syntect_theme_for(is_dark_theme);
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let fallback_color = if is_dark_theme {
-        color!(0xcdd6f4)
-    } else {
-        color!(0x4c4f69)
-    };
-
-    let mut highlighted_lines =
-        Vec::with_capacity(total_line_count.min(MAX_SYNTAX_HIGHLIGHT_LINES));
-    let mut parse_errors = 0usize;
-    let mut highlighted_line_count = 0usize;
-    let mut highlighted_bytes = 0usize;
-    let mut highlighted_segment_count = 0usize;
-    let mut truncation_notice: Option<String> = None;
-
-    for line_with_ending in LinesWithEndings::from(content) {
-        let line_bytes = line_with_ending.len();
-        if highlighted_line_count >= MAX_SYNTAX_HIGHLIGHT_LINES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} lines for performance.",
-                MAX_SYNTAX_HIGHLIGHT_LINES
-            ));
-            break;
-        }
-        if highlighted_bytes + line_bytes > MAX_SYNTAX_HIGHLIGHT_BYTES {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first ~{} KB for performance.",
-                MAX_SYNTAX_HIGHLIGHT_BYTES / 1024
-            ));
-            break;
-        }
-
-        let line = line_with_ending.trim_end_matches(['\r', '\n']);
-        let mut segments = Vec::new();
-        if let Ok(ranges) = highlighter.highlight_line(line_with_ending, syntax_set) {
-            for (style, token) in ranges {
-                let token = token.trim_end_matches(['\r', '\n']);
-                if token.is_empty() {
-                    continue;
-                }
-                segments.push(SyntaxHighlightSegment {
-                    text: token.to_string(),
-                    color: syntect_color_to_iced(style.foreground),
-                });
-            }
-        } else {
-            parse_errors += 1;
-        }
-
-        highlighted_segment_count += segments.len();
-        if highlighted_segment_count > MAX_SYNTAX_HIGHLIGHT_SEGMENTS {
-            truncation_notice = Some(format!(
-                "Syntax highlighting limited to first {} tokens for performance.",
-                MAX_SYNTAX_HIGHLIGHT_SEGMENTS
-            ));
-            break;
-        }
-
-        if segments.is_empty() {
-            let fallback_text = if line.is_empty() { " " } else { line };
-            segments.push(SyntaxHighlightSegment {
-                text: fallback_text.to_string(),
-                color: fallback_color,
-            });
-        }
-
-        highlighted_line_count += 1;
-        highlighted_bytes += line_bytes;
-        highlighted_lines.push(SyntaxHighlightLine { segments });
-    }
-
-    perf_log!(
-        "syntect path={} syntax={} lines={} highlighted_lines={} bytes={} highlighted_bytes={} parse_errors={} truncated={}",
-        path.display(),
-        syntax.name,
-        total_line_count,
-        highlighted_lines.len(),
-        total_bytes,
-        highlighted_bytes,
-        parse_errors,
-        truncation_notice.is_some()
-    );
-    let lines = Some(highlighted_lines);
+    let (lines, truncation_notice) =
+        gitterm_core::content::syntax::build_syntax_highlight_lines(path, content, is_dark_theme);
+    let lines = lines.map(|lines| {
+        lines
+            .into_iter()
+            .map(|line| SyntaxHighlightLine {
+                segments: line
+                    .segments
+                    .into_iter()
+                    .map(|segment| SyntaxHighlightSegment {
+                        text: segment.text,
+                        color: iced::Color::from_rgb8(
+                            segment.color[0],
+                            segment.color[1],
+                            segment.color[2],
+                        ),
+                    })
+                    .collect(),
+            })
+            .collect()
+    });
     if let Some(key) = cache_key {
         if let Ok(mut cache) = syntax_highlight_cache().lock() {
             cache.put(
@@ -8538,6 +8371,7 @@ fn repo_config_of(repo: &RepoState) -> Option<RepoConfig> {
         return None;
     }
     Some(RepoConfig {
+        extra: Default::default(),
         dir: repo_config_dir(repo),
         location: workspace_location_config_from_location(&repo.location),
         run_command: repo.run_command.clone(),
@@ -10322,6 +10156,7 @@ impl App {
                 })
                 .collect(),
             env: self.workspace_repo_env(ws, ws.home),
+            legacy_env_base: None,
             active: true,
             chats: ws.chats.clone(),
             parked: None,
@@ -10462,21 +10297,7 @@ impl App {
     /// Load workspace profiles from ~/.config/gitterm-v6/profiles.json
     /// Returns a map of profile_name -> env vars
     fn load_profiles() -> Option<HashMap<String, HashMap<String, String>>> {
-        let path = config::global_config_dir().join("profiles.json");
-        let contents = std::fs::read_to_string(&path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct Profile {
-            #[allow(dead_code)]
-            description: Option<String>,
-            env: HashMap<String, String>,
-        }
-        let profiles: HashMap<String, Profile> = serde_json::from_str(&contents).ok()?;
-        Some(
-            profiles
-                .into_iter()
-                .map(|(name, p)| (name, p.env))
-                .collect(),
-        )
+        gitterm_core::workspace_settings::load_profiles(&config::global_config_dir())
     }
 
     fn mark_workspaces_dirty(&mut self) {
@@ -15817,35 +15638,21 @@ impl App {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        if let Some(overridden) = ws.env_overrides.get_mut(&key) {
-            match value {
-                Some(value) => *overridden = value,
-                None => {
-                    ws.env_overrides.remove(&key);
-                }
-            }
-            return;
-        }
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            match value {
-                Some(value) => repo.env.insert(key, value),
-                None => repo.env.remove(&key),
-            };
-        }
+        gitterm_core::workspace_settings::EnvEdit::Set { key, value }.apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
-    /// A profile replaces workspace `idx`'s env: its home repo's env
-    /// becomes the profile and its overrides are cleared.
+    /// A profile replaces the home repo's env and clears workspace overrides.
     fn apply_env_profile(&mut self, idx: usize, profile: HashMap<String, String>) {
         let Some(ws) = self.workspaces.get_mut(idx) else {
             return;
         };
-        ws.env_overrides.clear();
-        let home = ws.home;
-        if let Some(repo) = self.repo_mut(home) {
-            repo.env = profile;
-        }
+        gitterm_core::workspace_settings::EnvEdit::Profile(profile).apply(
+            &mut ws.env_overrides,
+            self.repos.get_mut(ws.home).map(|repo| &mut repo.env),
+        );
     }
 
     /// Adds `workspace` to the bar in machine order, makes it active and
@@ -17600,11 +17407,15 @@ impl App {
                     ));
                 }
                 ReviewEffect::SaveMarks => {
-                    if let Some(Ok(marks)) = self.review.marks() {
+                    if let (Some(Ok(marks)), Some(previous)) =
+                        (self.review.marks(), self.review.marks_before_save())
+                    {
                         if let Err(error) =
-                            review_pane::save_viewed_marks(marks, &config::global_config_dir())
+                            marks.save_changes(previous, &config::global_config_dir())
                         {
                             eprintln!("[review] {error}");
+                        } else {
+                            self.review.marks_saved();
                         }
                     }
                 }
@@ -55164,6 +54975,7 @@ mod tests {
             run_command: None,
             bottom_terminals: Vec::new(),
             env: HashMap::new(),
+            legacy_env_base: None,
             active: false,
             chats: Vec::new(),
             parked: parked_at.map(|at| ParkedInfo {
@@ -55474,6 +55286,7 @@ mod tests {
     #[test]
     fn the_repos_section_keeps_open_repos_and_those_closed_workspaces_list() {
         let open = vec![RepoConfig {
+            extra: Default::default(),
             dir: "/tmp/tru180-open".into(),
             location: None,
             run_command: None,
@@ -55481,6 +55294,7 @@ mod tests {
             bottom_terminals: Vec::new(),
         }];
         let stored_for = |dir: &str| RepoConfig {
+            extra: Default::default(),
             dir: dir.into(),
             location: None,
             run_command: Some("make".into()),

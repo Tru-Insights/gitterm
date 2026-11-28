@@ -10,6 +10,9 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
+pub(crate) struct FileViewerClosed(pub WorkspaceId);
+impl EventEmitter<FileViewerClosed> for WorkspaceOwner {}
+
 #[derive(Clone)]
 enum EntryAction {
     Directory(PathBuf),
@@ -30,6 +33,10 @@ pub(crate) struct FilesView {
 #[cfg(test)]
 impl EventEmitter<crate::content::actions::OpenEditor> for FilesView {}
 impl FilesView {
+    #[cfg(test)]
+    pub(crate) fn selected_file(&self) -> Option<&std::path::Path> {
+        self.selected_file.as_deref()
+    }
     pub(crate) fn new(
         workspace: WorkspaceId,
         data: Rc<dyn ShellData>,
@@ -85,7 +92,29 @@ impl FilesView {
                 }
             })
             .detach();
-            this.sync(cx);
+            cx.subscribe(&owner, |this, _, event: &FileViewerClosed, cx| {
+                if event.0 == this.workspace {
+                    this.selected_file = None;
+                    cx.notify();
+                }
+            })
+            .detach();
+            let show_hidden = owner
+                .read(cx)
+                .iced_catalog()
+                .map(|catalog| {
+                    crate::workspace_config::load_iced_settings_from(&catalog.source).show_hidden
+                })
+                .unwrap_or(true);
+            owner.update(cx, |owner, _| {
+                owner
+                    .files
+                    .entry(workspace)
+                    .or_default()
+                    .set_show_hidden(show_hidden)
+            });
+            // Replace any startup listing requested before the saved setting was read.
+            this.navigate(this.directory.clone(), cx);
         } else {
             this.samples = data.files(workspace, cx);
             this.sync(cx);
@@ -120,6 +149,10 @@ impl FilesView {
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.actions.clear();
         if let Some(owner) = self.owner.clone() {
+            if let Some(saved) = owner.read(cx).iced_workspace(self.workspace) {
+                self.roots = gitterm_core::work::catalog::is_work(&saved.chats, false)
+                    .then(|| work_roots(&saved.repos, PathBuf::from(&saved.dir).join("docs")));
+            }
             if owner
                 .read(cx)
                 .files

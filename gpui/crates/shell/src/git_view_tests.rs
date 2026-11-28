@@ -188,6 +188,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 // GPUI's mock test platform only; no native GUI or production config access.
 #[gpui::test]
 fn toggle_clicks_switch_and_row_click_emits_existing_file_open(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let fixture = Fixture::new();

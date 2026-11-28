@@ -54,6 +54,7 @@ fn opened(out: &std::path::Path, name: &str, cx: &mut VisualTestContext) -> Path
 
 #[gpui::test]
 fn viewer_headers_show_the_esc_hint_and_browser_opens_what_iced_opens(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = super::h7_tests::fixture(cx);
     let work = root.path().join("work");
     let out = tempfile::tempdir().unwrap();
@@ -82,6 +83,7 @@ fn viewer_headers_show_the_esc_hint_and_browser_opens_what_iced_opens(cx: &mut T
 
 #[gpui::test]
 fn bar_pick_closes_usage_but_attention_and_restore_paths_keep_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = super::h7_tests::fixture(cx);
     let ids: Vec<WorkspaceId> = cx.read(|cx| {
         shell

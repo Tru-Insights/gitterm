@@ -625,6 +625,7 @@ pub const NATIVE_MENU_ACTIONS: &[&str] = &[
 /// A shell surface that consumes background commands while it is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modal {
+    BrowserEvidence,
     TaskSwitcher,
     Usage,
     /// A `gpui_component` dialog: the shortcuts help or a confirmation.
@@ -634,7 +635,8 @@ pub enum Modal {
 }
 
 impl Modal {
-    pub const ALL: [Modal; 5] = [
+    pub const ALL: [Modal; 6] = [
+        Modal::BrowserEvidence,
         Modal::TaskSwitcher,
         Modal::Usage,
         Modal::Dialog,

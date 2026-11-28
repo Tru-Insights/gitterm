@@ -221,6 +221,7 @@ fn notice(panel: &Entity<TaskPanel>, cx: &mut VisualTestContext) -> Option<Strin
 
 #[gpui::test]
 fn task_rows_from_host_snapshot(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     fixture.write_iced(vec![
         task("seeded-a", TaskLifecycle::Ready),
@@ -255,6 +256,7 @@ fn task_rows_from_host_snapshot(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn task_write_intents_show_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let ready = fixture.worktree("ready");
@@ -407,6 +409,7 @@ fn task_write_intents_show_notice(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn task_filter_chips_match_iced(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     let mut input = task("input", TaskLifecycle::Ready);
     input.attention = TaskAttention::raised(
@@ -576,6 +579,7 @@ fn run_tabs(shell: &Entity<crate::Shell>, cx: &mut VisualTestContext) -> usize {
 /// F1: Iced consumes background commands while a task prompt is up.
 #[gpui::test]
 fn task_modal_blocks_background_shortcuts(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, _root, shell, panel, cx) = shell_with_tasks(cx, |_| vec![]);
     panel.update(cx, |panel, cx| {
         panel.open_stop_and_close(target("running"), cx)
@@ -603,6 +607,7 @@ fn task_modal_blocks_background_shortcuts(cx: &mut TestAppContext) {
 /// F2: an archived row selects its task, from the host snapshot.
 #[gpui::test]
 fn archived_rail_row_selects_task(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
         let mut archived = in_dir(task("archived", TaskLifecycle::Archived), work);
         archived.archived_at = Some("2026-01-02T00:00:00Z".into());
@@ -668,6 +673,7 @@ fn remote_workspace_rail_matches_remote_and_root() {
 /// gives focus back to the shell.
 #[gpui::test]
 fn escape_dismisses_task_modals(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, root, shell, panel, cx) = shell_with_tasks(cx, |work| {
         vec![with_worktree(
             in_dir(task("ready", TaskLifecycle::Ready), work),
@@ -714,6 +720,7 @@ fn escape_dismisses_task_modals(cx: &mut TestAppContext) {
 /// F5: the create form goes through the core reducer's validation.
 #[gpui::test]
 fn create_uses_core_validation(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     fixture.write_iced(vec![]);
     let _owner = fixture.start(cx);
@@ -851,6 +858,7 @@ fn git(dir: &Path, args: &[&str]) {
 /// selects Iced's preferred base; a failed read keeps `HEAD`.
 #[gpui::test]
 fn create_form_lists_local_branches(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     fixture.write_iced(vec![]);
@@ -894,6 +902,7 @@ fn create_form_lists_local_branches(cx: &mut TestAppContext) {
 /// no form opened.
 #[gpui::test]
 fn create_refuses_without_workspace_session_or_git_repository(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     fixture.write_iced(vec![]);
     fixture.start(cx);
@@ -940,6 +949,7 @@ fn create_refuses_without_workspace_session_or_git_repository(cx: &mut TestAppCo
 /// task's worktree creates its task against the owning repository.
 #[gpui::test]
 fn create_from_a_task_worktree_uses_the_owning_repository(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let owner_repo = fixture.worktree("owner-repo");
@@ -984,6 +994,7 @@ fn with_conversation(mut task: TaskRecord) -> TaskRecord {
 /// focusing a session are reads; launches stop at the preview notice.
 #[gpui::test]
 fn start_resume_and_go_to_session_like_iced(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     let ready = fixture.worktree("ready");
     fixture.write_iced(vec![
@@ -1108,6 +1119,7 @@ fn overview_detail_rows_match_iced() {
 /// picker's Continue is a launch and stops at the notice.
 #[gpui::test]
 fn go_to_session_focuses_the_open_tab(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, _root, shell, panel, cx) = shell_with_tasks(cx, |work| {
         vec![with_worktree(
             in_dir(task("ready", TaskLifecycle::Ready), work),
@@ -1176,6 +1188,7 @@ fn go_to_session_focuses_the_open_tab(cx: &mut TestAppContext) {
 /// Iced `task_session_count` / `first_open_task_tab` search every workspace.
 #[gpui::test]
 fn overview_session_verbs_find_sessions_in_other_workspaces(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
         vec![with_worktree(
             in_dir(task("ready", TaskLifecycle::Ready), work),
@@ -1220,6 +1233,7 @@ fn overview_session_verbs_find_sessions_in_other_workspaces(cx: &mut TestAppCont
 /// the preview; the confirm label comes from it and the delete is refused.
 #[gpui::test]
 fn worktree_inspection_runs_in_preview_and_delete_refused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     let fixture = Fixture::new();
     let repo = fixture.worktree("repo");
@@ -1338,6 +1352,7 @@ fn worktree_inspection_runs_in_preview_and_delete_refused(cx: &mut TestAppContex
 /// core `task_handoff_prompt`, as Iced) and the picker says so.
 #[gpui::test]
 fn overview_copies_handoff_prompt(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {
         vec![with_worktree(
             in_dir(task("ready", TaskLifecycle::Ready), work),
@@ -1456,6 +1471,7 @@ fn history_labels(
 /// per-row state. `Open` focuses the tab; `Resume`/`Reopen` are launches.
 #[gpui::test]
 fn conversation_history_matches_iced(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     let ready = fixture.worktree("ready");
     let mut tasks = vec![
@@ -1549,6 +1565,7 @@ fn conversation_history_matches_iced(cx: &mut TestAppContext) {
 /// is open, as Iced's `resume_task_conversation`, and launches otherwise.
 #[gpui::test]
 fn resume_finds_the_open_conversation_tab(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let fixture = Fixture::new();
     let ready = fixture.worktree("ready");
     let mut document = TaskStoreDocument {
@@ -1631,6 +1648,7 @@ fn focused(outcomes: &Outcomes) -> bool {
 /// lists the presets, then Terminal.
 #[gpui::test]
 fn start_names_the_first_preset_and_the_picker_lists_presets(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     assert_eq!(start_label(false, "agent"), "▸ Start with agent ▾");
     assert_eq!(start_label(true, "Claude"), "+ Continue ▾");
     let (_fixture, _root, shell, _panel, cx) = shell_with_tasks(cx, |work| {

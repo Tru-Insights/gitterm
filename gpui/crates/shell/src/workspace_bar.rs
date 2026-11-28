@@ -7,7 +7,8 @@
 //! current owner; selection uses the existing selection reducer, NewWork opens
 //! the named-work sheet, and OpenReposMenu toggles the host's Repos popup.
 //! Native GPUI tooltips replace Iced's delayed overlay hints; their placement
-//! and rasterization are framework-specific. No shell hookup is installed here.
+//! and rasterization are framework-specific. Live repo actions below reuse the
+//! host picker, serialized desktop owner and remote connection/attachment paths.
 use std::rc::Rc;
 
 use gitterm_core::{park::WakeReason, settings::WorkspaceColor, workspace};
@@ -31,7 +32,7 @@ pub(crate) struct SavedFacts {
     pub news: std::collections::HashMap<WorkspaceId, News>,
     pub machines: Vec<News>,
     pub repo_machines: Vec<Machine>,
-    pub remote_workspaces: Vec<String>,
+    pub remote_workspaces: Vec<RemoteWorkspace>,
     /// Iced's Ready list: each home with a next-to-merge PR or open news.
     pub ready_groups: Vec<crate::park_sheet::ReadyGroup>,
     /// Iced's Parked list entries read from `workspaces.json`, newest first.
@@ -105,13 +106,17 @@ impl SavedFacts {
             .iter()
             .filter(|session| {
                 !file.workspaces.iter().any(|workspace| {
-                    workspace
-                        .remote_session
-                        .as_ref()
-                        .is_some_and(|open| open.session_name == session.session_name)
+                    workspace.active
+                        && workspace
+                            .remote_session
+                            .as_ref()
+                            .is_some_and(|open| open.session_name == session.session_name)
                 })
             })
-            .map(|session| format!("{}:{}", session.host_name, session.label))
+            .map(|session| RemoteWorkspace {
+                session_name: session.session_name.clone(),
+                name: format!("{}:{}", session.host_name, session.label),
+            })
             .collect();
         let homes = workspaces
             .iter()
@@ -664,7 +669,7 @@ pub struct Input {
     pub repos_open: bool,
     pub machine_news: Vec<News>,
     pub repo_machines: Vec<Machine>,
-    pub remote_workspaces: Vec<String>,
+    pub remote_workspaces: Vec<RemoteWorkspace>,
     pub pulse_bright: bool,
     pub ready_count: usize,
     pub ready_news_count: usize,
@@ -674,6 +679,12 @@ pub struct Input {
     pub browser: Browser,
     pub more_open: bool,
 }
+#[derive(Clone, Debug)]
+pub struct RemoteWorkspace {
+    pub session_name: String,
+    pub name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Browser {
     pub color: u32,
@@ -696,6 +707,8 @@ pub struct Machine {
 pub enum BrowserAction {
     Open,
     Focus,
+    Disconnect,
+    Evidence,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Menu {
@@ -726,6 +739,10 @@ pub enum Outcome {
     ShowMachineChats(String),
     /// "Pair a phone…" (machine key): the phone pairing panel.
     PairPhone(String),
+    AddRepo,
+    ToggleReposZone(String),
+    Reconnect(String),
+    OpenRemoteWorkspace(String),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
@@ -798,7 +815,7 @@ impl Input {
         match self.browser.action {
             Some(BrowserAction::Open) => entries.push("Open browser"),
             Some(BrowserAction::Focus) => entries.extend(["Focus browser", "Disconnect browser"]),
-            None => {}
+            _ => {}
         }
         if self.browser.has_evidence {
             entries.push("Browser evidence");
@@ -846,10 +863,27 @@ impl Input {
         machines
     }
     /// The outcome a repo-menu action emits; None is a preview notice.
-    fn repo_action_outcome(machine: &Machine, label: &str) -> Option<Outcome> {
+    fn repo_action_outcome(&self, machine: &Machine, label: &str) -> Option<Outcome> {
         if label == "New workspace…" && machine.key == workspace::LOCAL_GROUP {
             // The bar `+` opens the same sheet.
             Some(Outcome::NewWork)
+        } else if machine.key == workspace::LOCAL_GROUP
+            && self.workspaces.iter().any(|w| {
+                Some(w.id) == self.active
+                    && w.placement.group == workspace::LOCAL_GROUP
+                    && label == format!("Add a repo to {}…", w.name)
+            })
+        {
+            Some(Outcome::AddRepo)
+        } else if machine.key == workspace::LOCAL_GROUP
+            && matches!(
+                label,
+                "Keep repos in this menu only" | "Show repos on the bar too"
+            )
+        {
+            Some(Outcome::ToggleReposZone(machine.key.clone()))
+        } else if label == "Reconnect…" && machine.key.starts_with("agent:") {
+            Some(Outcome::Reconnect(machine.key.clone()))
         } else if label == "Open a repo…" {
             Some(Outcome::OpenFolder)
         } else if label == format!("Show {} chats", machine.name) {
@@ -1291,7 +1325,7 @@ pub fn render(
                                 {
                                     let id = format!("pstrip-repo-action-{position}-{index}");
                                     menu = menu.child(
-                                        match Input::repo_action_outcome(machine, &label) {
+                                        match menu_input.repo_action_outcome(machine, &label) {
                                             Some(outcome) => menu_control(
                                                 id,
                                                 label,
@@ -1308,12 +1342,15 @@ pub fn render(
                             if !menu_input.remote_workspaces.is_empty() {
                                 menu = menu
                                     .child(div().px(px(8.)).py(px(4.)).child("REMOTE SESSIONS"));
-                                for (index, name) in menu_input.remote_workspaces.iter().enumerate()
+                                for (index, remote) in
+                                    menu_input.remote_workspaces.iter().enumerate()
                                 {
-                                    menu = menu.child(preview_control(
+                                    menu = menu.child(menu_control(
                                         format!("pstrip-remote-workspace-{index}"),
-                                        format!("+ {name}"),
+                                        format!("+ {}", remote.name),
+                                        Outcome::OpenRemoteWorkspace(remote.session_name.clone()),
                                         colors,
+                                        menu_emit.clone(),
                                         cx,
                                     ));
                                 }
@@ -1426,6 +1463,7 @@ pub fn render(
             .on_click(move |_, window, cx| emit(Outcome::Browser(action), window, cx));
     }
     let more_input = input.clone();
+    let more_emit = emit.clone();
     let more = Button::new("pstrip-more")
         .ghost()
         .label("⋯")
@@ -1465,6 +1503,7 @@ pub fn render(
                         .font_family(crate::theme::LABEL_FONT)
                         .text_size(px(11.));
                     for (index, label) in more_input.more_entries().into_iter().enumerate() {
+                        let emit = more_emit.clone();
                         let weak = cx.entity().downgrade();
                         menu = menu.child(
                             control(
@@ -1486,12 +1525,14 @@ pub fn render(
                                             cx,
                                         );
                                     } else {
-                                        window.dispatch_action(
-                                            Box::new(crate::app_menus::PreviewUnavailable {
-                                                label: label.into(),
-                                            }),
-                                            cx,
-                                        );
+                                        let action = match label {
+                                            "Open browser" => BrowserAction::Open,
+                                            "Focus browser" => BrowserAction::Focus,
+                                            "Disconnect browser" => BrowserAction::Disconnect,
+                                            "Browser evidence" => BrowserAction::Evidence,
+                                            _ => return,
+                                        };
+                                        emit(Outcome::Browser(action), window, cx);
                                     }
                                 }),
                             )
@@ -1532,6 +1573,183 @@ pub fn render(
         .child(chips)
         .child(right)
 }
+
+impl crate::Shell {
+    /// The Repos menu shares the Work sidebar picker and the desktop owner.
+    pub(crate) fn repo_bar_outcome(
+        &mut self,
+        outcome: Outcome,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(store) = cx
+            .try_global::<crate::workspace_config::LiveWorkspaces>()
+            .filter(|_| self.live_chat_enabled(cx))
+            .map(|store| store.0.clone())
+        else {
+            let input = self.bar_input(cx);
+            let label = match outcome {
+                Outcome::AddRepo => input
+                    .workspaces
+                    .iter()
+                    .find(|w| Some(w.id) == input.active)
+                    .map_or_else(
+                        || "Add a repo…".into(),
+                        |w| format!("Add a repo to {}…", w.name),
+                    ),
+                Outcome::ToggleReposZone(_) => {
+                    if input.repos_on_bar {
+                        "Keep repos in this menu only".into()
+                    } else {
+                        "Show repos on the bar too".into()
+                    }
+                }
+                Outcome::Reconnect(_) => "Reconnect…".into(),
+                Outcome::OpenRemoteWorkspace(session) => input
+                    .remote_workspaces
+                    .iter()
+                    .find(|remote| remote.session_name == session)
+                    .map_or_else(
+                        || "Open remote workspace".into(),
+                        |remote| format!("+ {}", remote.name),
+                    ),
+                _ => return,
+            };
+            self.chrome_unavailable(&label, cx);
+            return;
+        };
+        if self.owner.read(cx).workspace_save_pending {
+            return;
+        }
+        match outcome {
+            Outcome::AddRepo => {
+                self.repo_outcome(
+                    &crate::work_sidebar::WorkSidebarOutcome::AddRepo,
+                    window,
+                    cx,
+                );
+            }
+            Outcome::Reconnect(key) => {
+                let Some(id) = key.strip_prefix("agent:") else {
+                    return;
+                };
+                self.reload_remotes(cx);
+                if self
+                    .configured_remotes()
+                    .iter()
+                    .any(|remote| remote.id == id)
+                {
+                    // Force the existing connection path to begin a new generation,
+                    // so an earlier attempt cannot overwrite the retry's answer.
+                    self.remote.connections.remove(id);
+                    self.connect_remotes(cx);
+                } else {
+                    self.bar_error(format!("Remote agent config not found for {id}"), cx);
+                }
+            }
+            Outcome::ToggleReposZone(key) => {
+                let root = store.root().to_path_buf();
+                self.owner
+                    .update(cx, |owner, _| owner.workspace_save_pending = true);
+                let save = cx.background_executor().spawn(async move {
+                    store
+                        .try_edit_workspaces(move |file| {
+                            file.toggle_repos_zone(&key);
+                            Ok(())
+                        })
+                        .wait()
+                });
+                cx.spawn(async move |shell, cx| {
+                    let result = save.await;
+                    _ = shell.update(cx, |shell, cx| {
+                        shell
+                            .owner
+                            .update(cx, |owner, _| owner.workspace_save_pending = false);
+                        match result {
+                            Ok(file) => shell.repo_document_saved(&root, file, cx),
+                            Err(error) => {
+                                shell.bar_error(format!("Save repo bar visibility: {error}"), cx)
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            Outcome::OpenRemoteWorkspace(session_name) => {
+                self.owner
+                    .update(cx, |owner, _| owner.workspace_save_pending = true);
+                let home = dirs::home_dir().unwrap_or_else(|| ".".into());
+                let save = cx.background_executor().spawn(async move {
+                    store
+                        .transact_workspaces(move |file| {
+                            let workspace = file.open_remote_workspace(&session_name, &home)?;
+                            // Catalog reads normalize legacy repo records in memory.
+                            // Keep that projection without rewriting unrelated entries.
+                            let mut projected = file.clone();
+                            projected.normalize_repos();
+                            Ok(crate::workspace_config::LiveWorkspaceSaved {
+                                workspace,
+                                repos: projected.repos,
+                                closed: file
+                                    .workspaces
+                                    .iter()
+                                    .filter(|w| !w.active)
+                                    .cloned()
+                                    .collect(),
+                            })
+                        })
+                        .wait()
+                });
+                cx.spawn_in(window, async move |shell, cx| {
+                    let result = save.await;
+                    _ = shell.update_in(cx, |shell, window, cx| {
+                        shell
+                            .owner
+                            .update(cx, |owner, _| owner.workspace_save_pending = false);
+                        match result {
+                            Ok(saved) => {
+                                let id = shell.owner.update(cx, |owner, cx| {
+                                    owner.publish_workspace(saved, false, cx)
+                                });
+                                if let Some(id) = id {
+                                    if let Err(error) = shell.mount_workspace(id, window, cx) {
+                                        shell.bar_error(
+                                            format!("Open remote workspace: {error:#}"),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    shell.select_workspace_id(id, window, cx);
+                                    shell.restore_live_workspace_sessions(id, window, cx);
+                                    shell.refresh_remote_sessions(window, cx);
+                                    shell.refresh_saved_facts(cx);
+                                }
+                            }
+                            Err(error) => {
+                                shell.bar_error(format!("Open remote workspace: {error}"), cx)
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            _ => {}
+        }
+    }
+
+    fn bar_error(&self, error: String, cx: &mut gpui::Context<Self>) {
+        self.owner.update(cx, |owner, cx| {
+            owner.error = Some(error);
+            cx.notify();
+        });
+    }
+}
+
+#[cfg(test)]
+#[path = "workspace_bar_live_tests.rs"]
+mod live_tests;
 
 #[cfg(test)]
 fn right_side_labels(input: &Input) -> Vec<String> {
@@ -1742,7 +1960,7 @@ pub(crate) mod tests {
             ]
         );
         assert!(matches!(
-            Input::repo_action_outcome(&machines[0], "New workspace…"),
+            i.repo_action_outcome(&machines[0], "New workspace…"),
             Some(Outcome::NewWork)
         ));
         i.repos_on_bar = true;
@@ -1820,7 +2038,8 @@ pub(crate) mod tests {
         }
     }
     #[gpui::test]
-    fn browser_more_entries_only_emit_preview_notices(cx: &mut TestAppContext) {
+    fn browser_more_entries_emit_host_actions(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let mut input = input();
@@ -1849,19 +2068,21 @@ pub(crate) mod tests {
             click(cx, selector);
         }
         assert_eq!(
-            *notices.borrow(),
-            ["Focus browser", "Disconnect browser", "Browser evidence"]
+            *events.borrow(),
+            [
+                Outcome::Browser(BrowserAction::Focus),
+                Outcome::Browser(BrowserAction::Disconnect),
+                Outcome::Browser(BrowserAction::Evidence)
+            ]
         );
-        assert!(
-            events.borrow().is_empty(),
-            "preview entries cannot emit an owner effect"
-        );
+        assert!(notices.borrow().is_empty());
     }
 
     #[gpui::test]
     fn overflowing_chips_scroll_without_shrinking_and_right_controls_stay_pinned(
         cx: &mut TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let mut input = input();
@@ -1912,6 +2133,7 @@ pub(crate) mod tests {
     }
     #[gpui::test]
     fn every_bar_control_emits_typed_outcome(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let events = Rc::new(RefCell::new(vec![]));

@@ -1718,6 +1718,7 @@ mod appearance_tests {
 
     #[gpui::test]
     fn loaded_chat_font_is_independent_and_theme_refresh_retains_it(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         cx.update(|cx| {
             let settings = crate::settings::FixtureSettings {
