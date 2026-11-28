@@ -3778,6 +3778,25 @@ impl Shell {
             _ => None,
         }
     }
+    /// Terminal menu target: a focused main-area terminal (GPUI can split the
+    /// center), else Iced's active main tab, so a focused bottom shell never is.
+    fn menu_terminal(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Entity<gitterm_terminal::TerminalView>> {
+        let focused_main = self.workspaces.iter().find_map(|state| {
+            let bottom = bottom_pane_ids(state, cx);
+            state.panes.iter().find_map(|(id, pane)| {
+                let pane::PaneContent::Terminal(view) = &pane.read(cx).content else {
+                    return None;
+                };
+                (!bottom.contains(id) && view.read(cx).focus_handle().contains_focused(window, cx))
+                    .then(|| view.clone())
+            })
+        });
+        focused_main.or_else(|| self.active_main_terminal(cx))
+    }
     fn focused_chat(&self, window: &Window, cx: &App) -> Option<gpui::EntityId> {
         self.workspaces
             .iter()
@@ -3964,7 +3983,7 @@ impl Shell {
             .menu_context(window, cx)
             .replace(" IcedTerminalSearch", "");
         if self
-            .active_main_terminal(cx)
+            .menu_terminal(window, cx)
             .is_some_and(|view| view.read(cx).is_find_open())
         {
             menu_context.push_str(" IcedTerminalSearch");
@@ -4164,9 +4183,9 @@ impl Shell {
                     this.chrome_unavailable(&action.label, cx);
                 },
             ))
-            .on_action(Self::background(cx, |this, _: &ClearTerminal, _, cx| {
+            .on_action(Self::background(cx, |this, _: &ClearTerminal, w, cx| {
                 // Iced writes to the active main tab, never the bottom panel.
-                if let Some(view) = this.active_main_terminal(cx) {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     view.update(cx, |v, _| {
                         v.backend_mut()
                             .handle(gitterm_terminal::Command::Write(b"clear\n".to_vec()));
@@ -4174,7 +4193,7 @@ impl Shell {
                 }
             }))
             .on_action(Self::background(cx, |this, _: &ToggleSearch, w, cx| {
-                if let Some(view) = this.active_main_terminal(cx) {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     if view.read(cx).is_find_open() {
                         view.update(cx, |v, cx| v.close_find(w, cx));
                     } else {
@@ -4183,8 +4202,8 @@ impl Shell {
                 }
                 cx.notify();
             }))
-            .on_action(Self::background(cx, |this, _: &SearchNext, _, cx| {
-                if let Some(view) = this.active_main_terminal(cx) {
+            .on_action(Self::background(cx, |this, _: &SearchNext, w, cx| {
+                if let Some(view) = this.menu_terminal(w, cx) {
                     view.update(cx, |v, cx| {
                         v.navigate_find(false, cx);
                     });
@@ -4192,8 +4211,8 @@ impl Shell {
             }))
             .on_action(Self::background(
                 cx,
-                |this, _: &view_preferences::SearchPrev, _, cx| {
-                    if let Some(view) = this.active_main_terminal(cx) {
+                |this, _: &view_preferences::SearchPrev, w, cx| {
+                    if let Some(view) = this.menu_terminal(w, cx) {
                         view.update(cx, |v, cx| {
                             v.navigate_find(true, cx);
                         });

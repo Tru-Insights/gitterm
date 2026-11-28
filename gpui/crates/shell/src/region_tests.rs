@@ -362,6 +362,8 @@ fn sidebar_width_comes_from_iced_settings_for_every_workspace(cx: &mut TestAppCo
         })
     });
     draw(cx);
+    // Activating starts the workspace slide; a drag mid-slide misses the divider.
+    crate::workspace_navigation::settle_slide(cx, 1);
     assert_eq!(cx.debug_bounds("sidebar").unwrap().size.width, px(310.));
 
     // A Live drag resizes every workspace and persists Iced's shared preference.
