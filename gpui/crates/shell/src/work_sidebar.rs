@@ -195,6 +195,7 @@ enum Action {
     /// Iced `Pr(ActionOpen)`: Approve, Merge and Ready for review open a
     /// confirmation panel first.
     Confirm(gitterm_core::merge_plan::PrKey, ActionKind),
+    ReviewPr(gitterm_core::merge_plan::PrKey),
     /// Iced's disabled Approve/Merge (checks gate, draft): a click does nothing.
     Inert,
 }
@@ -285,6 +286,7 @@ pub struct WorkSidebar {
     review_checkout: Option<PathBuf>,
     agent_line: Option<String>,
     confirm: Option<PrActionConfirm>,
+    live_guard: Option<Result<gitterm_core::work::pr_live::Guard, String>>,
     /// The open panel's focus, for Escape.
     confirm_focus: Option<gpui::FocusHandle>,
     /// gh's active login, as Iced reads it with each PR poll (`gh api user`,
@@ -369,6 +371,7 @@ impl WorkSidebar {
             review_checkout: None,
             agent_line: None,
             confirm: None,
+            live_guard: None,
             confirm_focus: None,
             active_login: None,
             login_reading: false,
@@ -612,7 +615,8 @@ impl WorkSidebar {
                 if this.focus != requested_focus || this.catalog_generation != catalog_generation {
                     this.load(true, cx);
                 }
-                if this.needs_active_login() {
+                if this.needs_active_login() && cx.try_global::<crate::pr_live::LivePrs>().is_none()
+                {
                     this.read_active_login(cx);
                 }
                 cx.notify();
@@ -695,7 +699,12 @@ impl WorkSidebar {
             return;
         }
         match &outcome {
-            WorkSidebarOutcome::Refresh { .. } => self.load(true, cx),
+            WorkSidebarOutcome::Refresh { .. } => {
+                if let Some(live) = cx.try_global::<crate::pr_live::LivePrs>() {
+                    live.request_refresh();
+                }
+                self.load(true, cx);
+            }
             WorkSidebarOutcome::Focus { focus, .. } => {
                 self.open.remove(&Fold::Focus);
                 self.focus = focus.clone();
@@ -1113,7 +1122,7 @@ impl WorkSidebar {
                         self.active_login.as_deref(),
                     );
                     let mut controls =
-                        vec![("Review".to_string(), Action::Preview("Review".to_string()))];
+                        vec![("Review".to_string(), Action::ReviewPr(pr.key.clone()))];
                     if !own {
                         controls.push((gated("Approve"), confirm(ActionKind::Approve)));
                     }
@@ -1726,6 +1735,7 @@ impl WorkSidebar {
             | Action::Rename
             | Action::Preview(_)
             | Action::Confirm(..)
+            | Action::ReviewPr(..)
             | Action::Inert => None,
         }
     }
@@ -1737,6 +1747,10 @@ impl WorkSidebar {
         }
         if let Action::Confirm(key, kind) = action {
             self.open_confirm(key, kind, window, cx);
+            return;
+        }
+        if let Action::ReviewPr(key) = action {
+            self.review_pr(key, cx);
             return;
         }
         if let Action::Rename = action {
@@ -1808,6 +1822,20 @@ impl WorkSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.confirm.as_ref().is_some_and(|c| c.running) {
+            return;
+        }
+        self.sync_live_prs(cx);
+        self.live_guard = cx.try_global::<crate::pr_live::LivePrs>().map(|_| {
+            let watched = self
+                .pull_requests
+                .iter()
+                .flat_map(|g| &g.prs)
+                .find(|pr| pr.key.id() == key.id());
+            let account = gitterm_core::prs::account_for(key.owner(), &self.pr_accounts);
+            let login = account.as_deref().or(self.active_login.as_deref());
+            gitterm_core::work::pr_live::Guard::capture(watched, login)
+        });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.confirm = Some(PrActionConfirm::open(
@@ -1840,21 +1868,143 @@ impl WorkSidebar {
     pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
         if pr_actions::close_action(&mut self.confirm) {
             self.confirm_focus = None;
+            self.live_guard = None;
         }
         cx.notify();
     }
 
-    /// Iced `ActionRun` would run `gh`; the preview reports it instead, in
-    /// the panel's error slot and the shell's notice.
-    /// shortcut: the shell has no `ServiceContext` yet, so the notice text is
-    /// the preview's own; ask `ServiceContext::pr_action` once it has one.
+    /// Live validates the opening facts and executes the shared action off
+    /// the UI thread. Preview keeps its notice in the panel and shell.
     pub(crate) fn confirm_run(&mut self, cx: &mut Context<Self>) {
+        if let Some(live) = cx.try_global::<crate::pr_live::LivePrs>().cloned() {
+            let Some(confirm) = self.confirm.as_mut().filter(|c| c.run_enabled()) else {
+                return;
+            };
+            let guard = match self
+                .live_guard
+                .clone()
+                .unwrap_or_else(|| Err("Reopen the confirmation".into()))
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    confirm.error = Some(error);
+                    cx.notify();
+                    return;
+                }
+            };
+            let mut command = confirm.clone();
+            let key = command.key.clone();
+            confirm.running = true;
+            confirm.error = None;
+            let job = cx
+                .background_executor()
+                .spawn(async move { live.confirm(&guard, &mut command) });
+            cx.spawn(async move |view, cx| {
+                let result = job.await;
+                _ = view.update(cx, |this, cx| {
+                    if pr_actions::finish_action(&mut this.confirm, &key, result) {
+                        this.confirm_focus = None;
+                        this.live_guard = None;
+                    }
+                    this.load(true, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let Some(confirm) = self.confirm.as_mut().filter(|c| c.run_enabled()) else {
             return;
         };
         let message = format!("{} · not available in preview", confirm.action().verb());
         confirm.error = Some(message.clone());
         self.notice(message, cx);
+    }
+
+    fn sync_live_prs(&mut self, cx: &gpui::App) {
+        let Some(live) = cx.try_global::<crate::pr_live::LivePrs>() else {
+            return;
+        };
+        live.read(|snapshot| {
+            if let Some(saved) = self.source.as_ref().and_then(|source| {
+                source
+                    .workspaces
+                    .get(self.workspace.id.saturating_sub(1) as usize)
+            }) && let Some(groups) = snapshot
+                .groups
+                .get(&crate::workspace_config::iced_layout_key(saved))
+            {
+                self.pull_requests = groups.clone();
+                for group in &mut self.pull_requests {
+                    for pr in &mut group.prs {
+                        if let Some(watched) = snapshot.watch.prs.get(&pr.key.id()) {
+                            *pr = watched.clone();
+                        }
+                    }
+                }
+            }
+            self.pr_plans = snapshot.plans.clone();
+            self.pr_accounts = snapshot.accounts.clone();
+            if let Some(login) = snapshot.logins.get(&None) {
+                self.active_login = Some(login.clone());
+            }
+            if let Some(error) = &snapshot.error {
+                self.error = Some(error.clone());
+            }
+        });
+    }
+
+    fn review_pr(&mut self, key: gitterm_core::merge_plan::PrKey, cx: &mut Context<Self>) {
+        let Some(live) = cx.try_global::<crate::pr_live::LivePrs>().cloned() else {
+            self.notice("Review · not available in preview".into(), cx);
+            return;
+        };
+        let watched = self
+            .pull_requests
+            .iter()
+            .flat_map(|g| &g.prs)
+            .find(|pr| pr.key.id() == key.id());
+        let candidates = self
+            .state
+            .borrow()
+            .pane(self.workspace.id)
+            .map(|pane| pr_actions::review_candidates(watched, &pane.branches))
+            .unwrap_or_default();
+        let job = cx.background_executor().spawn(async move {
+            live.review(&key)?;
+            let checkout = pr_actions::review_checkout(
+                candidates,
+                &key.repo,
+                |dir| {
+                    gitterm_core::gh_identity::repository_slug_for(dir)
+                        .map(|slug| slug.full_name())
+                        .map_err(|e| e.to_string())
+                },
+                |error| eprintln!("[pr-watch] review: {error}"),
+            );
+            Ok::<_, String>((key, checkout))
+        });
+        cx.spawn(async move |view, cx| {
+            let result = job.await;
+            _ = view.update(cx, |this, cx| {
+                match result {
+                    Ok((_, Some(checkout))) => this.emit(
+                        WorkSidebarOutcome::OpenReview {
+                            checkout,
+                            vs_base: true,
+                        },
+                        cx,
+                    ),
+                    Ok((key, None)) => {
+                        this.emit(WorkSidebarOutcome::OpenUrl { url: key.url() }, cx)
+                    }
+                    Err(error) => this.notice(error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The panel's live inputs: the PR's latest read and where its plan
@@ -1878,12 +2028,20 @@ impl WorkSidebar {
                 .find(|row| row.entry.key().id() == id)
                 .map(|row| row.status)
         });
-        pr_confirm::Model::build(
+        let mut model = pr_confirm::Model::build(
             confirm,
             watched,
             status.as_ref(),
             self.active_login.as_deref(),
-        )
+        );
+        if confirm.kind == ActionKind::Merge
+            && let Some(Ok(guard)) = &self.live_guard
+        {
+            model
+                .command
+                .push_str(&format!(" --match-head-commit {}", guard.head()));
+        }
+        model
     }
 
     fn run_command_outcome(repo: PathBuf, value: &str) -> WorkSidebarOutcome {
@@ -2193,6 +2351,7 @@ impl EventEmitter<WorkSidebarOutcome> for WorkSidebar {}
 impl Render for WorkSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load(false, cx);
+        self.sync_live_prs(cx);
         self.running_chats = self
             .source
             .as_ref()
