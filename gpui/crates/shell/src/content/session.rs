@@ -22,6 +22,14 @@ fn page_pane_id(workspace: WorkspaceId) -> String {
     format!("workspace-{}-page", workspace.0)
 }
 
+enum AggregateReview {
+    Branch {
+        checkout: std::path::PathBuf,
+        vs_base: bool,
+    },
+    Edit(gitterm_core::review::model::EditReview),
+}
+
 impl Shell {
     /// Iced `open_page_in_store`: show a PR or issue in the workspace's
     /// embedded Page, in GPUI's own copy of the selected login store.
@@ -172,12 +180,43 @@ impl Shell {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
+        self.open_aggregate_review(
+            workspace,
+            AggregateReview::Branch { checkout, vs_base },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn open_edit_review(
+        &mut self,
+        workspace: WorkspaceId,
+        open: gitterm_core::review::model::EditReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_aggregate_review(workspace, AggregateReview::Edit(open), window, cx);
+    }
+
+    fn open_aggregate_review(
+        &mut self,
+        workspace: WorkspaceId,
+        open: AggregateReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let checkout = match &open {
+            AggregateReview::Branch { checkout, .. } => checkout,
+            AggregateReview::Edit(open) => &open.target.checkout,
+        };
         let host = self.review_host(workspace, cx);
-        let state = self
+        let Some(state) = self
             .workspaces
             .iter_mut()
             .find(|state| state.workspace.id == workspace)
-            .unwrap();
+        else {
+            return;
+        };
         let session = self
             .content
             .read(cx)
@@ -188,7 +227,7 @@ impl Shell {
         // Keep branch review separate from the workspace's status-driven review.
         let id = format!(
             "{}-branch-review",
-            crate::content_pane_id(workspace, &checkout)
+            crate::content_pane_id(workspace, checkout)
         );
         let pane = state
             .panes
@@ -216,8 +255,9 @@ impl Shell {
         let pane::PaneContent::Review(review) = &pane.read(cx).content else {
             unreachable!()
         };
-        review.clone().update(cx, |view, cx| {
-            view.open_branch_review(
+        review.clone().update(cx, |view, cx| match open {
+            AggregateReview::Edit(open) => view.open_edit_review(open, host, cx),
+            AggregateReview::Branch { checkout, vs_base } => view.open_branch_review(
                 checkout,
                 if vs_base {
                     gitterm_core::review::model::ReviewSource::VsBase
@@ -226,7 +266,7 @@ impl Shell {
                 },
                 host,
                 cx,
-            )
+            ),
         });
         self.selected_files.remove(&workspace);
         self.content.update(cx, |content, cx| {
@@ -243,9 +283,8 @@ impl Shell {
         self.show_workspace_pane(workspace, &id, window, cx);
     }
 
-    /// What the native review borrows from the shell: Iced's config dir (marks and
-    /// turn snapshots, read-only), the preview root's writer for marks, the active
-    /// chat and the file-tree opener.
+    /// Live shares Iced's viewed marks; Preview writes only its own overlay.
+    /// Turn snapshots remain read-only in both modes.
     pub(crate) fn review_host(
         &self,
         workspace: WorkspaceId,
@@ -267,17 +306,24 @@ impl Shell {
                 pane::PaneContent::PreviewChat(chat) => chat.read(cx).chat_session_id(),
                 _ => None,
             });
-        let preview_marks_dir = writer.as_ref().map(|writer| writer.preview().layout());
-        let save_marks = writer.zip(preview_marks_dir.clone()).map(|(writer, dir)| {
-            let path = dir.join(gitterm_core::review::viewed::VIEWED_FILE);
-            Arc::new(move |bytes: Vec<u8>| {
-                // Completion errors are reported by the writer's own thread.
-                writer
-                    .submit(path.clone(), bytes)
-                    .map(drop)
-                    .map_err(|error| format!("save viewed marks: {error:#}"))
-            }) as gitterm_gpui_review::SaveMarks
-        });
+        let live = crate::chat::policy::is_live(cx);
+        let preview_marks_dir = (!live)
+            .then(|| writer.as_ref().map(|writer| writer.preview().layout()))
+            .flatten();
+        let save_marks = if live {
+            iced.clone().map(shared_marks_writer)
+        } else {
+            writer.zip(preview_marks_dir.clone()).map(|(writer, dir)| {
+                let path = dir.join(gitterm_core::review::viewed::VIEWED_FILE);
+                Arc::new(move |bytes: Vec<u8>| {
+                    // Completion errors are reported by the writer's own thread.
+                    writer
+                        .submit(path.clone(), bytes)
+                        .map(drop)
+                        .map_err(|error| format!("save viewed marks: {error:#}"))
+                }) as gitterm_gpui_review::SaveMarks
+            })
+        };
         let events = self.owner.clone();
         gitterm_gpui_review::ReviewHost {
             snapshot_roots: iced.as_ref().and_then(|dir| {
@@ -703,3 +749,60 @@ impl Shell {
 }
 
 pub(super) type ViewerVisits = HashMap<WorkspaceId, ViewerVisit>;
+
+/// The review sends an overlay against Iced. Reconstitute this pane's desired
+/// marks before applying its edits to the latest shared file.
+fn shared_marks_writer(dir: std::path::PathBuf) -> gitterm_gpui_review::SaveMarks {
+    use gitterm_core::review::viewed::ViewedMarks;
+    let previous = std::sync::Mutex::new(ViewedMarks::load(&dir));
+    Arc::new(move |bytes| {
+        let overlay: ViewedMarks = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("cannot parse viewed marks to save: {error}"))?;
+        let mut previous = previous
+            .lock()
+            .map_err(|error| format!("save viewed marks: {error}"))?;
+        let before = previous.as_ref().map_err(Clone::clone)?;
+        let mut desired = before.clone();
+        desired.checkouts.extend(overlay.checkouts);
+        desired.save_changes(before, &dir)?;
+        *previous = Ok(desired);
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod marks_tests {
+    use super::shared_marks_writer;
+    use gitterm_core::review::viewed::{VIEWED_FILE, ViewedMarks};
+
+    #[test]
+    fn review_host_shared_writer_preserves_other_client_edits_and_clears_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(VIEWED_FILE),
+            br#"{"checkouts":{"/tmp/checkout":{"clear":"old"}}}"#,
+        )
+        .unwrap();
+        let save = shared_marks_writer(dir.path().into());
+        // Iced writes after this pane loaded its snapshot.
+        std::fs::write(
+            dir.path().join(VIEWED_FILE),
+            br#"{"checkouts":{"/tmp/checkout":{"clear":"old","iced":"hash"}}}"#,
+        )
+        .unwrap();
+        save(br#"{"checkouts":{"/tmp/checkout":{"gpui":"new"}}}"#.to_vec()).unwrap();
+        let loaded = ViewedMarks::load(dir.path()).unwrap();
+        assert_eq!(
+            loaded.checkouts["/tmp/checkout"],
+            std::collections::BTreeMap::from([
+                ("iced".into(), "hash".into()),
+                ("gpui".into(), "new".into())
+            ])
+        );
+        save(br#"{"checkouts":{"/tmp/checkout":{}}}"#.to_vec()).unwrap();
+        assert_eq!(
+            ViewedMarks::load(dir.path()).unwrap().checkouts["/tmp/checkout"],
+            std::collections::BTreeMap::from([("iced".into(), "hash".into())])
+        );
+    }
+}

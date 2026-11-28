@@ -74,6 +74,29 @@ pub(super) fn fixture(owned: bool) -> WorkSidebar {
     fixture_with_branch(owned, "tru-274")
 }
 
+#[test]
+fn chat_review_target_reuses_work_row_and_ignores_gone_checkouts() {
+    let sidebar = fixture(true);
+    let target = sidebar
+        .review_target(std::path::Path::new("/repos/api-tru-274"))
+        .unwrap();
+    assert_eq!(target.checkout, PathBuf::from("/repos/api-tru-274"));
+    assert_eq!(target.repo, "api");
+    assert_eq!(target.branch, "tru-274");
+    assert_eq!(target.owner, "coordinator");
+    assert_eq!(target.base, None);
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/repos/api-old-branch"))
+            .is_none()
+    );
+    assert!(
+        sidebar
+            .review_target(std::path::Path::new("/unlisted"))
+            .is_none()
+    );
+}
+
 fn fixture_with_branch(owned: bool, first_branch: &str) -> WorkSidebar {
     let now = Instant::now();
     let wall_time = SystemTime::now();
