@@ -586,6 +586,10 @@ impl ConversationClaim {
         ensure!(!id.is_empty(), "Empty provider session identity");
         self.insert(format!("acp:{agent:?}:{id}"))
     }
+    pub(super) fn remote_provider_id(&self, remote: &str, id: &str) -> Result<()> {
+        ensure!(!id.is_empty(), "Empty remote provider session identity");
+        self.insert(format!("remote-claude:{remote}:{id}"))
+    }
     pub(super) fn provider_id(&self, id: &str) -> Result<()> {
         ensure!(!id.is_empty(), "Empty provider session identity");
         // Namespace comes from the effective provider root. Tests never inspect

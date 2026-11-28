@@ -18,6 +18,7 @@ pub(super) struct LiveTab {
     pub workspace_name: String,
     pub workspace_dir: String,
     pub tab: WorkspaceTabConfig,
+    pub location: Option<gitterm_core::remote::config::WorkspaceLocationConfig>,
 }
 impl LiveTab {
     pub fn new(
@@ -30,6 +31,7 @@ impl LiveTab {
             workspace_name: workspace.name.clone(),
             workspace_dir: workspace.dir.clone(),
             tab,
+            location: workspace.location.clone(),
         }
     }
     /// Share the workspace lifecycle's serialized owner. The chat shutdown queue
@@ -83,6 +85,10 @@ impl LiveTab {
         anyhow::ensure!(
             matches.next().is_none(),
             "Several saved workspaces have the same name and folder; this workspace cannot be changed in Live."
+        );
+        anyhow::ensure!(
+            workspace.location == self.location,
+            "Live chat workspace machine changed before saving"
         );
         let tabs = &mut workspace.tabs;
         let uid = self
@@ -192,10 +198,7 @@ impl ChatPane {
             .live_claim
             .as_ref()
             .context("Live chat has no conversation claim")?;
-        match self.controller.config.backend() {
-            AgentBackend::Acp(agent) => claim.acp_id(agent, id)?,
-            _ => claim.provider_id(id)?,
-        }
+        self.claim_provider(claim, id)?;
         let Some(tab) = &mut self.live_tab else {
             anyhow::bail!("Live chat has no workspace persistence binding");
         };
@@ -258,6 +261,7 @@ impl ChatPane {
         preview: Arc<gitterm_core::preview::Preview>,
         workspace: WorkspaceConfig,
         tab: WorkspaceTabConfig,
+        remote: Option<remote::Binding>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
@@ -265,23 +269,42 @@ impl ChatPane {
         #[cfg(test)]
         let projects = None;
         #[cfg(not(test))]
-        let projects = if tab
-            .agent_config
-            .as_ref()
-            .is_some_and(|config| config.backend() == AgentBackend::Claude)
+        let projects = if remote.is_none()
+            && tab
+                .agent_config
+                .as_ref()
+                .is_some_and(|config| config.backend() == AgentBackend::Claude)
         {
             Some(provider::live_provider_root()?.join("projects"))
         } else {
             None
         };
-        Self::resume_from(shutdown, preview, workspace, tab, projects, window, cx)
+        Self::resume_configured(
+            shutdown, preview, workspace, tab, projects, remote, window, cx,
+        )
     }
+    #[cfg(test)]
     fn resume_from(
         shutdown: Arc<RuntimeShutdown>,
         preview: Arc<gitterm_core::preview::Preview>,
         workspace: WorkspaceConfig,
         tab: WorkspaceTabConfig,
         projects: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Self> {
+        Self::resume_configured(
+            shutdown, preview, workspace, tab, projects, None, window, cx,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn resume_configured(
+        shutdown: Arc<RuntimeShutdown>,
+        preview: Arc<gitterm_core::preview::Preview>,
+        workspace: WorkspaceConfig,
+        tab: WorkspaceTabConfig,
+        projects: Option<PathBuf>,
+        remote: Option<remote::Binding>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
@@ -304,12 +327,16 @@ impl ChatPane {
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| {
+                if remote.is_some() {
+                    return None;
+                }
                 git2::Repository::discover(&tab.dir)
                     .ok()
                     .and_then(|repo| repo.workdir().map(PathBuf::from))
             })
             .unwrap_or_else(|| PathBuf::from(&tab.dir));
         let mut pane = Self::new(shutdown, preview, cwd, window, cx);
+        pane.bind_remote(remote, cx);
         pane.controller.target.session_uid = tab
             .session_uid
             .clone()
@@ -344,7 +371,10 @@ impl ChatPane {
         if let Some(id) = &id {
             match config.backend() {
                 AgentBackend::Acp(agent) => claim.acp_id(agent, id)?,
-                _ => claim.provider_id(id)?,
+                _ => match &pane.remote {
+                    Some(remote) => claim.remote_provider_id(&remote.agent.id, id)?,
+                    None => claim.provider_id(id)?,
+                },
             }
         }
         pane.live_claim = Some(claim);
@@ -382,6 +412,14 @@ impl ChatPane {
         pane.view.update(cx, |view, cx| {
             view.set_live_launch_settings(&settings, cx);
         });
+        if pane.remote.is_some() {
+            pane.controller.config = config.clone();
+            if id.is_some() {
+                pane.reload_remote_history(true, cx);
+            }
+            pane.controller.seed_launch(&settings);
+            return Ok(pane);
+        }
         let history = id
             .map(|id| {
                 pane.controller
@@ -457,7 +495,7 @@ impl ChatPane {
         }
         self.shutdown_runtime(cx);
         // Keep the old provider session untouched; only this pane's binding is reset.
-        if !self.saved.cwd.is_dir() {
+        if self.remote.is_none() && !self.saved.cwd.is_dir() {
             let Some(tab) = &self.live_tab else {
                 return;
             };
@@ -477,6 +515,7 @@ impl ChatPane {
         self.controller = Controller::new();
         self.controller.config = config;
         self.controller.live = true;
+        self.controller.remote = self.remote.is_some();
         self.controller.target.task_id = old_target.task_id;
         self.controller.target.task_session_id = old_target.task_session_id;
         self.saved.uid = self.controller.target.session_uid.clone();

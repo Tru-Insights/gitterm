@@ -97,14 +97,12 @@ fn review_f1_filtered_resume_reconciles_roster_and_reparks_the_right_identity(
                 "filtered chat must have no runtime pane"
             );
             let pane = state.panes[&crate::session_pane_id(state.sessions[0].id)].read(cx);
-            assert_eq!(
-                pane.session.as_ref().unwrap().session_uid,
-                "terminal-caller"
-            );
-            assert_eq!(
-                shell.live_workspace_tabs(state.runtime_uid, cx)[0].extra["future_tab"],
-                "keep"
-            );
+            // This roster fixture has no task host to mount a terminal. Its
+            // identity remains in the saved tab until a runtime is mounted.
+            assert!(pane.session.is_none());
+            let tabs = shell.live_workspace_tabs(state.runtime_uid, cx);
+            assert_eq!(tabs[0].session_uid.as_deref(), Some("terminal-caller"));
+            assert_eq!(tabs[0].extra["future_tab"], "keep");
             shell.park_workspace(&state.park_target(cx), Mode::Stop, window, cx);
         })
     });

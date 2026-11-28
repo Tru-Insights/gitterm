@@ -125,7 +125,7 @@ fn case_saved_acp_restores_and_resumes_recorded_session(cx: &mut gpui::TestAppCo
     )
     .unwrap();
     let (pane, cx) = cx.add_window_view(|window, cx| {
-        ChatPane::resume(shutdown.clone(), preview, workspace, tab, window, cx).unwrap()
+        ChatPane::resume(shutdown.clone(), preview, workspace, tab, None, window, cx).unwrap()
     });
     pane.update(cx, |pane, cx| pane.load_acp_history(cx));
     wait(&pane, cx, |pane| pane.controller.ready);
@@ -136,6 +136,14 @@ fn case_saved_acp_restores_and_resumes_recorded_session(cx: &mut gpui::TestAppCo
         assert!(pane.saved.records.iter().any(|record| matches!(&record.entry, Entry::Harness(HarnessEvent::TextDelta(text)) if text == "placeholder saved reply")));
         assert!(!pane.history_loading);
         assert!(pane.resume_error.is_none());
+        let other = provider::ConversationClaim::claim(
+            &pane.deferred_live.as_ref().unwrap().services,
+            "placeholder-other-caller",
+        ).unwrap();
+        let id = "placeholder-recorded-session";
+        assert!(other.acp_id(AcpAgent::Antigravity, id).is_err());
+        other.provider_id(id).unwrap();
+        other.remote_provider_id("placeholder-remote", id).unwrap();
     });
     std::fs::write(root.join("permission"), "").unwrap();
     pane.update(cx, |pane, cx| {
@@ -223,7 +231,7 @@ fn case_new_acp_uses_iced_argv_env_and_chat_config(cx: &mut gpui::TestAppContext
     ));
     let shutdown = RuntimeShutdown::new();
     let (pane, cx) = cx.add_window_view(|window, cx| {
-        ChatPane::resume(shutdown.clone(), preview, workspace, tab, window, cx).unwrap()
+        ChatPane::resume(shutdown.clone(), preview, workspace, tab, None, window, cx).unwrap()
     });
     assert!(pane.read_with(cx, |pane, _| pane.controller.runtime.is_none()));
     pane.update(cx, |pane, cx| {
@@ -305,6 +313,7 @@ fn case_missing_acp_reports_iced_message_and_retired_gemini_is_read_only(
             preview.clone(),
             workspace.clone(),
             saved(&root, Some("placeholder-missing-session")),
+            None,
             window,
             cx,
         )
@@ -326,7 +335,7 @@ fn case_missing_acp_reports_iced_message_and_retired_gemini_is_read_only(
         effort: None,
     });
     let (retired, cx) = cx.add_window_view(|window, cx| {
-        ChatPane::resume(shutdown.clone(), preview, workspace, tab, window, cx).unwrap()
+        ChatPane::resume(shutdown.clone(), preview, workspace, tab, None, window, cx).unwrap()
     });
     retired.read_with(cx, |pane, _| {
         assert!(pane.controller.runtime.is_none());
@@ -346,7 +355,7 @@ fn case_preview_keeps_acp_resume_and_persistent_permissions_unavailable(
     let (_fixture, preview) = super::super::tests::fixture();
     let workspace: WorkspaceConfig = serde_json::from_value(serde_json::json!({"name":"Placeholder", "abbrev":"P", "color":"blue", "dir":root, "tabs":[]})).unwrap();
     let (_pane, _) = cx.add_window_view(|window, cx| {
-        let result = ChatPane::resume(RuntimeShutdown::new(), preview.clone(), workspace, saved(&root, Some("placeholder-preview-session")), window, cx);
+        let result = ChatPane::resume(RuntimeShutdown::new(), preview.clone(), workspace, saved(&root, Some("placeholder-preview-session")), None, window, cx);
         assert!(matches!(result, Err(error) if error.to_string() == "Resume for this recorded backend is unavailable"));
         let mut pane = ChatPane::history(RuntimeShutdown::new(), SavedChat { uid:"placeholder-preview".into(), cwd:root.clone(), provider:preview.provider(), session_id:None, records:vec![] }, window, cx);
         pane.controller.config = saved(&root, None).agent_config.unwrap();
@@ -378,6 +387,7 @@ fn case_f1_initialize_uses_desktop_client_version(cx: &mut gpui::TestAppContext)
             preview,
             workspace,
             saved(&root, None),
+            None,
             window,
             cx,
         )
@@ -548,6 +558,7 @@ fn case_f4_resume_fallback_finishes_history_and_accepts_send(cx: &mut gpui::Test
                 preview.clone(),
                 workspace.clone(),
                 saved(&root, Some("placeholder-fallback-session")),
+                None,
                 window,
                 cx,
             )
@@ -592,6 +603,7 @@ fn case_f5_send_after_exit_resets_runtime_lifecycle(cx: &mut gpui::TestAppContex
             preview,
             workspace,
             saved(&root, None),
+            None,
             window,
             cx,
         )
