@@ -1,4 +1,5 @@
 //! Runtime identities belong to panes, independently of saved layout IDs.
+use crate::terminal_setup::{self, Placement};
 use gitterm_core::session::{self, SavedIdentity, Target};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1946,7 +1947,7 @@ impl crate::Shell {
                     let cwd_target = target.clone();
                     let title_target = target.clone();
                     let view = cx.new(|cx| {
-                        gitterm_terminal::TerminalView::launch(launch, Default::default(), cx)
+                        terminal_setup::launch(launch, Placement::Main, cx)
                             .with_cwd_callback(move |_, cx, cwd| {
                                 let _ = cwd_pane.update(cx, |pane, cx| {
                                     if pane.session.as_ref() == Some(&cwd_target) {

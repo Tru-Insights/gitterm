@@ -78,7 +78,7 @@ fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
                 )
         })
     });
-    entity.update(cx, |view, _| {
+    entity.update(cx, |view, cx| {
         *view.layout_metrics.lock() = LayoutMetrics {
             origin: point(px(0.), px(0.)),
             cell_width: px(10.),
@@ -87,11 +87,14 @@ fn actual_view_sgr_press_release_wheel_reach_child(cx: &mut TestAppContext) {
             rows: 24,
         };
         let position = point(px(15.), px(25.));
-        view.mouse_down(&MouseDownEvent {
-            position,
-            click_count: 1,
-            ..Default::default()
-        });
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                click_count: 1,
+                ..Default::default()
+            },
+            cx,
+        );
         view.mouse_up(&MouseUpEvent {
             position,
             ..Default::default()
@@ -520,11 +523,14 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
                 cols: 80,
                 rows: 24,
             };
-            view.mouse_down(&MouseDownEvent {
-                position: point(px(15.), px(5.)),
-                click_count: 1,
-                ..Default::default()
-            });
+            view.mouse_down(
+                &MouseDownEvent {
+                    position: point(px(15.), px(5.)),
+                    click_count: 1,
+                    ..Default::default()
+                },
+                cx,
+            );
             let term = view.backend.term.clone();
             let guard = term.lock_unfair();
             view.mouse_up(&MouseUpEvent {
@@ -541,15 +547,18 @@ fn drag_shift_copy_and_native_copy_survive_parser_contention(cx: &mut TestAppCon
                     .unwrap(),
                 "bcd"
             );
-            view.mouse_down(&MouseDownEvent {
-                position: point(px(65.), px(5.)),
-                click_count: 1,
-                modifiers: Modifiers {
-                    shift: true,
+            view.mouse_down(
+                &MouseDownEvent {
+                    position: point(px(65.), px(5.)),
+                    click_count: 1,
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            });
+                cx,
+            );
             view.mouse_up(&MouseUpEvent {
                 position: point(px(65.), px(5.)),
                 ..Default::default()
@@ -694,7 +703,7 @@ fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContex
             view.backend.sync() && view.backend.mode().contains(TermMode::MOUSE_REPORT_CLICK)
         })
     });
-    entity.update(cx, |view, _| {
+    entity.update(cx, |view, cx| {
         *view.layout_metrics.lock() = LayoutMetrics {
             origin: point(px(0.), px(0.)),
             cell_width: px(10.),
@@ -704,23 +713,29 @@ fn legacy_mouse_press_release_and_wheel_use_non_sgr_bytes(cx: &mut TestAppContex
         };
         let position = point(px(15.), px(25.));
         // Consumed Cmd-click must suppress its release even if Cmd is released first.
-        view.mouse_down(&MouseDownEvent {
-            position,
-            modifiers: gpui_kit::Modifiers {
-                platform: true,
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                modifiers: gpui_kit::Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        });
+            cx,
+        );
         view.mouse_up(&MouseUpEvent {
             position,
             ..Default::default()
         });
-        view.mouse_down(&MouseDownEvent {
-            position,
-            click_count: 1,
-            ..Default::default()
-        });
+        view.mouse_down(
+            &MouseDownEvent {
+                position,
+                click_count: 1,
+                ..Default::default()
+            },
+            cx,
+        );
         // A regular press still needs a release if Cmd is pressed in between.
         view.mouse_up(&MouseUpEvent {
             position,
@@ -822,10 +837,10 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
                 },
                 ..Default::default()
             };
-            view.mouse_down(&click(position));
+            view.mouse_down(&click(position), cx);
             // Clicking another URL without a prior hover must never use the old URL.
-            view.mouse_down(&click(point(px(35.), px(30.))));
-            view.mouse_down(&click(point(px(600.), px(30.))));
+            view.mouse_down(&click(point(px(35.), px(30.))), cx);
+            view.mouse_down(&click(point(px(600.), px(30.))), cx);
             assert_eq!(
                 &*opened.borrow(),
                 &["https://example.com/path", "https://example.org/second"]
@@ -834,7 +849,7 @@ fn cmd_hover_and_click_resolve_current_url_and_call_only_app_opener(cx: &mut Tes
             // Lock contention clears hover and refuses an old cached destination.
             let term = view.backend.term.clone();
             let guard = term.lock_unfair();
-            view.mouse_down(&click(position));
+            view.mouse_down(&click(position), cx);
             assert_eq!(opened.borrow().len(), 2);
             drop(guard);
             view.on_modifiers_changed(&ModifiersChangedEvent::default(), window, cx);
@@ -1093,4 +1108,75 @@ fn launch_cwd_and_title_callbacks_reach_app_headlessly(cx: &mut TestAppContext) 
         Some(std::path::Path::new("/tmp/callback cwd"))
     );
     assert_eq!(title.borrow().as_deref(), Some("CALLBACK_TITLE"));
+}
+
+#[::gpui::test]
+fn terminal_osc52_callback_stores_decoded_text_and_rejects_invalid_payloads(
+    cx: &mut TestAppContext,
+) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    use alacritty_terminal::vte::ansi::Processor;
+    let mut backend = Backend::new_deferred(BackendSettings::default());
+    backend.cancel();
+    let stored = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let callback = stored.clone();
+    let window = cx.add_window(|_, cx| {
+        TerminalView::new(backend, Default::default(), cx)
+            .with_clipboard_store_callback(move |_, _, text| callback.lock().push(text.to_owned()))
+    });
+    window
+        .update(cx, |view, window, cx| {
+            let mut parser: Processor = Processor::new();
+            for payload in [
+                b"\x1b]52;c;bad*base64\x07".as_slice(),
+                b"\x1b]52;c;/w==\x07",
+                b"\x1b]52;x;YQ==\x07",
+            ] {
+                parser.advance(&mut *view.backend.term.lock_unfair(), payload);
+                view.process_events(window, cx);
+            }
+            assert!(stored.lock().is_empty());
+            parser.advance(
+                &mut *view.backend.term.lock_unfair(),
+                b"\x1b]52;c;Zml4dHVyZSDinJM=\x07",
+            );
+            view.process_events(window, cx);
+            assert_eq!(&*stored.lock(), &["fixture ✓"]);
+            // Iced adds no app-level size cap; the shared parser accepts a larger payload too.
+            let payload = format!("\x1b]52;s;{}\x07", "eHh4".repeat(1366));
+            parser.advance(&mut *view.backend.term.lock_unfair(), payload.as_bytes());
+            view.process_events(window, cx);
+            assert_eq!(stored.lock()[1], "x".repeat(4098));
+        })
+        .unwrap();
+}
+
+#[::gpui::test]
+fn terminal_scrollback_limit_survives_deferred_pty_start(cx: &mut TestAppContext) {
+    let _cleanup = crate::test_app::Cleanup::new(cx);
+    cx.background_executor.allow_parking();
+    let entity = cx.new(|cx| {
+        TerminalView::new_deferred(
+            BackendSettings {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "read fixture".into()],
+                ..Default::default()
+            },
+            TerminalConfig {
+                scrollback: 13,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    entity.update(cx, |view, _| {
+        assert!(view.backend.sync());
+        assert!(view.backend.initialize_deferred(80, 24, 8, 16).unwrap());
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(
+            &mut *view.backend.term.lock_unfair(),
+            "line\r\n".repeat(100).as_bytes(),
+        );
+        assert_eq!(view.backend.term.lock_unfair().grid().history_size(), 13);
+    });
 }
