@@ -579,6 +579,35 @@ mod parity_tests {
             ],
         );
     }
+
+    #[test]
+    fn explicit_dim_ansi_palette_matches_iced_without_derived_shades() {
+        let names = [
+            NamedColor::DimBlack,
+            NamedColor::DimRed,
+            NamedColor::DimGreen,
+            NamedColor::DimYellow,
+            NamedColor::DimBlue,
+            NamedColor::DimMagenta,
+            NamedColor::DimCyan,
+            NamedColor::DimWhite,
+        ];
+        for dark in [true, false] {
+            let palette = ColorPalette::for_theme(dark);
+            let iced = gitterm_core::terminal::palette(dark);
+            for (index, name) in names.into_iter().enumerate() {
+                let actual = palette.resolve(Color::Named(name), &Colors::default());
+                assert_eq!(actual, rgb24_to_hsla(iced.dim[index]));
+                let mut derived = palette.ansi_colors[index];
+                derived.l *= 0.7;
+                assert_ne!(actual, derived, "{name:?} must use Iced's explicit value");
+            }
+            assert_eq!(
+                palette.resolve(Color::Named(NamedColor::DimForeground), &Colors::default()),
+                rgb24_to_hsla(iced.dim_foreground)
+            );
+        }
+    }
     #[test]
     fn terminal_palette_light_latte_matches_iced() {
         assert_palette(

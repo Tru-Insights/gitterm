@@ -165,6 +165,8 @@ pub fn sync_terminal_typography(view: &gpui::Entity<gitterm_terminal::TerminalVi
     config.colors = colors;
     config.font_family = theme.mono_font_family.to_string();
     config.font_size = theme.mono_font_size;
+    // TerminalView rebuilds its renderer when the palette changes while
+    // preserving the PTY, selection and scrollback owned by its backend.
     view.update(cx, |view, cx| view.update_config(config, cx));
 }
 
