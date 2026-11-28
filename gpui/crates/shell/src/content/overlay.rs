@@ -111,6 +111,7 @@ pub struct RetainedViewer<H: SurfaceHost> {
     geometry: Option<Geometry>,
     selected: bool,
     phase: LoadPhase,
+    document: Option<Document>,
     state: State,
     pending: Option<(SnapshotTicket, Instant)>,
     snapshot: Option<Snapshot>,
@@ -133,6 +134,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
             geometry: None,
             selected: false,
             phase: LoadPhase::Failed,
+            document: None,
             state: State::Empty,
             pending: None,
             snapshot: None,
@@ -145,6 +147,9 @@ impl<H: SurfaceHost> RetainedViewer<H> {
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+    pub fn document(&self) -> Option<&Document> {
+        self.document.as_ref()
     }
     pub fn host(&self) -> &H {
         &self.host
@@ -167,6 +172,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
         };
         self.load = Some(ticket.clone());
         self.phase = LoadPhase::Preparing;
+        self.document = None;
         self.error = None;
         self.state = State::Loading;
         ticket
@@ -180,7 +186,11 @@ impl<H: SurfaceHost> RetainedViewer<H> {
         if self.load.as_ref() != Some(ticket) || self.phase != LoadPhase::Preparing {
             return false;
         }
-        match document.and_then(|document| self.host.load(ticket.clone(), &document)) {
+        match document.and_then(|document| {
+            self.host.load(ticket.clone(), &document)?;
+            self.document = Some(document);
+            Ok(())
+        }) {
             Ok(()) => self.phase = LoadPhase::Navigating,
             Err(error) => {
                 self.phase = LoadPhase::Failed;
@@ -221,6 +231,7 @@ impl<H: SurfaceHost> RetainedViewer<H> {
     pub fn clear(&mut self) {
         self.invalidate();
         self.load = None;
+        self.document = None;
         self.phase = LoadPhase::Failed;
         self.selected = false;
         self.error = None;
