@@ -37,7 +37,10 @@ pub(crate) struct Host {
 }
 impl Host {
     async fn action(&self, action: BrowserAction) -> Result<Option<BrowserStatus>, String> {
-        let _admitted = self.admission.enter()?;
+        self.admission.run(self.perform_action(action)).await
+    }
+
+    async fn perform_action(&self, action: BrowserAction) -> Result<Option<BrowserStatus>, String> {
         let (tool, access) = match action {
             BrowserAction::Open => ("browser_open", BrowserAccess::Launch),
             BrowserAction::Focus => ("browser_target_focus", BrowserAccess::Interact),
@@ -332,37 +335,40 @@ impl Shell {
                     let labels = shell.browser_labels(cx);
                     let previous = shell.browser.labels.clone();
                     let runtime = host.runtime.clone();
-                    let admitted = host.admission.enter().ok()?;
                     Some(runtime.spawn(async move {
-                        let _admitted = admitted;
-                        let sync = if previous != labels {
-                            let released: HashSet<_> = previous
-                                .keys()
-                                .filter(|key| !labels.contains_key(*key))
-                                .cloned()
-                                .collect();
-                            async {
-                                host.engine.release_owners(&released).await?;
-                                host.browser.set_owner_labels(labels.clone()).await
-                            }
+                        host.admission
+                            .run(async {
+                                let sync = if previous != labels {
+                                    let released: HashSet<_> = previous
+                                        .keys()
+                                        .filter(|key| !labels.contains_key(*key))
+                                        .cloned()
+                                        .collect();
+                                    async {
+                                        host.engine.release_owners(&released).await?;
+                                        host.browser.set_owner_labels(labels.clone()).await
+                                    }
+                                    .await
+                                    .map_err(|e| {
+                                        format!("could not sync browser target owners: {e}")
+                                    })
+                                } else {
+                                    Ok(())
+                                };
+                                let status = host.browser.status().await.map_err(|e| {
+                                    format!("could not refresh managed browser status: {e}")
+                                });
+                                let telemetry = host.browser.telemetry().await;
+                                Ok((sync, labels, status, telemetry))
+                            })
                             .await
-                            .map_err(|e| format!("could not sync browser target owners: {e}"))
-                        } else {
-                            Ok(())
-                        };
-                        let status =
-                            host.browser.status().await.map_err(|e| {
-                                format!("could not refresh managed browser status: {e}")
-                            });
-                        let telemetry = host.browser.telemetry().await;
-                        (sync, labels, status, telemetry)
                     }))
                 });
                 let Ok(job) = job else {
                     break;
                 };
                 if let Some(job) = job {
-                    let result = job.await;
+                    let result = job.await.unwrap_or_else(|error| Err(error.to_string()));
                     if shell
                         .update(cx, |shell, cx| {
                             match result {

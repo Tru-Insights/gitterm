@@ -113,6 +113,7 @@ pub fn browser_tool_access(tool: &str) -> BrowserAccess {
 struct Requests {
     state: std::sync::Mutex<(bool, usize)>,
     changed: tokio::sync::Notify,
+    ui_cancelled: CancellationToken,
 }
 impl Requests {
     fn enter(self: &Arc<Self>) -> Option<RequestGuard> {
@@ -125,6 +126,7 @@ impl Requests {
     }
     fn close(&self) {
         self.state.lock().unwrap().0 = true;
+        self.ui_cancelled.cancel();
     }
     async fn drain(&self) {
         loop {
@@ -166,28 +168,43 @@ async fn shutdown_browser(
     disconnect: impl Future<Output = Result<(), String>>,
 ) -> Result<(), String> {
     requests.close();
-    shutdown_phase("browser-mcp-requests", timeout, async {
+    let drained = shutdown_phase("browser-mcp-requests", timeout, async {
         requests.drain().await;
         Ok(())
     })
-    .await?;
-    shutdown_phase("browser-engine-sessions", timeout, sessions).await?;
-    shutdown_phase("browser-disconnect-profile", timeout, disconnect).await
+    .await;
+    let sessions = shutdown_phase("browser-engine-sessions", timeout, sessions).await;
+    // Cleanup must run even when an earlier phase failed. The controller bounds
+    // its CDP/profile waits; a shorter outer timeout would abandon that cleanup.
+    let disconnected = disconnect
+        .await
+        .map_err(|error| format!("shutdown phase browser-disconnect-profile: {error}"));
+    let errors: Vec<_> = [drained, sessions, disconnected]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
-/// UI operations share MCP admission so quit drains both before releasing
-/// the profile. Cloning this handle never grants a new browser identity.
+/// UI operations share MCP admission, and quit cancels them before draining
+/// requests and releasing the profile. This grants no new browser identity.
 #[derive(Clone)]
 pub struct BrowserUiAdmission(Arc<Requests>);
-pub struct BrowserUiGuard {
-    _request: RequestGuard,
-}
 impl BrowserUiAdmission {
-    pub fn enter(&self) -> Result<BrowserUiGuard, String> {
-        self.0
+    pub async fn run<T>(&self, work: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        let _request = self
+            .0
             .enter()
-            .map(|request| BrowserUiGuard { _request: request })
-            .ok_or_else(|| "GitTerm's browser has shut down".to_string())
+            .ok_or_else(|| "GitTerm's browser has shut down".to_string())?;
+        tokio::select! {
+            biased;
+            _ = self.0.ui_cancelled.cancelled() => Err("GitTerm's browser has shut down".into()),
+            result = work => result,
+        }
     }
 }
 
@@ -1754,14 +1771,19 @@ mod tests {
             *events.lock().unwrap(),
             ["request-completed", "sessions", "disconnect-profile"]
         );
-        // A failed drain must not run later phases.
+        // Failures are reported, but must never bypass profile cleanup.
         let requests = Arc::new(Requests::default());
         let _accepted = requests.enter().unwrap();
+        events.lock().unwrap().clear();
         let error = shutdown_browser(
             &requests,
             Duration::from_millis(10),
-            async { panic!("sessions ran before request completion") },
-            async { panic!("profile released before request completion") },
+            async { Err("fixture session failure".into()) },
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                events.lock().unwrap().push("disconnect-profile");
+                Ok(())
+            },
         )
         .await
         .unwrap_err();
@@ -1769,6 +1791,8 @@ mod tests {
             error.contains("browser-mcp-requests") && error.contains("timeout"),
             "{error}"
         );
+        assert!(error.contains("fixture session failure"), "{error}");
+        assert_eq!(*events.lock().unwrap(), ["disconnect-profile"]);
     }
 
     #[test]
@@ -2668,27 +2692,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn live_browser_quit_drains_ui_and_releases_owned_profile_for_iced() {
+    async fn live_browser_quit_cancels_pending_open_and_releases_owned_profile_for_iced() {
         let root = tempdir().unwrap();
         let services = live_services(root.path());
         let profile = services.browser_profile_dir().unwrap();
         let devtools = fake_chrome_in(&profile).await;
         let (connection, server) =
             prepare_scoped(services, ListenerBind::LoopbackEphemeral, TEST_VERSION).unwrap();
-        assert!(!connection
-            .browser()
-            .profile_dir()
-            .await
-            .as_os_str()
-            .is_empty());
-        let (client, server_task) = serve_and_connect(&connection, server, "fixture-chat").await;
-        let result = call(&client, "browser_open", serde_json::json!({})).await;
-        assert_eq!(result.is_error, Some(false), "{result:?}");
-        // A pipe-backed stand-in process exits when fake CDP receives Browser.close.
-        // It never runs Chrome, touches a real profile or needs a process signal.
+        let server_task = tokio::spawn(server.run());
+        // The owned startup child exits only when fake CDP receives Browser.close.
+        // Open has not verified its endpoint yet, and must not launch Chrome.
         let mut child = tokio::process::Command::new("/bin/sh")
             .args(["-c", "read fixture"])
             .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -2699,26 +2716,43 @@ mod tests {
         }));
         connection.browser().own_test_child(child).await;
         let admission = connection.ui_admission();
-        let accepted_ui = admission.enter().unwrap();
-        client.cancel().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *devtools.next_list_gate.lock().unwrap() = Some((started.clone(), release.clone()));
+        let browser = connection.browser();
+        assert!(profile.join("DevToolsActivePort").exists());
+        let opening_admission = admission.clone();
+        let opening = tokio::spawn(async move {
+            opening_admission
+                .run(async {
+                    browser
+                        .launch(Default::default())
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        assert!(
+            !opening.is_finished(),
+            "fake Open must still be pending at quit"
+        );
         let shutdown = tokio::spawn(async move { connection.shutdown().await });
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(
-            !shutdown.is_finished(),
-            "quit must wait for an admitted UI operation"
-        );
-        assert!(
-            admission.enter().is_err(),
-            "no new UI operations during quit"
-        );
-        assert!(!devtools
-            .calls
-            .lock()
+        // Shorter than the request-drain timeout: success must come from UI
+        // cancellation, never a manually completed fake Open or an expired drain.
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
             .unwrap()
-            .iter()
-            .any(|c| c == "Browser.close"));
-        drop(accepted_ui);
-        shutdown.await.unwrap().unwrap();
+            .unwrap()
+            .unwrap();
+        assert!(opening.await.unwrap().unwrap_err().contains("shut down"));
+        assert!(admission
+            .run::<()>(async { panic!("new UI work admitted during quit") })
+            .await
+            .is_err());
+        release.notify_one();
         server_task.await.unwrap().unwrap();
         assert!(devtools
             .calls
@@ -2726,6 +2760,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c == "Browser.close"));
+        assert!(!profile.join("DevToolsActivePort").exists());
         crate::browser_control::verify_profile_released(&profile).unwrap();
         let (iced, _) = prepare(root.path(), "fixture-iced-after-live", TEST_VERSION).unwrap();
         assert_eq!(iced.browser().profile_dir().await, profile);
