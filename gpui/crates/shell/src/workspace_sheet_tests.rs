@@ -61,6 +61,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn validation_messages_and_order_match_iced(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, NewWorkSheet::default(), vec![]);
     cx.simulate_keystrokes("enter");
     cx.read(|cx| {
@@ -95,6 +96,7 @@ fn validation_messages_and_order_match_iced(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn enter_emits_normalized_create_with_core_start(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let repos = vec![PathBuf::from("/fixture/web"), PathBuf::from("/fixture/api")];
     let expected = WorkStart::new(repos.clone(), Some(repos[1].clone())).unwrap();
     let (view, cx, outcomes) = fixture(
@@ -119,6 +121,7 @@ fn enter_emits_normalized_create_with_core_start(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn matches_and_duplicate_label_follow_core_catalog(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use ExistingWorkStatus::*;
     let work = [
         ("Cloud done", Done),
@@ -178,6 +181,7 @@ fn matches_and_duplicate_label_follow_core_catalog(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn emits_each_existing_identity_and_cancel(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let key = Key {
         name: "Cloud migration".into(),
         dir: "/fixture/work".into(),
@@ -228,6 +232,7 @@ fn emits_each_existing_identity_and_cancel(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn rendered_create_and_repo_controls_emit_outcomes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let repo = PathBuf::from("/fixture/home/web");
     let (view, cx, outcomes) = fixture(
         cx,
@@ -271,6 +276,7 @@ fn rendered_create_and_repo_controls_emit_outcomes(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn card_keeps_iced_width_padding_and_control_order_in_both_themes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, _) = fixture(
         cx,
         NewWorkSheet {
@@ -307,6 +313,7 @@ fn card_keeps_iced_width_padding_and_control_order_in_both_themes(cx: &mut TestA
 
 #[gpui::test]
 fn escape_cancels_with_name_focused(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, NewWorkSheet::default(), vec![]);
     name(&view, "Unsubmitted draft", cx);
     cx.simulate_keystrokes("escape");
@@ -315,6 +322,7 @@ fn escape_cancels_with_name_focused(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn picker_preserves_draft_and_owns_enter_escape_until_finished(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (view, cx, outcomes) = fixture(cx, NewWorkSheet::default(), vec![]);
     name(&view, "Cloud migration", cx);
     view.update(cx, |view, cx| view.browse(cx));
@@ -349,6 +357,7 @@ fn picker_preserves_draft_and_owns_enter_escape_until_finished(cx: &mut TestAppC
 
 #[gpui::test]
 fn repo_shortcuts_add_remove_and_decisions_use_core_rules(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let recent = (0..8)
         .map(|index| PathBuf::from(format!("/fixture/home/repo-{index}")))
         .collect::<Vec<_>>();

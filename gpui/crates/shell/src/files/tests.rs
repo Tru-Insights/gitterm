@@ -169,6 +169,7 @@ fn jobs_use_owners_runtime_and_publish_errors_without_panicking() {
 
 #[gpui::test]
 fn owner_bridges_selection_expansion_refresh_and_file_open(cx: &mut gpui::TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use crate::{
         FileOpen, WorkspaceOwner,
         workspace_config::WorkspaceStore,

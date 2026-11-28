@@ -89,6 +89,7 @@ fn machine(f: &Fixture, cx: &mut VisualTestContext) -> workspace_bar::Machine {
 
 #[gpui::test]
 fn phone_panel_opens_when_machine_serves_phones(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture_with(serving(Ok(fixture_phones())), cx);
     let before = snapshot(&f.iced());
     // The bar handshook Mini as Iced connects it, and nothing else ran.
@@ -112,6 +113,7 @@ fn phone_panel_opens_when_machine_serves_phones(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn no_pair_a_phone_entry_when_the_agent_does_not_serve_phones(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let mini = machine(&f, cx);
     assert!(mini.connected && !mini.serves_phones);
@@ -122,6 +124,7 @@ fn no_pair_a_phone_entry_when_the_agent_does_not_serve_phones(cx: &mut TestAppCo
 
 #[gpui::test]
 fn an_unreachable_agent_shows_iced_word_and_no_entry(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     // The default test client fails every call, as an agent that is down.
     let (f, cx) = fixture(cx);
     f.shell.update(cx, |shell, cx| {
@@ -137,6 +140,7 @@ fn an_unreachable_agent_shows_iced_word_and_no_entry(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn phone_list_runs_once_on_open_and_shows_rows(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture_with(serving(Ok(fixture_phones())), cx);
     let before = snapshot(&f.iced());
     let panel = open(&f, cx);
@@ -157,6 +161,7 @@ fn phone_list_runs_once_on_open_and_shows_rows(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn phone_list_error_shows_iced_text(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture_with(serving(Err("list_phones failed: agent said no".into())), cx);
     let before = snapshot(&f.iced());
     let panel = open(&f, cx);
@@ -177,6 +182,7 @@ fn phone_list_error_shows_iced_text(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_list_shows_iced_loading_text_until_it_answers(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let panel = open(&f, cx);
     assert_eq!(LOADING, "Loading…");
@@ -205,6 +211,7 @@ fn the_list_shows_iced_loading_text_until_it_answers(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn labels_and_defaults_match_iced(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let panel = open(&f, cx);
     assert_eq!(CREATE_LABEL, "Show pairing code");
@@ -261,6 +268,7 @@ fn labels_and_defaults_match_iced(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_name_field_and_checkbox_are_local_only(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let before = snapshot(&f.iced());
     let panel = open(&f, cx);
@@ -283,6 +291,7 @@ fn the_name_field_and_checkbox_are_local_only(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn phone_create_and_revoke_refused_without_calls(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture_with(serving(Ok(fixture_phones())), cx);
     let before = snapshot(&f.iced());
     let panel = open(&f, cx);
@@ -334,6 +343,7 @@ fn phone_create_and_revoke_refused_without_calls(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn busy_disables_every_write_control(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let panel = open(&f, cx);
     panel.update(cx, |panel, cx| {
@@ -362,6 +372,7 @@ fn panel_is_open(f: &Fixture, cx: &mut VisualTestContext) -> bool {
 
 #[gpui::test]
 fn escape_closes_the_panel(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     let before = snapshot(&f.iced());
     open(&f, cx);
@@ -376,6 +387,7 @@ fn escape_closes_the_panel(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn close_closes_the_panel(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx);
     open(&f, cx);
     click("phone-close", cx);

@@ -152,6 +152,7 @@ impl LiveDelivery {
 
 #[gpui::test]
 fn live_delivery_reserves_once_and_rejects_stale_completion(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_reserves_once_and_rejects_stale_completion") {
         return;
     }
@@ -207,6 +208,7 @@ fn live_delivery_reserves_once_and_rejects_stale_completion(cx: &mut TestAppCont
 
 #[gpui::test]
 fn live_delivery_receipt_save_failure_retries_without_duplicate(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_receipt_save_failure_retries_without_duplicate") {
         return;
     }
@@ -245,6 +247,7 @@ fn live_delivery_receipt_save_failure_retries_without_duplicate(cx: &mut TestApp
 
 #[gpui::test]
 fn live_delivery_busy_closed_and_restart_preserve_undelivered_results(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_busy_closed_and_restart_preserve_undelivered_results") {
         return;
     }
@@ -298,6 +301,7 @@ fn live_delivery_busy_closed_and_restart_preserve_undelivered_results(cx: &mut T
 
 #[gpui::test]
 fn live_delivery_restores_background_parent_without_selecting_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_restores_background_parent_without_selecting_it") {
         return;
     }
@@ -364,6 +368,7 @@ fn live_delivery_restores_background_parent_without_selecting_it(cx: &mut TestAp
 
 #[gpui::test]
 fn live_card_manual_send_waits_when_auto_tell_is_off(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_card_manual_send_waits_when_auto_tell_is_off") {
         return;
     }
@@ -405,6 +410,7 @@ fn live_card_manual_send_waits_when_auto_tell_is_off(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_card_send_selected_findings_and_dismiss(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_card_send_selected_findings_and_dismiss") {
         return;
     }
@@ -454,6 +460,7 @@ fn finished_review(id: &str, d: &LiveDelivery, _: &mut TestAppContext) -> Delega
 
 #[gpui::test]
 fn live_card_rerun_uses_current_caller_and_fake_runner(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_card_rerun_uses_current_caller_and_fake_runner") {
         return;
     }
@@ -490,6 +497,7 @@ fn live_card_rerun_uses_current_caller_and_fake_runner(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn live_card_cancel_and_stop_tracking_leave_worker_task_untouched(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_card_cancel_and_stop_tracking_leave_worker_task_untouched") {
         return;
     }
@@ -527,6 +535,7 @@ fn live_card_cancel_and_stop_tracking_leave_worker_task_untouched(cx: &mut TestA
 
 #[gpui::test]
 fn live_delivery_reaches_fake_parent_process_once(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_reaches_fake_parent_process_once") {
         return;
     }
@@ -572,6 +581,7 @@ fn live_delivery_reaches_fake_parent_process_once(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn live_delivery_moved_head_matches_iced_banner_and_delivery(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_delivery_moved_head_matches_iced_banner_and_delivery") {
         return;
     }
@@ -618,6 +628,7 @@ fn live_delivery_moved_head_matches_iced_banner_and_delivery(cx: &mut TestAppCon
 
 #[gpui::test]
 fn live_card_cancel_stops_fake_running_consult(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     if child("live_card_cancel_stops_fake_running_consult") {
         return;
     }

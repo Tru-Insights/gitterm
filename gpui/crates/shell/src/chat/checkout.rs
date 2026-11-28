@@ -108,6 +108,7 @@ mod tests {
     fn source_without_a_config_root_offers_only_the_workspace_checkout(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let menu = cx.update(|cx| source("/repo".into(), None)(cx));
         assert_eq!(menu.len(), 1);
         assert_eq!(menu[0].label, "Current checkout");
@@ -115,6 +116,7 @@ mod tests {
 
     #[gpui::test]
     fn source_reads_the_host_store_not_iceds_file(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_core::tasks::TaskStoreDocument;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();

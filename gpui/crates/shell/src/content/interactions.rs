@@ -83,6 +83,7 @@ fn open(shell: &Entity<Shell>, path: PathBuf, cx: &mut VisualTestContext) {
 
 #[gpui::test]
 fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (folder, config, shell, cx) = fixture(cx);
     let out = tempfile::tempdir().unwrap();
     super::actions::TEST_OUT_DIR.with(|dir| *dir.borrow_mut() = Some(out.path().to_path_buf()));
@@ -154,6 +155,7 @@ fn copy_all_and_browser_buttons_use_full_file_and_test_platform(cx: &mut TestApp
 
 #[gpui::test]
 fn editor_controls_request_each_route_and_nonlocal_header_is_disabled(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (folder, config, shell, cx) = fixture(cx);
     let path = folder.path().join("source.rs");
     let edit_path = folder.path().join("other.rs");
@@ -228,6 +230,7 @@ fn editor_controls_request_each_route_and_nonlocal_header_is_disabled(cx: &mut T
 
 #[gpui::test]
 fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_folder, _config, shell, cx) = fixture(cx);
     let review = cx.update(|window, cx| shell.update(cx, |shell, cx| {
         use gitterm_core::status::{GitFileStatus, GitStatusSnapshot};
@@ -299,6 +302,7 @@ fn diff_navigation_back_and_edit_notice_are_mounted(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn work_branch_review_marks_the_sidebar_checkout_until_the_review_closes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_folder, _config, shell, cx) = fixture(cx);
     let checkout = PathBuf::from("/private/tmp/gt-branch-selection-fixture");
     let marked = |cx: &mut VisualTestContext| {
@@ -335,6 +339,7 @@ fn work_branch_review_marks_the_sidebar_checkout_until_the_review_closes(cx: &mu
 
 #[gpui::test]
 fn work_branch_outcome_reviews_given_checkout_with_given_source(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::review::model::ReviewSource;
     let (_folder, _config, shell, cx) = fixture(cx);
     let repo = tempfile::tempdir_in("/private/tmp").unwrap();
@@ -447,6 +452,7 @@ fn tree_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(gpui_component::init);
     let folder = tempfile::tempdir_in("/private/tmp").unwrap();
@@ -507,6 +513,7 @@ fn review_host_saves_marks_under_the_preview_root_and_opens_files_like_the_tree(
 
 #[gpui::test]
 fn work_sidebar_and_chat_navigation_reach_the_shared_editor_request(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (folder, _config, shell, cx) = fixture_with_preview(cx, true);
     let path = folder.path().join("file with 'quotes'.rs");
     std::fs::write(&path, "unchanged").unwrap();

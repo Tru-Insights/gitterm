@@ -606,6 +606,7 @@ mod tests {
 
     #[gpui::test]
     fn window_covers_reject_closed_surface_and_snapshot_completions(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.update(gpui_component::init);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.html"), "<h1>First</h1>").unwrap();

@@ -38,6 +38,7 @@ pub(super) fn sample(
 
 #[gpui::test]
 fn installed_keymap_is_iced_table_and_old_bindings_are_absent(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, _shell, cx) = sample(cx);
     cx.read(|cx| {
         let keymap = cx.key_bindings();
@@ -82,6 +83,7 @@ fn installed_keymap_is_iced_table_and_old_bindings_are_absent(cx: &mut TestAppCo
 
 #[gpui::test]
 fn registered_actions_are_reachable_and_missing_actions_are_unavailable(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, _shell, cx) = sample(cx);
     dispatch(TabSelect { index: 1 }, cx);
     cx.update(|window, cx| {
@@ -119,6 +121,7 @@ fn registered_actions_are_reachable_and_missing_actions_are_unavailable(cx: &mut
 
 #[gpui::test]
 fn indexed_shortcuts_sidebar_console_sheets_and_escape_reach_host(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = sample(cx);
     cx.simulate_keystrokes("ctrl-2");
     draw(cx);
@@ -160,6 +163,7 @@ fn indexed_shortcuts_sidebar_console_sheets_and_escape_reach_host(cx: &mut TestA
 
 #[gpui::test]
 fn fonts_adjust_live_terminals_and_persist_only_preview_regions(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = h5_tests::fixture(cx);
     let iced = root.path().join("iced");
     let before =
@@ -233,6 +237,7 @@ fn fonts_adjust_live_terminals_and_persist_only_preview_regions(cx: &mut TestApp
 
 #[gpui::test]
 fn terminal_find_routes_once_and_reserved_commands_do_not_enter_pty(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = sample(cx);
     dispatch(TabSelect { index: 1 }, cx);
     let terminal = cx.read(|cx| {
@@ -275,6 +280,7 @@ fn terminal_find_routes_once_and_reserved_commands_do_not_enter_pty(cx: &mut Tes
 
 #[gpui::test]
 fn native_chat_find_uses_canonical_adapter_without_local_binding(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = sample(cx);
     dispatch(TabSelect { index: 0 }, cx);
     let chat = cx.read(|cx| {
@@ -335,6 +341,7 @@ fn native_chat_find_uses_canonical_adapter_without_local_binding(cx: &mut TestAp
 
 #[gpui::test]
 fn file_navigation_edit_and_escape_use_existing_file_open_route(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     use gitterm_core::status::{GitFileStatus, GitStatusSnapshot};
     cx.background_executor.allow_parking();
     cx.update(|cx| {
@@ -487,6 +494,7 @@ fn file_navigation_edit_and_escape_use_existing_file_open_route(cx: &mut TestApp
 fn terminal_secondary_click_has_no_popup_and_hidden_pty_receives_no_app_chords(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = sample(cx);
     dispatch(TabSelect { index: 1 }, cx);
     let terminal = cx.read(|cx| {

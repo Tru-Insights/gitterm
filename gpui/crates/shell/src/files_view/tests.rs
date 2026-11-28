@@ -105,6 +105,7 @@ fn names(view: &Entity<FilesView>, cx: &mut VisualTestContext) -> Vec<String> {
 fn folder_click_replaces_listing_and_parent_returns_without_inline_expansion(
     cx: &mut TestAppContext,
 ) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("child/nested")).unwrap();
@@ -134,6 +135,7 @@ fn folder_click_replaces_listing_and_parent_returns_without_inline_expansion(
 
 #[gpui::test]
 fn complete_directory_is_shown_without_paging(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     for ix in 0..crate::files::PAGE_SIZE + 1 {
@@ -150,6 +152,7 @@ fn complete_directory_is_shown_without_paging(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn clicking_file_opens_it_and_selects_only_that_file(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::write(root.path().join("file.txt"), "file").unwrap();
@@ -176,6 +179,7 @@ fn clicking_file_opens_it_and_selects_only_that_file(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn edit_click_requests_terminal_editor_without_launching_in_tests(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join("folder")).unwrap();
@@ -235,6 +239,7 @@ fn edit_click_requests_terminal_editor_without_launching_in_tests(cx: &mut TestA
 
 #[gpui::test]
 fn roots_back_and_directory_rows_have_iced_insets_and_heights(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let root = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
     let repo = root.path().join("repo");
@@ -322,6 +327,7 @@ fn work_folders_keep_iced_repo_then_docs_order_without_duplicates() {
 
 #[gpui::test]
 fn selecting_work_root_retains_directory_after_workspace_refresh(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let config = tempfile::tempdir().unwrap();
@@ -392,6 +398,7 @@ fn edit_click_never_runs_configured_editor() {
 
 #[gpui::test]
 fn sample_folders_also_navigate_without_an_inline_tree(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, cx| {
         FilesView::new(
@@ -411,6 +418,7 @@ fn sample_folders_also_navigate_without_an_inline_tree(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn mounted_files_pane_keeps_iced_insets_in_roots_and_directory(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     cx.background_executor.allow_parking();
     cx.update(|cx| {
         gpui_component::init(cx);

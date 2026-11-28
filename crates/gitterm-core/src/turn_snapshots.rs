@@ -2245,8 +2245,6 @@ mod tests {
             return;
         };
         let store = PathBuf::from(store);
-        let control =
-            PathBuf::from(std::env::var_os("GITTERM_V6_SNAPSHOT_LEASE_TEST_CONTROL").unwrap());
         let oid = std::env::var("GITTERM_V6_SNAPSHOT_LEASE_TEST_OID").unwrap();
         let guard = std::fs::OpenOptions::new()
             .read(true)
@@ -2255,15 +2253,18 @@ mod tests {
             .unwrap();
         guard.try_lock().unwrap();
         let _pin = Snapshot::pin(&store, oid, None).unwrap();
-        std::fs::write(control.join("ready"), "").unwrap();
-        let mut guard = Some(guard);
-        for _ in 0..2_000 {
-            if control.join("release").exists() {
-                guard.take();
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("parent did not terminate lease fixture");
+        use std::io::Write;
+        println!("LEASE_READY");
+        std::io::stdout().flush().unwrap();
+        // Keep the lock until the parent explicitly releases it, then keep
+        // the pin live until the parent crashes this child. A fixed fixture
+        // lifetime races slow GC on a loaded host.
+        use std::io::Read;
+        let mut command = [0];
+        std::io::stdin().read_exact(&mut command).unwrap();
+        assert_eq!(command, [b'R']);
+        drop(guard);
+        std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
     }
     #[tokio::test]
     async fn cross_process_lock_and_live_pin_survive_gc_then_crash_is_reclaimed() {
@@ -2277,7 +2278,6 @@ mod tests {
         let snapshot = snapshot(&test_root(), dir).await.unwrap().unwrap();
         let oid = snapshot.to_string();
         drop(snapshot);
-        let control = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2285,17 +2285,25 @@ mod tests {
                 "--nocapture",
             ])
             .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_STORE", &store)
-            .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_CONTROL", control.path())
             .env("GITTERM_V6_SNAPSHOT_LEASE_TEST_OID", &oid)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !control.path().join("ready").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        use tokio::io::AsyncBufReadExt;
+        let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let line = output
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .expect("lease child exited before acquiring the lock and pin");
+                if line.ends_with("LEASE_READY") {
+                    break;
+                }
             }
         })
         .await
@@ -2310,7 +2318,8 @@ mod tests {
                 .is_err(),
             "GC must respect another process's store lock"
         );
-        std::fs::write(control.path().join("release"), "").unwrap();
+        use tokio::io::AsyncWriteExt;
+        child.stdin.as_mut().unwrap().write_all(b"R").await.unwrap();
         cleanup.await.unwrap().unwrap();
         assert_eq!(g(&store, &["show", &format!("{oid}:file.txt")]), "base");
         child.kill().await.unwrap();

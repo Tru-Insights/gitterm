@@ -117,6 +117,7 @@ fn notice(f: &Fixture, cx: &mut VisualTestContext) -> Option<String> {
 
 #[gpui::test]
 fn gear_opens_sheet_with_fixture_values_and_esc_closes(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx, true);
     assert!(cx.debug_bounds("settings-card").is_none());
     click(cx, "pstrip-settings");
@@ -187,6 +188,7 @@ fn gear_opens_sheet_with_fixture_values_and_esc_closes(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn write_controls_change_nothing_and_show_their_notice(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx, true);
     let before = snapshot(&f.source);
     click(cx, "pstrip-settings");
@@ -253,6 +255,7 @@ fn write_controls_change_nothing_and_show_their_notice(cx: &mut TestAppContext) 
 
 #[gpui::test]
 fn edit_guidelines_opens_viewer_when_file_exists(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx, true);
     let before = snapshot(&f.source);
     click(cx, "pstrip-settings");
@@ -272,6 +275,7 @@ fn edit_guidelines_opens_viewer_when_file_exists(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn edit_guidelines_without_file_shows_notice_and_creates_nothing(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (f, cx) = fixture(cx, false);
     let before = snapshot(&f.source);
     click(cx, "pstrip-settings");

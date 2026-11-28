@@ -21,6 +21,7 @@ fn notice(shell: &Entity<Shell>, cx: &mut VisualTestContext) -> Option<String> {
 
 #[gpui::test]
 fn ready_count_opens_iced_list_with_open_resume_close(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture_catalog(cx, true);
     cx.simulate_resize(size(px(1600.), px(800.)));
     draw(cx);
@@ -76,6 +77,7 @@ fn ready_count_opens_iced_list_with_open_resume_close(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn ready_list_without_news_says_so(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture_with(cx, false, |_| {});
     cx.update(|window, cx| shell.update(cx, |shell, cx| shell.open_ready_list(window, cx)));
     draw(cx);
@@ -87,6 +89,7 @@ fn ready_list_without_news_says_so(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn parked_count_opens_iced_list_with_resume_done_and_notices(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture_catalog(cx, true);
     cx.simulate_resize(size(px(1600.), px(800.)));
     draw(cx);
@@ -135,6 +138,7 @@ fn parked_count_opens_iced_list_with_resume_done_and_notices(cx: &mut TestAppCon
 
 #[gpui::test]
 fn a_live_park_lists_first_as_running_and_resume_returns_it(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (root, shell, cx) = fixture_catalog(cx, true);
     cx.simulate_resize(size(px(1600.), px(800.)));
     let before = files(root.path());
@@ -178,6 +182,7 @@ fn a_live_park_lists_first_as_running_and_resume_returns_it(cx: &mut TestAppCont
 
 #[gpui::test]
 fn park_sheet_facts_carry_shared_repos_and_other_chats(cx: &mut TestAppContext) {
+    let _test_app = crate::test_app::Cleanup::new(cx);
     let (_root, shell, cx) = fixture_with(cx, false, |file| {
         for workspace in file["workspaces"].as_array_mut().unwrap() {
             workspace["repos"] = serde_json::json!(["/fixture/shared"]);

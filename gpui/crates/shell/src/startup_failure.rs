@@ -129,6 +129,7 @@ mod tests {
 
     #[gpui::test]
     fn startup_failure_presents_a_native_prompt_headlessly(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::AppContext as _;
         let view = cx.update(|cx| {
             cx.open_window(gpui::WindowOptions::default(), |window, cx| {

@@ -2344,6 +2344,7 @@ mod tests {
     fn live_restore_keeps_selected_tab_when_background_tab_shares_conversation(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         let live = tempfile::tempdir().unwrap();
         let services = gitterm_core::preview::service::ServiceContext::production(
             live.path(),
@@ -2689,6 +2690,7 @@ mod tests {
     /// a final text; then a second prompt and turn.
     #[gpui::test]
     fn replayed_claude_transcript_folds_each_finished_turn(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {
             cx.run_until_parked();
@@ -2814,6 +2816,7 @@ mod tests {
     /// hook summary, and then a GitTerm delivery and the next turn.
     #[gpui::test]
     fn real_claude_turn_shape_folds_into_one_worked_row(cx: &mut gpui::TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         use gitterm_gpui_chat::model::RowKind;
         use gpui::{AppContext as _, VisualTestContext};
         fn draw(cx: &mut VisualTestContext) {

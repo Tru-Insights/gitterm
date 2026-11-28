@@ -603,6 +603,7 @@ mod tests {
     }
     #[gpui::test]
     fn dot_click_jumps_option_click_selects_and_usage_toggles(cx: &mut TestAppContext) {
+        let _test_app = crate::test_app::Cleanup::new(cx);
         cx.background_executor.allow_parking();
         cx.update(gpui_component::init);
         let events = Rc::new(RefCell::new(vec![]));
