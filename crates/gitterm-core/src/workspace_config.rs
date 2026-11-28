@@ -905,3 +905,5 @@ pub fn create_work_folder(base: &Path, name: &str) -> std::io::Result<PathBuf> {
     }
     unreachable!("u32 suffixes exhausted under {}", base.display())
 }
+
+mod workspace_bar;

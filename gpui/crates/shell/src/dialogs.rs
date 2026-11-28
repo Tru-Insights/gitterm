@@ -330,7 +330,12 @@ mod interaction_tests {
                 connected: false,
                 serves_phones: true,
             });
-            facts.remote_workspaces.push("Fixture:repo".into());
+            facts
+                .remote_workspaces
+                .push(crate::workspace_bar::RemoteWorkspace {
+                    session_name: "fixture-repo".into(),
+                    name: "Fixture:repo".into(),
+                });
             shell.saved_facts.replace(facts);
             cx.notify();
         });
