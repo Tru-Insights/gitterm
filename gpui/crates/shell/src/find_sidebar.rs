@@ -2767,7 +2767,7 @@ pub(crate) struct FindViews {
 }
 
 impl crate::Shell {
-    fn find_owner_for(
+    pub(crate) fn find_owner_for(
         &self,
         workspace: &crate::WorkspaceDock,
         session: Option<crate::data::SessionId>,
@@ -3555,13 +3555,21 @@ impl crate::Shell {
             .is_some_and(|views| views.preview.read(cx).file_overlay)
     }
 
-    pub(crate) fn find_content(&self, cx: &gpui::Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let owner = self.find_owner(cx);
-        let regions = &self.active(cx).store.regions;
+    pub(crate) fn find_content(
+        &self,
+        state: &crate::WorkspaceDock,
+        cx: &gpui::Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let owner = self.find_owner_for(state, state.active_session, cx);
+        let regions = &state.store.regions;
         if regions.sidebar_mode == crate::SidebarMode::Find
             && !regions.sidebar_collapsed
-            && self.content.read(cx).selected.is_none()
             && let Some(views) = self.find_views.get(&owner)
+            && (if Some(state.workspace.id) == self.active_workspace(cx) {
+                self.content.read(cx).selected.is_none()
+            } else {
+                !views.preview.read(cx).file_overlay
+            })
         {
             let selected = self.find_state.borrow().selected(&owner).is_some();
             return div()
@@ -3578,6 +3586,6 @@ impl crate::Shell {
                 .h_full()
                 .child(views.preview.clone());
         }
-        self.file_viewer_content(cx)
+        self.file_viewer_content(state, cx)
     }
 }

@@ -530,8 +530,11 @@ impl Render for Pane {
 
 impl crate::Shell {
     /// Mount the retained Git subview when the Work repo route is selected.
-    pub(crate) fn git_sidebar(&self, sidebar: Stateful<Div>, cx: &Context<Self>) -> Stateful<Div> {
-        let state = self.active(cx);
+    pub(crate) fn git_sidebar(
+        &self,
+        sidebar: Stateful<Div>,
+        state: &crate::WorkspaceDock,
+    ) -> Stateful<Div> {
         sidebar.child(
             div().flex_1().min_h_0().child(
                 state.panes[&format!("workspace-{}-git", state.workspace.layout_key)].clone(),
